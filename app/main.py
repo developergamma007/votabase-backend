@@ -1145,55 +1145,93 @@ def get_voters(
 @app.get(f"{CONTEXT_PATH}/api/voters/snapshot")
 def get_snapshot(assemblyCode: str, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("USER", "ADMIN"))):
     try:
+        assembly = (
+            db.query(Assembly)
+            .filter(
+                Assembly.tenant_id == current.tenantId,
+                Assembly.assembly_code == assemblyCode,
+            )
+            .first()
+        )
+        if not assembly:
+            raise ValueError(f"Assembly not found for assemblyCode: {assemblyCode}")
+
         if current.assignmentType == "ASSEMBLY":
-            row = (
-                db.query(VoterSnapshot)
+            wards = (
+                db.query(Ward)
                 .filter(
-                    VoterSnapshot.tenant_id == current.tenantId,
-                    VoterSnapshot.assembly_code == assemblyCode,
-                    VoterSnapshot.snapshot_level == "ASSEMBLY",
+                    Ward.tenant_id == current.tenantId,
+                    Ward.assembly_id == assembly.assembly_id,
                 )
-                .first()
+                .all()
             )
+            snapshot = _build_assembly_json(db, assembly, wards, True, current.tenantId)
         elif current.assignmentType == "WARD":
-            row = (
-                db.query(VoterSnapshot)
+            ward = (
+                db.query(Ward)
                 .filter(
-                    VoterSnapshot.tenant_id == current.tenantId,
-                    VoterSnapshot.ward_code == str(current.assignmentId),
-                    VoterSnapshot.assembly_code == assemblyCode,
+                    Ward.tenant_id == current.tenantId,
+                    Ward.assembly_id == assembly.assembly_id,
+                    Ward.ward_code == str(current.assignmentId),
                 )
                 .first()
             )
+            if not ward:
+                raise ValueError("No ward snapshot found")
+            snapshot = _build_assembly_json(db, assembly, [ward], True, current.tenantId)
         elif current.assignmentType == "BOOTH":
-            row = (
-                db.query(VoterSnapshot)
+            booth_row = (
+                db.query(Booth)
+                .join(Ward, Booth.ward_id == Ward.ward_id)
                 .filter(
-                    VoterSnapshot.tenant_id == current.tenantId,
-                    VoterSnapshot.booth_id == current.assignmentId,
-                    VoterSnapshot.assembly_code == assemblyCode,
+                    Booth.tenant_id == current.tenantId,
+                    Booth.booth_id == current.assignmentId,
+                    Ward.assembly_id == assembly.assembly_id,
                 )
                 .first()
             )
+            if not booth_row:
+                raise ValueError("No booth snapshot found")
+
+            ward = db.query(Ward).filter(Ward.ward_id == booth_row.ward_id).first()
+            if not ward:
+                raise ValueError("No ward found for booth")
+
+            voters = (
+                db.query(Voter)
+                .filter(
+                    Voter.tenant_id == current.tenantId,
+                    Voter.booth_id == booth_row.booth_id,
+                )
+                .all()
+            )
+
+            snapshot = {
+                "assembly": {
+                    "assemblyId": assembly.assembly_id,
+                    "assemblyNameEn": assembly.assembly_name_en,
+                    "assemblyNameLocal": assembly.assembly_name_local,
+                    "wards": [
+                        {
+                            "wardId": ward.ward_id,
+                            "wardNameEn": ward.ward_name_en,
+                            "wardNameLocal": ward.ward_name_local,
+                            "booths": [
+                                {
+                                    "boothId": booth_row.booth_id,
+                                    "boothNameEn": booth_row.polling_station_adr_en,
+                                    "boothNameLocal": booth_row.polling_station_adr_local,
+                                    "voters": [_build_voter_map(v) for v in voters],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
         else:
             raise ValueError(f"Invalid role: {current.assignmentType}")
 
-        if not row:
-            raise ValueError("No snapshot found")
-
-        key = s3_extract_key(row.s3_url)
-        # Snapshot files are private by default; always return a presigned URL.
-        # Returning the raw S3 URL causes AccessDenied for private objects.
-        url = s3_presigned_url(key, 1)
-        return api_success("Snapshot URL fetched successfully", url)
-    except NoCredentialsError:
-        return JSONResponse(
-            status_code=500,
-            content=api_error(
-                "Failed to fetch snapshot URL",
-                "AWS credentials missing/invalid for presigned URL generation",
-            ),
-        )
+        return api_success("Snapshot fetched successfully", snapshot)
     except ValueError as ex:
         return JSONResponse(status_code=404, content=api_error("No snapshot found", str(ex)))
 
