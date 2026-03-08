@@ -33,7 +33,9 @@ def _load_dotenv_from_python_backend() -> None:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+            # Keep backend deterministic: values in votabase-backend/.env
+            # should override inherited shell variables.
+            os.environ[key.strip()] = value.strip().strip("\"'")
 
 
 _load_dotenv_from_python_backend()
@@ -52,6 +54,43 @@ SUPERADMIN_USERNAME = os.getenv("SUPERADMIN_USERNAME", "admin@iswot.io")
 
 JWT_SECRET = "supersecretkeysupersecretkeysupersecretkey"
 JWT_EXPIRATION_SECONDS = 60 * 60 * 24 * 365
+SNAPSHOT_CACHE_TTL_SECONDS = 60 * 15
+
+
+# In-memory cache for large snapshot payloads served via short-lived links.
+_snapshot_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def _safe_db_target(db_url: str) -> str:
+    # Print DB target without exposing credentials.
+    m = re.match(r"postgresql(?:\+psycopg2)?://[^@]+@([^:/]+)(?::(\d+))?/([^?]+)", db_url or "")
+    if not m:
+        return "unknown"
+    host = m.group(1)
+    port = m.group(2) or "5432"
+    db = m.group(3)
+    return f"{host}:{port}/{db}"
+
+
+def _cleanup_snapshot_cache() -> None:
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    expired = [
+        k
+        for k, v in _snapshot_cache.items()
+        if now_ts - int(v.get("created_ts", 0)) > SNAPSHOT_CACHE_TTL_SECONDS
+    ]
+    for k in expired:
+        _snapshot_cache.pop(k, None)
+
+
+def _cache_snapshot(snapshot: Dict[str, Any]) -> str:
+    _cleanup_snapshot_cache()
+    snapshot_id = uuid.uuid4().hex
+    _snapshot_cache[snapshot_id] = {
+        "created_ts": int(datetime.now(timezone.utc).timestamp()),
+        "payload": snapshot,
+    }
+    return snapshot_id
 
 
 # ---------------------------
@@ -622,6 +661,76 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def log_all_requests(request: Request, call_next):
+    started_at = datetime.now(timezone.utc)
+    query = request.url.query
+    path_with_query = f"{request.url.path}?{query}" if query else request.url.path
+    auth_present = bool(request.headers.get("Authorization"))
+    body_log = None
+
+    target_paths = {
+        f"{CONTEXT_PATH}/api/auth/login",
+        f"{CONTEXT_PATH}/api/booth",
+        f"{CONTEXT_PATH}/api/voters/snapshot",
+    }
+
+    def mask_sensitive(value: Any) -> Any:
+        if isinstance(value, dict):
+            out: Dict[str, Any] = {}
+            for k, v in value.items():
+                lk = k.lower()
+                if lk in {"phone", "token", "password", "authorization"}:
+                    out[k] = "***"
+                else:
+                    out[k] = mask_sensitive(v)
+            return out
+        if isinstance(value, list):
+            return [mask_sensitive(v) for v in value]
+        return value
+
+    if request.url.path in target_paths:
+        content_type = (request.headers.get("content-type") or "").lower()
+        if "application/json" in content_type:
+            try:
+                raw_body = await request.body()
+                if raw_body:
+                    parsed = json.loads(raw_body.decode("utf-8"))
+                    body_log = json.dumps(mask_sensitive(parsed), ensure_ascii=False)
+
+                    # Re-inject the already-read body so downstream handlers can read it.
+                    async def receive():
+                        return {"type": "http.request", "body": raw_body, "more_body": False}
+
+                    request = Request(request.scope, receive)
+            except Exception:
+                body_log = "<unparseable-json>"
+
+    try:
+        response = await call_next(request)
+        duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+        line = (
+            f"[API_HIT] method={request.method} path={path_with_query} "
+            f"status={response.status_code} auth={'yes' if auth_present else 'no'} "
+            f"durationMs={duration_ms}"
+        )
+        if body_log is not None:
+            line += f" body={body_log}"
+        print(line)
+        return response
+    except Exception as ex:
+        duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+        line = (
+            f"[API_HIT] method={request.method} path={path_with_query} "
+            f"status=500 auth={'yes' if auth_present else 'no'} durationMs={duration_ms} "
+            f"error={type(ex).__name__}"
+        )
+        if body_log is not None:
+            line += f" body={body_log}"
+        print(line)
+        raise
+
+
 @app.exception_handler(InvalidCredentialsException)
 async def handle_invalid_credentials(_: Request, ex: InvalidCredentialsException):
     return JSONResponse(
@@ -671,6 +780,7 @@ async def handle_generic(_: Request, ex: Exception):
 # ---------------------------
 @app.on_event("startup")
 def startup_seed_super_admin() -> None:
+    print(f"[DB_TARGET] { _safe_db_target(DATABASE_URL) }")
     db = SessionLocal()
     try:
         existing = db.query(User).filter(User.role == "SUPER_ADMIN").first()
@@ -1037,38 +1147,18 @@ def get_assignments(type: str = Query(...), db: Session = Depends(get_db), _: Jw
 
 @app.get(f"{CONTEXT_PATH}/api/booth")
 def get_booths(db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER"))):
-    if current.role == "SUPER_ADMIN":
-        booths = db.query(Booth).all()
-    elif current.role == "ADMIN" or not current.assignmentType:
-        booths = db.query(Booth).filter(Booth.tenant_id == current.tenantId).all()
-    elif current.assignmentType == "ASSEMBLY":
-        # Mimic Java behavior: compare assembly_id with assignmentId cast to string.
-        booths = (
-            db.query(Booth)
-            .join(Ward, Booth.ward_id == Ward.ward_id)
-            .join(Assembly, Ward.assembly_id == Assembly.assembly_id)
-            .filter(Assembly.assembly_id == int(str(current.assignmentId)), Booth.tenant_id == current.tenantId)
-            .all()
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                b.id AS id,
+                COALESCE(NULLIF(b.booth_add_en, ''), 'Booth ' || COALESCE(b.booth_no::text, b.id::text)) AS name_en
+            FROM public.booths b
+            ORDER BY LOWER(COALESCE(NULLIF(b.booth_add_en, ''), 'Booth ' || COALESCE(b.booth_no::text, b.id::text)))
+            """
         )
-    elif current.assignmentType == "WARD":
-        booths = (
-            db.query(Booth)
-            .join(Ward, Booth.ward_id == Ward.ward_id)
-            .filter(Ward.ward_code == str(current.assignmentId), Booth.tenant_id == current.tenantId)
-            .all()
-        )
-    elif current.assignmentType == "BOOTH":
-        booth = db.query(Booth).filter(Booth.booth_id == current.assignmentId).first()
-        if not booth:
-            raise ValueError(f"Booth not found: {current.assignmentId}")
-        booths = [booth]
-    else:
-        raise ValueError(f"Unknown assignment type: {current.assignmentType}")
-
-    dto = sorted(
-        [{"id": b.booth_id, "nameEn": b.polling_station_adr_en} for b in booths],
-        key=lambda x: (x["nameEn"] or "").lower(),
-    )
+    ).all()
+    dto = [{"id": int(r.id), "nameEn": r.name_en} for r in rows]
     return api_success("Booths fetched successfully", dto)
 
 
@@ -1213,8 +1303,183 @@ def get_voters(
     return [_build_voter_map(v) for v in voters]
 
 
+@app.get(f"{CONTEXT_PATH}/api/voters/by-booth")
+def get_voters_by_booth(
+    boothId: int,
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "USER", "ADMIN")),
+):
+    _ = current
+    booth_cols = _get_table_columns(db, "public", "booths")
+    voter_cols = _get_table_columns(db, "public", "voters")
+    ward_cols = _get_table_columns(db, "public", "wards")
+
+    booth_id_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
+    booth_no_col = "booth_no" if "booth_no" in booth_cols else booth_id_col
+    booth_ward_code_col = "ward_code" if "ward_code" in booth_cols else None
+    booth_ward_id_col = "ward_id" if "ward_id" in booth_cols else None
+    booth_name_en_col = "booth_add_en" if "booth_add_en" in booth_cols else ("polling_station_adr_en" if "polling_station_adr_en" in booth_cols else None)
+    booth_name_local_col = "booth_add_local" if "booth_add_local" in booth_cols else ("polling_station_adr_local" if "polling_station_adr_local" in booth_cols else None)
+
+    if not booth_id_col or not booth_no_col:
+        return JSONResponse(status_code=404, content=api_error("Booth not found", "public.booths missing required columns"))
+
+    booth_row = db.execute(
+        text(
+            f"""
+            SELECT
+                {booth_id_col} AS booth_id,
+                {booth_no_col} AS booth_no,
+                {booth_ward_code_col if booth_ward_code_col else 'NULL'} AS ward_code,
+                {booth_ward_id_col if booth_ward_id_col else 'NULL'} AS ward_id,
+                {booth_name_en_col if booth_name_en_col else 'NULL'} AS booth_name_en,
+                {booth_name_local_col if booth_name_local_col else 'NULL'} AS booth_name_local
+            FROM public.booths
+            WHERE {booth_id_col} = :booth_id
+            LIMIT 1
+            """
+        ),
+        {"booth_id": boothId},
+    ).first()
+    if not booth_row:
+        return JSONResponse(status_code=404, content=api_error("Booth not found", f"Invalid boothId: {boothId}"))
+
+    ward_name_en = None
+    ward_name_local = None
+    if booth_row.ward_id is not None and ("id" in ward_cols or "ward_id" in ward_cols):
+        ward_id_col = "id" if "id" in ward_cols else "ward_id"
+        ward_name_en_col = "ward_name_en" if "ward_name_en" in ward_cols else ("name_en" if "name_en" in ward_cols else None)
+        ward_name_local_col = "ward_name_local" if "ward_name_local" in ward_cols else ("name_kannada" if "name_kannada" in ward_cols else None)
+        if ward_name_en_col or ward_name_local_col:
+            ward_row = db.execute(
+                text(
+                    f"""
+                    SELECT
+                        {ward_name_en_col if ward_name_en_col else 'NULL'} AS ward_name_en,
+                        {ward_name_local_col if ward_name_local_col else 'NULL'} AS ward_name_local
+                    FROM public.wards
+                    WHERE {ward_id_col} = :ward_id
+                    LIMIT 1
+                    """
+                ),
+                {"ward_id": booth_row.ward_id},
+            ).first()
+            if ward_row:
+                ward_name_en = ward_row.ward_name_en
+                ward_name_local = ward_row.ward_name_local
+
+    voter_sr_col = "sl" if "sl" in voter_cols else ("sr_no" if "sr_no" in voter_cols else None)
+    voter_epic_col = "epic" if "epic" in voter_cols else ("epic_no" if "epic_no" in voter_cols else None)
+    voter_name_en_col = "name_en" if "name_en" in voter_cols else ("first_middle_name_en" if "first_middle_name_en" in voter_cols else None)
+    voter_name_local_col = "name_kannada" if "name_kannada" in voter_cols else ("first_middle_name_local" if "first_middle_name_local" in voter_cols else None)
+    voter_house_col = "house" if "house" in voter_cols else ("house_no_en" if "house_no_en" in voter_cols else None)
+    voter_gender_col = "gender" if "gender" in voter_cols else None
+    voter_booth_no_col = "booth_no" if "booth_no" in voter_cols else ("booth_id" if "booth_id" in voter_cols else None)
+    voter_ward_code_col = "ward_code" if "ward_code" in voter_cols else None
+
+    if not voter_booth_no_col:
+        return JSONResponse(status_code=404, content=api_error("Voters not found", "public.voters missing booth mapping column"))
+
+    where_clause = f"{voter_booth_no_col} = :booth_no"
+    params: Dict[str, Any] = {"booth_no": booth_row.booth_no}
+    if voter_ward_code_col and booth_row.ward_code is not None:
+        where_clause += f" AND {voter_ward_code_col} = :ward_code"
+        params["ward_code"] = booth_row.ward_code
+
+    voters_rows = db.execute(
+        text(
+            f"""
+            SELECT
+                ROW_NUMBER() OVER () AS voter_id,
+                {voter_sr_col if voter_sr_col else 'NULL'} AS sr_no,
+                {voter_epic_col if voter_epic_col else 'NULL'} AS epic_no,
+                {voter_name_en_col if voter_name_en_col else 'NULL'} AS name_en,
+                {voter_name_local_col if voter_name_local_col else 'NULL'} AS name_local,
+                {voter_house_col if voter_house_col else 'NULL'} AS house_no_en,
+                {voter_gender_col if voter_gender_col else 'NULL'} AS gender
+            FROM public.voters
+            WHERE {where_clause}
+            """
+        ),
+        params,
+    ).all()
+
+    voters = []
+    male = 0
+    female = 0
+    for v in voters_rows:
+        g = (v.gender or "").upper()
+        if g.startswith("M"):
+            male += 1
+        if g.startswith("F"):
+            female += 1
+        voters.append(
+            {
+                "voterId": int(v.voter_id),
+                "srNo": v.sr_no,
+                "epicNo": v.epic_no,
+                "firstMiddleNameEn": v.name_en,
+                "lastNameEn": "",
+                "firstMiddleNameLocal": v.name_local,
+                "lastNameLocal": "",
+                "houseNoEn": str(v.house_no_en) if v.house_no_en is not None else None,
+                "houseNoLocal": None,
+                "gender": v.gender,
+                "age": None,
+                "dob": None,
+                "mobile": None,
+                "addressEn": None,
+                "addressLocal": None,
+                "status": None,
+                "community": None,
+                "caste": None,
+                "residenceType": None,
+                "civicIssue": None,
+                "motherTongue": None,
+                "team": None,
+                "ownership": None,
+                "education": None,
+                "natureOfVoter": None,
+                "latitude": None,
+                "longitude": None,
+            }
+        )
+
+    return api_success(
+        "Booth voters fetched",
+        {
+            "boothId": int(booth_row.booth_id),
+            "boothNameEn": booth_row.booth_name_en,
+            "boothNameLocal": booth_row.booth_name_local,
+            "wardId": booth_row.ward_id,
+            "wardCode": str(booth_row.ward_code) if booth_row.ward_code is not None else None,
+            "wardNameEn": ward_name_en,
+            "wardNameLocal": ward_name_local,
+            "voterStats": {"total": len(voters), "male": male, "female": female},
+            "voters": voters,
+        },
+    )
+
+
 @app.get(f"{CONTEXT_PATH}/api/voters/snapshot")
-def get_snapshot(assemblyCode: str, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "USER", "ADMIN"))):
+def get_snapshot(
+    assemblyCode: str,
+    request: Request,
+    includeVoters: bool = True,
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "USER", "ADMIN")),
+):
+    try:
+        public_snapshot = _build_public_snapshot(assemblyCode, db, include_voters=includeVoters)
+        snapshot_id = _cache_snapshot(public_snapshot)
+        snapshot_url = f"{str(request.base_url).rstrip('/')}{CONTEXT_PATH}/api/voters/snapshot/content/{snapshot_id}"
+        payload = api_success("Snapshot fetched successfully", snapshot_url)
+        payload["snapshotMode"] = "link"
+        return JSONResponse(content=payload, headers={"X-Snapshot-Mode": "link"})
+    except Exception:
+        # Fallback: retain legacy behavior over data.* tables.
+        pass
+
     try:
         assembly_q = db.query(Assembly).filter(Assembly.assembly_code == assemblyCode)
         if current.role != "SUPER_ADMIN":
@@ -1294,9 +1559,22 @@ def get_snapshot(assemblyCode: str, db: Session = Depends(get_db), current: JwtU
         else:
             raise ValueError(f"Invalid role: {current.assignmentType}")
 
-        return api_success("Snapshot fetched successfully", snapshot)
+        snapshot_id = _cache_snapshot(snapshot)
+        snapshot_url = f"{str(request.base_url).rstrip('/')}{CONTEXT_PATH}/api/voters/snapshot/content/{snapshot_id}"
+        payload = api_success("Snapshot fetched successfully", snapshot_url)
+        payload["snapshotMode"] = "link"
+        return JSONResponse(content=payload, headers={"X-Snapshot-Mode": "link"})
     except ValueError as ex:
         return JSONResponse(status_code=404, content=api_error("No snapshot found", str(ex)))
+
+
+@app.get(f"{CONTEXT_PATH}/api/voters/snapshot/content/{{snapshot_id}}")
+def get_snapshot_content(snapshot_id: str):
+    _cleanup_snapshot_cache()
+    cached = _snapshot_cache.get(snapshot_id)
+    if not cached:
+        raise HTTPException(status_code=404, detail="Snapshot link expired or not found")
+    return cached["payload"]
 
 
 @app.get(f"{CONTEXT_PATH}/api/association")
@@ -1698,6 +1976,224 @@ def _build_voter_map(v: Voter) -> Dict[str, Any]:
         "natureOfVoter": v.nature_of_voter,
         "latitude": v.latitude,
         "longitude": v.longitude,
+    }
+
+
+def _get_table_columns(db: Session, schema: str, table: str) -> set[str]:
+    rows = db.execute(
+        text(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = :schema AND table_name = :table
+            """
+        ),
+        {"schema": schema, "table": table},
+    ).all()
+    return {r[0] for r in rows}
+
+
+def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool = True) -> Dict[str, Any]:
+    booth_cols = _get_table_columns(db, "public", "booths")
+    voter_cols = _get_table_columns(db, "public", "voters")
+    ward_cols = _get_table_columns(db, "public", "wards")
+
+    booth_id_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
+    booth_ward_id_col = "ward_id" if "ward_id" in booth_cols else None
+    booth_no_col = "booth_no" if "booth_no" in booth_cols else (booth_id_col or "id")
+    booth_ward_code_col = "ward_code" if "ward_code" in booth_cols else None
+    booth_name_en_col = "booth_add_en" if "booth_add_en" in booth_cols else ("polling_station_adr_en" if "polling_station_adr_en" in booth_cols else None)
+    booth_name_local_col = "booth_add_local" if "booth_add_local" in booth_cols else ("polling_station_adr_local" if "polling_station_adr_local" in booth_cols else None)
+
+    if not booth_id_col or not booth_ward_id_col:
+        raise ValueError("public.booths missing required columns")
+
+    booth_rows = db.execute(
+        text(
+            f"""
+            SELECT
+                {booth_id_col} AS booth_id,
+                {booth_ward_id_col} AS ward_id,
+                {booth_no_col} AS booth_no,
+                {booth_ward_code_col if booth_ward_code_col else 'NULL'} AS ward_code,
+                {booth_name_en_col if booth_name_en_col else 'NULL'} AS booth_name_en,
+                {booth_name_local_col if booth_name_local_col else 'NULL'} AS booth_name_local
+            FROM public.booths
+            ORDER BY {booth_ward_id_col}, {booth_no_col}
+            """
+        )
+    ).all()
+
+    ward_id_col = "id" if "id" in ward_cols else ("ward_id" if "ward_id" in ward_cols else None)
+    ward_code_col = "ward_code" if "ward_code" in ward_cols else ("ward_no" if "ward_no" in ward_cols else None)
+    ward_name_en_col = "ward_name_en" if "ward_name_en" in ward_cols else ("name_en" if "name_en" in ward_cols else None)
+    ward_name_local_col = "ward_name_local" if "ward_name_local" in ward_cols else ("name_kannada" if "name_kannada" in ward_cols else None)
+
+    ward_map: Dict[Any, Dict[str, Any]] = {}
+    if ward_id_col:
+        ward_rows = db.execute(
+            text(
+                f"""
+                SELECT
+                    {ward_id_col} AS ward_id,
+                    {ward_code_col if ward_code_col else 'NULL'} AS ward_code,
+                    {ward_name_en_col if ward_name_en_col else 'NULL'} AS ward_name_en,
+                    {ward_name_local_col if ward_name_local_col else 'NULL'} AS ward_name_local
+                FROM public.wards
+                """
+            )
+        ).all()
+        for w in ward_rows:
+            ward_map[w.ward_id] = {
+                "wardId": w.ward_id,
+                "wardCode": str(w.ward_code) if w.ward_code is not None else None,
+                "wardNameEn": w.ward_name_en or (f"Ward {w.ward_id}"),
+                "wardNameLocal": w.ward_name_local,
+                "booths": [],
+            }
+
+    voter_sr_col = "sl" if "sl" in voter_cols else ("sr_no" if "sr_no" in voter_cols else None)
+    voter_epic_col = "epic" if "epic" in voter_cols else ("epic_no" if "epic_no" in voter_cols else None)
+    voter_name_en_col = "name_en" if "name_en" in voter_cols else ("first_middle_name_en" if "first_middle_name_en" in voter_cols else None)
+    voter_name_local_col = "name_kannada" if "name_kannada" in voter_cols else ("first_middle_name_local" if "first_middle_name_local" in voter_cols else None)
+    voter_house_col = "house" if "house" in voter_cols else ("house_no_en" if "house_no_en" in voter_cols else None)
+    voter_gender_col = "gender" if "gender" in voter_cols else None
+    voter_booth_no_col = "booth_no" if "booth_no" in voter_cols else ("booth_id" if "booth_id" in voter_cols else None)
+    voter_ward_code_col = "ward_code" if "ward_code" in voter_cols else None
+
+    if not voter_booth_no_col:
+        raise ValueError("public.voters missing booth mapping column")
+
+    voters_by_key: Dict[tuple, List[Dict[str, Any]]] = {}
+    counts_by_key: Dict[tuple, Dict[str, int]] = {}
+
+    if include_voters:
+        voter_rows = db.execute(
+            text(
+                f"""
+                SELECT
+                    ROW_NUMBER() OVER () AS voter_id,
+                    {voter_sr_col if voter_sr_col else 'NULL'} AS sr_no,
+                    {voter_epic_col if voter_epic_col else 'NULL'} AS epic_no,
+                    {voter_name_en_col if voter_name_en_col else 'NULL'} AS name_en,
+                    {voter_name_local_col if voter_name_local_col else 'NULL'} AS name_local,
+                    {voter_house_col if voter_house_col else 'NULL'} AS house_no_en,
+                    {voter_gender_col if voter_gender_col else 'NULL'} AS gender,
+                    {voter_booth_no_col} AS booth_no,
+                    {voter_ward_code_col if voter_ward_code_col else 'NULL'} AS ward_code
+                FROM public.voters
+                """
+            )
+        ).all()
+
+        for v in voter_rows:
+            key = (str(v.ward_code) if v.ward_code is not None else None, str(v.booth_no))
+            voters_by_key.setdefault(key, []).append(
+                {
+                    "voterId": int(v.voter_id),
+                    "srNo": v.sr_no,
+                    "epicNo": v.epic_no,
+                    "firstMiddleNameEn": v.name_en,
+                    "lastNameEn": "",
+                    "firstMiddleNameLocal": v.name_local,
+                    "lastNameLocal": "",
+                    "houseNoEn": str(v.house_no_en) if v.house_no_en is not None else None,
+                    "houseNoLocal": None,
+                    "gender": v.gender,
+                    "age": None,
+                    "dob": None,
+                    "mobile": None,
+                    "addressEn": None,
+                    "addressLocal": None,
+                    "status": None,
+                    "community": None,
+                    "caste": None,
+                    "residenceType": None,
+                    "civicIssue": None,
+                    "motherTongue": None,
+                    "team": None,
+                    "ownership": None,
+                    "education": None,
+                    "natureOfVoter": None,
+                    "latitude": None,
+                    "longitude": None,
+                }
+            )
+        for key, rows in voters_by_key.items():
+            male = sum(1 for r in rows if (r.get("gender") or "").upper().startswith("M"))
+            female = sum(1 for r in rows if (r.get("gender") or "").upper().startswith("F"))
+            counts_by_key[key] = {"total": len(rows), "male": male, "female": female}
+    else:
+        if voter_gender_col:
+            counts_rows = db.execute(
+                text(
+                    f"""
+                    SELECT
+                        {voter_ward_code_col if voter_ward_code_col else 'NULL'} AS ward_code,
+                        {voter_booth_no_col} AS booth_no,
+                        COUNT(*)::int AS total_count,
+                        SUM(CASE WHEN UPPER(COALESCE({voter_gender_col}, '')) LIKE 'M%' THEN 1 ELSE 0 END)::int AS male_count,
+                        SUM(CASE WHEN UPPER(COALESCE({voter_gender_col}, '')) LIKE 'F%' THEN 1 ELSE 0 END)::int AS female_count
+                    FROM public.voters
+                    GROUP BY {voter_ward_code_col if voter_ward_code_col else 'NULL'}, {voter_booth_no_col}
+                    """
+                )
+            ).all()
+        else:
+            counts_rows = db.execute(
+                text(
+                    f"""
+                    SELECT
+                        {voter_ward_code_col if voter_ward_code_col else 'NULL'} AS ward_code,
+                        {voter_booth_no_col} AS booth_no,
+                        COUNT(*)::int AS total_count,
+                        0::int AS male_count,
+                        0::int AS female_count
+                    FROM public.voters
+                    GROUP BY {voter_ward_code_col if voter_ward_code_col else 'NULL'}, {voter_booth_no_col}
+                    """
+                )
+            ).all()
+        for row in counts_rows:
+            key = (str(row.ward_code) if row.ward_code is not None else None, str(row.booth_no))
+            counts_by_key[key] = {
+                "total": int(row.total_count or 0),
+                "male": int(row.male_count or 0),
+                "female": int(row.female_count or 0),
+            }
+
+    for b in booth_rows:
+        ward_id = b.ward_id
+        if ward_id not in ward_map:
+            ward_map[ward_id] = {
+                "wardId": ward_id,
+                "wardCode": str(b.ward_code) if b.ward_code is not None else None,
+                "wardNameEn": f"Ward {ward_id}",
+                "wardNameLocal": None,
+                "booths": [],
+            }
+
+        key = (str(b.ward_code) if b.ward_code is not None else None, str(b.booth_no))
+        booth_entry = {
+            "boothId": int(b.booth_id),
+            "boothNameEn": b.booth_name_en or (f"Booth {b.booth_no}"),
+            "boothNameLocal": b.booth_name_local,
+            "voterStats": counts_by_key.get(key, {"total": 0, "male": 0, "female": 0}),
+        }
+        if include_voters:
+            booth_entry["voters"] = voters_by_key.get(key, [])
+        else:
+            booth_entry["voters"] = []
+        ward_map[ward_id]["booths"].append(booth_entry)
+
+    return {
+        "assembly": {
+            "assemblyId": None,
+            "assemblyCode": assembly_code,
+            "assemblyNameEn": None,
+            "assemblyNameLocal": None,
+            "wards": sorted(list(ward_map.values()), key=lambda w: (w.get("wardCode") or str(w["wardId"]))),
+        }
     }
 
 

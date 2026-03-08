@@ -1,70 +1,126 @@
 # Implementation Document
 
-## Project
-- Repository: `votabase-backend`
-- Date: March 6, 2026
+## Project Scope
+- Backend: `votabase-backend`
+- Frontend: `Votabase-mobile-ui`
+- Runtime target DB: `Survey_Production (13.233.40.235:5432/surveydb)`
+- Date: March 9, 2026
 
-## User Requests Captured
-1. Run the app.
-2. Create one implementation document containing every point requested with proposed solutions.
+## Requested Outcomes
+1. Backend and mobile app must connect correctly.
+2. APIs should use Survey_Production data, especially `public.assembly`, `public.wards`, `public.booths`, `public.voters`.
+3. Resolve auth and visibility issues for booth/snapshot APIs.
+4. Fix large snapshot response problem (5+ lakh voters) causing Postman and iOS failures.
+5. Keep response structures compatible with app usage.
+6. Ensure local backend logs clearly show incoming API hits and DB target.
 
-## Work Completed
-1. Inspected project structure and startup docs.
-2. Identified runtime stack: FastAPI + Uvicorn + PostgreSQL.
-3. Created local virtual environment: `.venv`.
-4. Installed dependencies from `requirements.txt`.
-5. Attempted to start app:
-   - Command: `source .venv/bin/activate && uvicorn app.main:app --host 0.0.0.0 --port 8081`
+## Final Design Implemented
+1. Keep snapshot API as link-based response to avoid huge direct payload.
+2. Add lightweight snapshot mode for booth listing:
+   - `GET /votebase/v1/api/voters/snapshot?assemblyCode=...&includeVoters=false`
+   - Returns all wards/booths + `voterStats`, with `voters: []`.
+3. Add booth-level lazy voter load:
+   - `GET /votebase/v1/api/voters/by-booth?boothId=...`
+   - Returns one booth with full voters list.
+4. Update mobile to use lightweight snapshot for Search Booth and fetch booth voters on tap.
+5. Cache only lite snapshot for booth search use-case.
 
-## Observed Issue
-- App startup fails during DB-dependent startup logic (super admin seed path).
-- Error summary:
-  - Could not connect to PostgreSQL host `65.0.75.0:5432`
-  - Failure mode observed: `Operation not permitted` / `Operation timed out`
-- Effect:
-  - API never finishes startup.
-  - Port `8081` is not bound.
+## Backend Changes
+File: `votabase-backend/app/main.py`
 
-## Root Cause
-- The application requires active PostgreSQL connectivity during startup.
-- Current configured database endpoint is unreachable from this run environment.
+1. Environment loading
+- `.env` values now override inherited shell envs for deterministic runtime.
 
-## Proposed Solution
-### Option A (Recommended): Use a reachable dev/local PostgreSQL
-1. Update `.env` `DATABASE_URL` to a reachable DB (local docker or accessible dev DB).
-2. Verify connectivity with a DB check (`psql` or SQLAlchemy test connect).
-3. Start app again on `8081`.
-4. Validate API responds at:
-   - `http://127.0.0.1:8081/votebase/v1`
+2. Startup/diagnostic logs
+- Added DB target startup log:
+  - `[DB_TARGET] host:port/db`
+- Fixed DB target regex parsing.
 
-### Option B: Make startup DB seed optional
-1. Guard startup seeding with an env flag (example: `SEED_ON_STARTUP=true/false`).
-2. Skip seed flow when DB is unavailable or when flag is disabled.
-3. Allow API process boot for non-DB smoke checks.
-4. Re-enable seeding in connected environments.
+3. Request logging middleware
+- Added request logs for key APIs with auth presence, status, duration.
+- Added masked body logging for selected endpoints (phone/token/password masked).
 
-### Option C: Add resilience + diagnostics
-1. Add retry with timeout/backoff for initial DB connect.
-2. Improve startup log message with explicit DB host/port and env hint.
-3. Fail fast with clear actionable error if DB remains unreachable.
+4. Booth API source change
+- `/votebase/v1/api/booth` now reads from `public.booths`.
+- Returns all booths for authenticated users.
 
-## Implementation Plan (Pragmatic)
-1. Confirm preferred approach (A/B/C or combo).
-2. If A:
-   - Update `.env` and rerun app.
-3. If B:
-   - Patch startup logic in `app/main.py` to gate seeding by env.
-4. Validate with:
-   - Process starts cleanly
-   - Port `8081` listening
-   - Base route responds
+5. Snapshot link mode
+- `/voters/snapshot` returns URL in `data.result`.
+- `/voters/snapshot/content/{snapshot_id}` serves cached snapshot payload.
+- Added short-lived in-memory cache and cleanup.
 
-## Acceptance Criteria
-1. App process starts without crashing.
-2. `uvicorn` binds `0.0.0.0:8081`.
-3. Endpoint under `/votebase/v1` responds (even if auth-protected).
-4. Startup logs are actionable for DB failure scenarios.
+6. Public table snapshot mapper
+- Added dynamic schema column detection via `information_schema`.
+- Added `_build_public_snapshot(..., include_voters=bool)` mapping:
+  - `public.wards` + `public.booths` + `public.voters`
+  - Compatible output shape: `assembly -> wards -> booths -> voters`.
 
-## Notes
-- No destructive changes were made.
-- Dependencies are installed in `.venv`.
+7. Lightweight snapshot mode
+- `includeVoters=false` support:
+  - omits large voter arrays in snapshot
+  - adds per-booth stats:
+    - `voterStats.total`
+    - `voterStats.male`
+    - `voterStats.female`
+
+8. New per-booth voters endpoint
+- Added `/votebase/v1/api/voters/by-booth?boothId=...`
+- Uses `public.booths/public.voters/public.wards`
+- Returns booth metadata + full voters + `voterStats`.
+
+## Frontend Changes
+Files:
+- `Votabase-mobile-ui/src/apis/Api.js`
+- `Votabase-mobile-ui/src/screens/VotersManagement/SearchBooth.tsx`
+- `Votabase-mobile-ui/src/screens/LoginManagement/LoadData.tsx`
+
+1. New API wrappers
+- `loadDataLite()` calls snapshot with `includeVoters=false`.
+- `fetchBoothVoters(boothId)` calls new `by-booth` endpoint.
+
+2. SearchBooth flow updated
+- Uses lightweight snapshot endpoint.
+- Stores compact snapshot in AsyncStorage key: `boothSnapshotLite`.
+- Displays stats from `voterStats` without loading full voters.
+- On booth tap: fetches full voters for selected booth only, then navigates.
+
+3. LoadData behavior updated
+- Loads/stores lite snapshot (`boothSnapshotLite`) instead of huge full payload for this flow.
+
+## Root Cause of "String length exceeds limit"
+1. Mobile app attempted to parse/store very large JSON snapshot containing all voters.
+2. JS engine / bridge / AsyncStorage limits triggered on large string/object operations.
+3. Postman also hit maximum response size when requesting huge content links.
+
+## Fix Strategy for 5-Lakh Response Issue
+1. Do not return full dataset in one request for UI bootstrap.
+2. Return compact structure + counts for listing/search pages.
+3. Fetch full voters only for selected booth (lazy load).
+4. Optional next step: paginate `by-booth` results if some booths are very large.
+
+## Validation Performed
+1. Verified backend points to Survey_Production from startup log:
+   - `[DB_TARGET] 13.233.40.235:5432/surveydb`
+2. Verified compact snapshot on live backend:
+   - `WARDS = 27`
+   - `BOOTHS = 508`
+   - First booth has `voterStats`
+   - First booth `voters` length is `0` when `includeVoters=false`
+3. Verified per-booth endpoint returns full voters and correct stats.
+4. Verified API hit logs appear in backend terminal for requested endpoints.
+
+## Operational Notes
+1. If old behavior appears, backend was running stale process.
+2. Must restart backend on `8082` after code changes.
+3. For Postman:
+   - Use snapshot lite endpoint first.
+   - Then open returned content link.
+   - Do not test old heavy content links.
+
+## Current Recommended API Usage Pattern
+1. App startup / booth search:
+   - `GET /voters/snapshot?...&includeVoters=false`
+2. Booth open:
+   - `GET /voters/by-booth?boothId=...`
+3. Optional voter-global search pages:
+   - keep scoped/filter-based loading, avoid full assembly-wide voter blob.
