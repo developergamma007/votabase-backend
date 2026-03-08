@@ -5,6 +5,7 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import boto3
@@ -94,7 +95,7 @@ class User(Base):
 
 
 class Assembly(Base):
-    __tablename__ = "assembly_details"
+    __tablename__ = "assembly"
     __table_args__ = {"schema": "data"}
 
     assembly_id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -105,11 +106,11 @@ class Assembly(Base):
 
 
 class Ward(Base):
-    __tablename__ = "ward_details"
+    __tablename__ = "wards"
     __table_args__ = {"schema": "data"}
 
     ward_id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    assembly_id: Mapped[int] = mapped_column(ForeignKey("data.assembly_details.assembly_id"))
+    assembly_id: Mapped[int] = mapped_column(ForeignKey("data.assembly.assembly_id"))
     tenant_id: Mapped[str] = mapped_column(String(20))
     ward_name_en: Mapped[Optional[str]] = mapped_column(String(255))
     ward_name_local: Mapped[Optional[str]] = mapped_column(String(255))
@@ -117,11 +118,11 @@ class Ward(Base):
 
 
 class Booth(Base):
-    __tablename__ = "booth_details"
+    __tablename__ = "booths"
     __table_args__ = {"schema": "data"}
 
     booth_id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    ward_id: Mapped[int] = mapped_column(ForeignKey("data.ward_details.ward_id"))
+    ward_id: Mapped[int] = mapped_column(ForeignKey("data.wards.ward_id"))
     tenant_id: Mapped[str] = mapped_column(String(20))
     polling_station_adr_en: Mapped[Optional[str]] = mapped_column(String(255))
     polling_station_adr_local: Mapped[Optional[str]] = mapped_column(String(255))
@@ -133,7 +134,7 @@ class Association(Base):
 
     association_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     association_name: Mapped[str] = mapped_column(String(100))
-    booth_id: Mapped[Optional[int]] = mapped_column(ForeignKey("data.booth_details.booth_id"))
+    booth_id: Mapped[Optional[int]] = mapped_column(ForeignKey("data.booths.booth_id"))
     association_address: Mapped[Optional[str]] = mapped_column(String)
     association_head_name: Mapped[Optional[str]] = mapped_column(String)
     phone: Mapped[Optional[str]] = mapped_column(String)
@@ -143,12 +144,12 @@ class Association(Base):
 
 
 class Voter(Base):
-    __tablename__ = "voter_details"
+    __tablename__ = "voters"
     __table_args__ = {"schema": "data"}
 
     voter_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(20))
-    booth_id: Mapped[int] = mapped_column("booth_id", ForeignKey("data.booth_details.booth_id"))
+    booth_id: Mapped[int] = mapped_column("booth_id", ForeignKey("data.booths.booth_id"))
     sr_no: Mapped[Optional[int]] = mapped_column(Integer)
     epic_no: Mapped[Optional[str]] = mapped_column(String(20), unique=True)
     first_middle_name_en: Mapped[Optional[str]] = mapped_column(String(150))
@@ -196,7 +197,7 @@ class Family(Base):
     points_provided: Mapped[Optional[int]] = mapped_column(Integer)
     latitude: Mapped[Optional[float]] = mapped_column(Double)
     longitude: Mapped[Optional[float]] = mapped_column(Double)
-    booth_id: Mapped[int] = mapped_column(ForeignKey("data.booth_details.booth_id"))
+    booth_id: Mapped[int] = mapped_column(ForeignKey("data.booths.booth_id"))
     association_id: Mapped[Optional[int]] = mapped_column(ForeignKey("data.association.association_id"))
     economic_status: Mapped[Optional[str]] = mapped_column(String(50))
     family_nature: Mapped[Optional[str]] = mapped_column(String(50))
@@ -209,7 +210,7 @@ class FamilyMember(Base):
 
     member_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     family_id: Mapped[int] = mapped_column(ForeignKey("data.family.family_id"))
-    voter_id: Mapped[int] = mapped_column(ForeignKey("data.voter_details.voter_id"))
+    voter_id: Mapped[int] = mapped_column(ForeignKey("data.voters.voter_id"))
     is_head: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
@@ -235,7 +236,7 @@ class VoterChangeLog(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(20))
-    voter_id: Mapped[int] = mapped_column(ForeignKey("data.voter_details.voter_id"))
+    voter_id: Mapped[int] = mapped_column(ForeignKey("data.voters.voter_id"))
     updated_by: Mapped[int] = mapped_column(ForeignKey("metastore.users.id"))
     field_name: Mapped[str] = mapped_column(String(100))
     old_value: Mapped[Optional[str]] = mapped_column(String)
@@ -400,19 +401,22 @@ class UserDetailsIn(BaseModel):
 
 
 class UserBlockRequest(BaseModel):
-    firstName: str
-    phone: str
+    firstName: Optional[str] = None
+    phone: Optional[str] = None
+    userEmail: Optional[str] = None
     block: bool
 
 
 class UserDeleteRequest(BaseModel):
-    firstName: str
-    phone: str
+    firstName: Optional[str] = None
+    phone: Optional[str] = None
+    userEmail: Optional[str] = None
     delete: bool
 
 
 class UserBulkActionRequest(BaseModel):
-    userFirstNames: List[str]
+    userFirstNames: Optional[List[str]] = None
+    userEmails: Optional[List[str]] = None
     action: bool
 
 
@@ -480,6 +484,8 @@ def to_user_details(u: User) -> Dict[str, Any]:
         "assignmentType": u.assignment_type,
         "assignmentId": u.assignment_id,
         "firstName": u.first_name,
+        "lastName": "",
+        "userName": u.first_name,
         "phone": u.phone,
         "profilePicUrl": u.profile_pic_url,
         "blocked": u.blocked,
@@ -566,6 +572,41 @@ def normalize_assembly_code(value: Any) -> str:
     if len(s) == 12:
         return s
     return f"{int(s):012d}"
+
+
+def normalize_optional_text(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    trimmed = value.strip()
+    return trimmed if trimmed else None
+
+
+def parse_optional_bool(value: Optional[str | bool]) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    cleaned = normalize_optional_text(value)
+    if cleaned is None:
+        return None
+    lowered = cleaned.lower()
+    if lowered in {"true", "1", "yes"}:
+        return True
+    if lowered in {"false", "0", "no"}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value}")
+
+
+def resolve_user_first_name(first_name: Optional[str], fallback_username: Optional[str]) -> Optional[str]:
+    return normalize_optional_text(first_name) or normalize_optional_text(fallback_username)
+
+
+def resolve_bulk_usernames(payload: UserBulkActionRequest) -> List[str]:
+    candidates = payload.userFirstNames if payload.userFirstNames is not None else payload.userEmails
+    if not candidates:
+        raise ValueError("At least one user identifier is required")
+    usernames = [name.strip() for name in candidates if name and name.strip()]
+    if not usernames:
+        raise ValueError("At least one valid user identifier is required")
+    return usernames
 
 
 # ---------------------------
@@ -691,13 +732,13 @@ def get_dashboard(user: JwtUserDetails = Depends(require_roles("ADMIN"))):
 
 @app.post(f"{CONTEXT_PATH}/api/user/register")
 def register_user(payload: UserDetailsIn, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN"))):
-    if not payload.role:
-        raise ValueError("Role is required")
-
     if current.role != "ADMIN":
         raise HTTPException(status_code=403, detail="You are not authorized to create users")
-    if payload.role != "USER":
-        raise ValueError("ADMIN can only create USER users")
+
+    requested_role = (payload.role or "").strip().upper()
+    role_to_create = "USER"
+    if requested_role not in {"", "USER", "ADMIN"}:
+        raise ValueError("Invalid role in register request")
 
     tenant = db.query(Tenant).filter(Tenant.tenant_id == current.tenantId).first()
     if not tenant:
@@ -708,7 +749,7 @@ def register_user(payload: UserDetailsIn, db: Session = Depends(get_db), current
         raise ResourceAlreadyExistsException("registerUser", "userName", payload.firstName)
 
     user = User(
-        role=payload.role,
+        role=role_to_create,
         tenant_ref=tenant.id,
         assignment_type=payload.assignmentType,
         assignment_id=payload.assignmentId,
@@ -721,34 +762,41 @@ def register_user(payload: UserDetailsIn, db: Session = Depends(get_db), current
     db.commit()
 
     out = payload.model_dump()
+    out["role"] = role_to_create
     out["tenantId"] = current.tenantId
+    out["userName"] = payload.firstName
     return api_success("User registered successfully", out)
 
 
 @app.put(f"{CONTEXT_PATH}/api/user/block")
 def block_user(payload: UserBlockRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN"))):
+    target_first_name = resolve_user_first_name(payload.firstName, payload.userEmail)
+    if not target_first_name:
+        raise ValueError("firstName or userEmail is required")
+
     user = (
         db.query(User)
         .join(Tenant, User.tenant_ref == Tenant.id)
-        .filter(User.first_name == payload.firstName, User.phone == payload.phone, Tenant.tenant_id == current.tenantId)
+        .filter(User.first_name == target_first_name, Tenant.tenant_id == current.tenantId)
         .first()
     )
     if not user:
-        return api_error("User not found", {"details": f"User not found with FirstName: '{payload.firstName}'"})
+        return api_error("User not found", {"details": f"User not found with FirstName: '{target_first_name}'"})
 
     user.blocked = payload.block
     db.commit()
     action = "blocked" if payload.block else "unblocked"
-    return api_success(f"User {action} successfully", {"firstname": payload.firstName})
+    return api_success(f"User {action} successfully", {"firstName": target_first_name})
 
 
 @app.get(f"{CONTEXT_PATH}/api/user")
 def list_users(
+    role: Optional[str] = None,
     page: int = 0,
     size: int = 10,
     search: Optional[str] = None,
-    blocked: Optional[bool] = None,
-    deleted: Optional[bool] = None,
+    blocked: Optional[str] = None,
+    deleted: Optional[str] = None,
     assignmentType: Optional[str] = None,
     sortBy: str = "firstName",
     direction: str = "asc",
@@ -757,12 +805,16 @@ def list_users(
 ):
     q = db.query(User).join(Tenant, User.tenant_ref == Tenant.id).filter(User.role == "USER", Tenant.tenant_id == current.tenantId)
 
-    if blocked is not None:
-        q = q.filter(User.blocked == blocked)
-    if deleted is not None:
-        q = q.filter(User.deleted == deleted)
-    if assignmentType is not None:
-        q = q.filter(User.assignment_type == assignmentType)
+    blocked_filter = parse_optional_bool(blocked)
+    deleted_filter = parse_optional_bool(deleted)
+    assignment_type_filter = normalize_optional_text(assignmentType)
+
+    if blocked_filter is not None:
+        q = q.filter(User.blocked == blocked_filter)
+    if deleted_filter is not None:
+        q = q.filter(User.deleted == deleted_filter)
+    if assignment_type_filter is not None:
+        q = q.filter(User.assignment_type == assignment_type_filter)
     if search and search.strip():
         s = f"%{search.lower()}%"
         q = q.filter(or_(func.lower(User.first_name).like(s), User.phone.like(f"%{search}%")))
@@ -786,10 +838,19 @@ def list_users(
 
 
 @app.put(f"{CONTEXT_PATH}/api/user/delete")
-def delete_user(payload: UserDeleteRequest, db: Session = Depends(get_db), _: JwtUserDetails = Depends(require_roles("ADMIN"))):
-    user = db.query(User).filter(User.first_name == payload.firstName, User.phone == payload.phone).first()
+def delete_user(payload: UserDeleteRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN"))):
+    target_first_name = resolve_user_first_name(payload.firstName, payload.userEmail)
+    if not target_first_name:
+        raise ValueError("firstName or userEmail is required")
+
+    user = (
+        db.query(User)
+        .join(Tenant, User.tenant_ref == Tenant.id)
+        .filter(User.first_name == target_first_name, Tenant.tenant_id == current.tenantId)
+        .first()
+    )
     if not user:
-        return api_error("User not found", {"details": f"User not found with FirstName: '{payload.firstName}'"})
+        return api_error("User not found", {"details": f"User not found with FirstName: '{target_first_name}'"})
 
     user.deleted = payload.delete
     db.commit()
@@ -799,38 +860,40 @@ def delete_user(payload: UserDeleteRequest, db: Session = Depends(get_db), _: Jw
 
 @app.put(f"{CONTEXT_PATH}/api/user/block/bulk")
 def bulk_block(payload: UserBulkActionRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN"))):
+    usernames = resolve_bulk_usernames(payload)
     users = (
         db.query(User)
         .join(Tenant, User.tenant_ref == Tenant.id)
-        .filter(Tenant.tenant_id == current.tenantId, User.first_name.in_(payload.userFirstNames))
+        .filter(Tenant.tenant_id == current.tenantId, User.first_name.in_(usernames))
         .all()
     )
-    if len(users) != len(payload.userFirstNames):
+    if len(users) != len(usernames):
         return api_error("Some users not found", {"details": "Some users not found"})
 
     for user in users:
         user.blocked = payload.action
     db.commit()
     action = "blocked" if payload.action else "unblocked"
-    return api_success(f"Users {action} successfully", {"emails": payload.userFirstNames})
+    return api_success(f"Users {action} successfully", {"emails": usernames})
 
 
 @app.put(f"{CONTEXT_PATH}/api/user/delete/bulk")
 def bulk_delete(payload: UserBulkActionRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN"))):
+    usernames = resolve_bulk_usernames(payload)
     users = (
         db.query(User)
         .join(Tenant, User.tenant_ref == Tenant.id)
-        .filter(Tenant.tenant_id == current.tenantId, User.first_name.in_(payload.userFirstNames))
+        .filter(Tenant.tenant_id == current.tenantId, User.first_name.in_(usernames))
         .all()
     )
-    if len(users) != len(payload.userFirstNames):
+    if len(users) != len(usernames):
         return api_error("Some users not found", {"details": "Some users not found"})
 
     for user in users:
         user.deleted = payload.action
     db.commit()
     action = "deleted" if payload.action else "restored"
-    return api_success(f"Users {action} successfully", {"emails": payload.userFirstNames})
+    return api_success(f"Users {action} successfully", {"emails": usernames})
 
 
 @app.get(f"{CONTEXT_PATH}/api/user/profile")
@@ -846,6 +909,8 @@ def get_profile(db: Session = Depends(get_db), current: JwtUserDetails = Depends
 
     return {
         "firstName": user.first_name,
+        "lastName": "",
+        "userName": user.first_name,
         "phone": user.phone,
         "profilePicUrl": presigned,
         "tenantId": user.tenant.tenant_id if user.tenant else None,
@@ -882,6 +947,8 @@ def upload_profile(file: UploadFile = File(...), db: Session = Depends(get_db), 
     presigned = s3_presigned_url(key, 15, fallback_url=s3_url)
     return {
         "firstName": user.first_name,
+        "lastName": "",
+        "userName": user.first_name,
         "phone": user.phone,
         "profilePicUrl": presigned,
         "tenantId": user.tenant.tenant_id if user.tenant else None,
@@ -954,7 +1021,7 @@ def list_tenants(page: int = 0, size: int = 10, db: Session = Depends(get_db), _
 
 
 @app.get(f"{CONTEXT_PATH}/api/assignments")
-def get_assignments(type: str = Query(...), db: Session = Depends(get_db), _: JwtUserDetails = Depends(require_roles("ADMIN", "USER"))):
+def get_assignments(type: str = Query(...), db: Session = Depends(get_db), _: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER"))):
     t = type.upper()
     if t == "ASSEMBLY":
         rows = db.query(Assembly).order_by(Assembly.assembly_name_en.asc()).all()
@@ -969,8 +1036,12 @@ def get_assignments(type: str = Query(...), db: Session = Depends(get_db), _: Jw
 
 
 @app.get(f"{CONTEXT_PATH}/api/booth")
-def get_booths(db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN", "USER"))):
-    if current.assignmentType == "ASSEMBLY":
+def get_booths(db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER"))):
+    if current.role == "SUPER_ADMIN":
+        booths = db.query(Booth).all()
+    elif current.role == "ADMIN" or not current.assignmentType:
+        booths = db.query(Booth).filter(Booth.tenant_id == current.tenantId).all()
+    elif current.assignmentType == "ASSEMBLY":
         # Mimic Java behavior: compare assembly_id with assignmentId cast to string.
         booths = (
             db.query(Booth)
@@ -1143,28 +1214,20 @@ def get_voters(
 
 
 @app.get(f"{CONTEXT_PATH}/api/voters/snapshot")
-def get_snapshot(assemblyCode: str, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("USER", "ADMIN"))):
+def get_snapshot(assemblyCode: str, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "USER", "ADMIN"))):
     try:
-        assembly = (
-            db.query(Assembly)
-            .filter(
-                Assembly.tenant_id == current.tenantId,
-                Assembly.assembly_code == assemblyCode,
-            )
-            .first()
-        )
+        assembly_q = db.query(Assembly).filter(Assembly.assembly_code == assemblyCode)
+        if current.role != "SUPER_ADMIN":
+            assembly_q = assembly_q.filter(Assembly.tenant_id == current.tenantId)
+        assembly = assembly_q.first()
         if not assembly:
             raise ValueError(f"Assembly not found for assemblyCode: {assemblyCode}")
 
-        if current.assignmentType == "ASSEMBLY":
-            wards = (
-                db.query(Ward)
-                .filter(
-                    Ward.tenant_id == current.tenantId,
-                    Ward.assembly_id == assembly.assembly_id,
-                )
-                .all()
-            )
+        if current.role == "SUPER_ADMIN":
+            wards = db.query(Ward).filter(Ward.assembly_id == assembly.assembly_id).all()
+            snapshot = _build_assembly_json(db, assembly, wards, True, None)
+        elif current.role == "ADMIN" or not current.assignmentType or current.assignmentType == "ASSEMBLY":
+            wards = db.query(Ward).filter(Ward.tenant_id == current.tenantId, Ward.assembly_id == assembly.assembly_id).all()
             snapshot = _build_assembly_json(db, assembly, wards, True, current.tenantId)
         elif current.assignmentType == "WARD":
             ward = (
@@ -1433,14 +1496,15 @@ def list_families(
     page: int = 0,
     size: int = 10,
     search: Optional[str] = None,
-    association: Optional[bool] = None,
+    association: Optional[str] = None,
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("ADMIN", "USER")),
 ):
     q = db.query(Family).filter(Family.tenant_id == current.tenantId, Family.booth_id == boothId, Family.deleted.is_(False))
 
-    if association is not None:
-        if association:
+    association_filter = parse_optional_bool(association)
+    if association_filter is not None:
+        if association_filter:
             q = q.filter(Family.association_id.is_not(None))
         else:
             q = q.filter(Family.association_id.is_(None))
@@ -1672,7 +1736,13 @@ def _upload_and_save_snapshot(db: Session, data: Dict[str, Any], key: str, tenan
         )
 
 
-def _build_assembly_json(db: Session, assembly: Assembly, wards: List[Ward], include_voters: bool, tenant_id: str) -> Dict[str, Any]:
+def _build_assembly_json(
+    db: Session,
+    assembly: Assembly,
+    wards: List[Ward],
+    include_voters: bool,
+    tenant_id: Optional[str],
+) -> Dict[str, Any]:
     assembly_map: Dict[str, Any] = {
         "assemblyId": assembly.assembly_id,
         "assemblyNameEn": assembly.assembly_name_en,
@@ -1687,7 +1757,10 @@ def _build_assembly_json(db: Session, assembly: Assembly, wards: List[Ward], inc
             "wardNameLocal": ward.ward_name_local,
         }
 
-        booths = db.query(Booth).filter(Booth.tenant_id == tenant_id, Booth.ward_id == ward.ward_id).all()
+        booths_q = db.query(Booth).filter(Booth.ward_id == ward.ward_id)
+        if tenant_id is not None:
+            booths_q = booths_q.filter(Booth.tenant_id == tenant_id)
+        booths = booths_q.all()
         booth_list: List[Dict[str, Any]] = []
         for booth in booths:
             booth_map: Dict[str, Any] = {
@@ -1696,7 +1769,10 @@ def _build_assembly_json(db: Session, assembly: Assembly, wards: List[Ward], inc
                 "boothNameLocal": booth.polling_station_adr_local,
             }
             if include_voters:
-                voters = db.query(Voter).filter(Voter.tenant_id == tenant_id, Voter.booth_id == booth.booth_id).all()
+                voters_q = db.query(Voter).filter(Voter.booth_id == booth.booth_id)
+                if tenant_id is not None:
+                    voters_q = voters_q.filter(Voter.tenant_id == tenant_id)
+                voters = voters_q.all()
                 booth_map["voters"] = [_build_voter_map(v) for v in voters]
             booth_list.append(booth_map)
 
