@@ -1303,6 +1303,248 @@ def get_voters(
     return [_build_voter_map(v) for v in voters]
 
 
+@app.get(f"{CONTEXT_PATH}/api/voter-search")
+@app.get(f"{CONTEXT_PATH}/api/voters/search")
+def search_voters(
+    assemblyCode: str,
+    searchQuery: Optional[str] = None,
+    wardId: Optional[int] = None,
+    boothNumber: Optional[str] = None,
+    mobileNumber: Optional[str] = None,
+    epicId: Optional[str] = None,
+    relationName: Optional[str] = None,
+    houseNumber: Optional[str] = None,
+    page: int = 0,
+    size: int = 50,
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "USER", "ADMIN")),
+):
+    _ = current
+    booth_cols = _get_table_columns(db, "public", "booths")
+    voter_cols = _get_table_columns(db, "public", "voters")
+    ward_cols = _get_table_columns(db, "public", "wards")
+
+    booth_id_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
+    booth_no_col = "booth_no" if "booth_no" in booth_cols else booth_id_col
+    booth_ward_code_col = "ward_code" if "ward_code" in booth_cols else None
+    booth_ward_id_col = "ward_id" if "ward_id" in booth_cols else None
+    booth_name_en_col = "booth_add_en" if "booth_add_en" in booth_cols else ("polling_station_adr_en" if "polling_station_adr_en" in booth_cols else None)
+    booth_name_local_col = "booth_add_local" if "booth_add_local" in booth_cols else ("polling_station_adr_local" if "polling_station_adr_local" in booth_cols else None)
+
+    if not booth_id_col or not booth_no_col:
+        return JSONResponse(status_code=404, content=api_error("Search failed", "public.booths missing required columns"))
+
+    ward_id_col = "id" if "id" in ward_cols else ("ward_id" if "ward_id" in ward_cols else None)
+    ward_code_col = "ward_code" if "ward_code" in ward_cols else ("ward_no" if "ward_no" in ward_cols else None)
+    ward_name_en_col = "ward_name_en" if "ward_name_en" in ward_cols else ("name_en" if "name_en" in ward_cols else None)
+    ward_name_local_col = "ward_name_local" if "ward_name_local" in ward_cols else ("name_kannada" if "name_kannada" in ward_cols else None)
+
+    ward_by_id: Dict[int, Dict[str, Any]] = {}
+    if ward_id_col:
+        ward_rows = db.execute(
+            text(
+                f"""
+                SELECT
+                    {ward_id_col} AS ward_id,
+                    {ward_code_col if ward_code_col else 'NULL'} AS ward_code,
+                    {ward_name_en_col if ward_name_en_col else 'NULL'} AS ward_name_en,
+                    {ward_name_local_col if ward_name_local_col else 'NULL'} AS ward_name_local
+                FROM public.wards
+                """
+            )
+        ).all()
+        for r in ward_rows:
+            ward_by_id[int(r.ward_id)] = {
+                "wardId": int(r.ward_id),
+                "wardCode": str(r.ward_code) if r.ward_code is not None else None,
+                "wardNameEn": r.ward_name_en,
+                "wardNameLocal": r.ward_name_local,
+            }
+
+    ward_code_filter: Optional[str] = None
+    if wardId is not None and wardId in ward_by_id:
+        ward_code_filter = ward_by_id[wardId].get("wardCode")
+
+    booth_sql = f"""
+        SELECT
+            {booth_id_col} AS booth_id,
+            {booth_no_col} AS booth_no,
+            {booth_ward_code_col if booth_ward_code_col else 'NULL'} AS ward_code,
+            {booth_ward_id_col if booth_ward_id_col else 'NULL'} AS ward_id,
+            {booth_name_en_col if booth_name_en_col else 'NULL'} AS booth_name_en,
+            {booth_name_local_col if booth_name_local_col else 'NULL'} AS booth_name_local
+        FROM public.booths
+    """
+    booth_rows = db.execute(text(booth_sql)).all()
+    booth_by_key: Dict[tuple, Dict[str, Any]] = {}
+    booths_by_no: Dict[str, List[Dict[str, Any]]] = {}
+    for b in booth_rows:
+        row = {
+            "boothId": int(b.booth_id),
+            "boothNo": str(b.booth_no),
+            "wardCode": str(b.ward_code) if b.ward_code is not None else None,
+            "wardId": int(b.ward_id) if b.ward_id is not None else None,
+            "boothNameEn": b.booth_name_en,
+            "boothNameLocal": b.booth_name_local,
+        }
+        booth_by_key[(row["wardCode"], row["boothNo"])] = row
+        booths_by_no.setdefault(row["boothNo"], []).append(row)
+
+    voter_sr_col = "sl" if "sl" in voter_cols else ("sr_no" if "sr_no" in voter_cols else None)
+    voter_epic_col = "epic" if "epic" in voter_cols else ("epic_no" if "epic_no" in voter_cols else None)
+    voter_name_en_col = "name_en" if "name_en" in voter_cols else ("first_middle_name_en" if "first_middle_name_en" in voter_cols else None)
+    voter_name_local_col = "name_kannada" if "name_kannada" in voter_cols else ("first_middle_name_local" if "first_middle_name_local" in voter_cols else None)
+    voter_relation_en_col = "relation_name_en" if "relation_name_en" in voter_cols else ("relation_first_middle_name_en" if "relation_first_middle_name_en" in voter_cols else None)
+    voter_house_col = "house" if "house" in voter_cols else ("house_no_en" if "house_no_en" in voter_cols else None)
+    voter_gender_col = "gender" if "gender" in voter_cols else None
+    voter_mobile_col = "mobile" if "mobile" in voter_cols else None
+    voter_booth_no_col = "booth_no" if "booth_no" in voter_cols else ("booth_id" if "booth_id" in voter_cols else None)
+    voter_ward_code_col = "ward_code" if "ward_code" in voter_cols else None
+
+    if not voter_booth_no_col:
+        return JSONResponse(status_code=404, content=api_error("Search failed", "public.voters missing booth mapping column"))
+
+    where_parts = ["1=1"]
+    params: Dict[str, Any] = {"limit": max(1, min(size, 2000)), "offset": max(page, 0) * max(1, min(size, 2000))}
+
+    if ward_code_filter and voter_ward_code_col:
+        where_parts.append(f"{voter_ward_code_col} = :ward_code")
+        params["ward_code"] = ward_code_filter
+    if boothNumber:
+        where_parts.append(f"CAST({voter_booth_no_col} AS TEXT) ILIKE :booth_number")
+        params["booth_number"] = f"%{boothNumber.strip()}%"
+    if mobileNumber and voter_mobile_col:
+        where_parts.append(f"CAST({voter_mobile_col} AS TEXT) ILIKE :mobile_number")
+        params["mobile_number"] = f"%{mobileNumber.strip()}%"
+    if epicId and voter_epic_col:
+        where_parts.append(f"CAST({voter_epic_col} AS TEXT) ILIKE :epic_id")
+        params["epic_id"] = f"%{epicId.strip()}%"
+    if houseNumber and voter_house_col:
+        where_parts.append(f"CAST({voter_house_col} AS TEXT) ILIKE :house_number")
+        params["house_number"] = f"%{houseNumber.strip()}%"
+    if relationName and voter_relation_en_col:
+        where_parts.append(f"CAST({voter_relation_en_col} AS TEXT) ILIKE :relation_name")
+        params["relation_name"] = f"%{relationName.strip()}%"
+
+    search_fields: List[str] = []
+    if voter_name_en_col:
+        search_fields.append(f"CAST({voter_name_en_col} AS TEXT)")
+    if voter_epic_col:
+        search_fields.append(f"CAST({voter_epic_col} AS TEXT)")
+    if voter_mobile_col:
+        search_fields.append(f"CAST({voter_mobile_col} AS TEXT)")
+    if voter_sr_col:
+        search_fields.append(f"CAST({voter_sr_col} AS TEXT)")
+    search_fields.append(f"CAST({voter_booth_no_col} AS TEXT)")
+    if voter_house_col:
+        search_fields.append(f"CAST({voter_house_col} AS TEXT)")
+    if voter_relation_en_col:
+        search_fields.append(f"CAST({voter_relation_en_col} AS TEXT)")
+    if searchQuery and search_fields:
+        where_parts.append("(" + " OR ".join([f"{f} ILIKE :search_query" for f in search_fields]) + ")")
+        params["search_query"] = f"%{searchQuery.strip()}%"
+
+    where_sql = " AND ".join(where_parts)
+
+    voters_rows = db.execute(
+        text(
+            f"""
+            SELECT
+                ROW_NUMBER() OVER () AS voter_id,
+                {voter_sr_col if voter_sr_col else 'NULL'} AS sr_no,
+                {voter_epic_col if voter_epic_col else 'NULL'} AS epic_no,
+                {voter_name_en_col if voter_name_en_col else 'NULL'} AS name_en,
+                {voter_name_local_col if voter_name_local_col else 'NULL'} AS name_local,
+                {voter_relation_en_col if voter_relation_en_col else 'NULL'} AS relation_name_en,
+                {voter_house_col if voter_house_col else 'NULL'} AS house_no_en,
+                {voter_gender_col if voter_gender_col else 'NULL'} AS gender,
+                {voter_mobile_col if voter_mobile_col else 'NULL'} AS mobile,
+                {voter_booth_no_col} AS booth_no,
+                {voter_ward_code_col if voter_ward_code_col else 'NULL'} AS ward_code
+            FROM public.voters
+            WHERE {where_sql}
+            ORDER BY {voter_booth_no_col}
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        params,
+    ).all()
+
+    result: List[Dict[str, Any]] = []
+    for v in voters_rows:
+        ward_code = str(v.ward_code) if v.ward_code is not None else None
+        booth_no = str(v.booth_no)
+        booth = booth_by_key.get((ward_code, booth_no))
+        if not booth:
+            candidates = booths_by_no.get(booth_no, [])
+            booth = candidates[0] if candidates else None
+
+        ward_id_mapped = booth.get("wardId") if booth else None
+        if wardId is not None and ward_id_mapped is not None and int(ward_id_mapped) != int(wardId):
+            continue
+
+        ward_info = ward_by_id.get(int(ward_id_mapped)) if ward_id_mapped is not None else None
+        result.append(
+            {
+                "voterId": int(v.voter_id),
+                "srNo": v.sr_no,
+                "epicNo": v.epic_no,
+                "firstMiddleNameEn": v.name_en,
+                "lastNameEn": "",
+                "firstMiddleNameLocal": v.name_local,
+                "lastNameLocal": "",
+                "relationFirstMiddleNameEn": v.relation_name_en,
+                "relationLastNameEn": "",
+                "houseNoEn": str(v.house_no_en) if v.house_no_en is not None else None,
+                "houseNoLocal": None,
+                "gender": v.gender,
+                "age": None,
+                "mobile": str(v.mobile) if v.mobile is not None else None,
+                "boothInfo": {
+                    "boothId": booth.get("boothId") if booth else None,
+                    "boothNameEn": booth.get("boothNameEn") if booth else None,
+                    "boothNameLocal": booth.get("boothNameLocal") if booth else None,
+                },
+                "wardId": ward_id_mapped,
+                "wardNameEn": ward_info.get("wardNameEn") if ward_info else None,
+                "wardNameLocal": ward_info.get("wardNameLocal") if ward_info else None,
+            }
+        )
+
+    count_sql = f"""
+        SELECT
+            COUNT(*)::int AS total_count,
+            SUM(CASE WHEN UPPER(COALESCE({voter_gender_col}, '')) LIKE 'M%' THEN 1 ELSE 0 END)::int AS male_count,
+            SUM(CASE WHEN UPPER(COALESCE({voter_gender_col}, '')) LIKE 'F%' THEN 1 ELSE 0 END)::int AS female_count
+        FROM public.voters
+        WHERE {where_sql}
+    """ if voter_gender_col else f"""
+        SELECT
+            COUNT(*)::int AS total_count,
+            0::int AS male_count,
+            0::int AS female_count
+        FROM public.voters
+        WHERE {where_sql}
+    """
+    count_params = {k: v for k, v in params.items() if k not in {"limit", "offset"}}
+    counts = db.execute(text(count_sql), count_params).first()
+    total_count = int((counts.total_count if counts else 0) or 0)
+    male_count = int((counts.male_count if counts else 0) or 0)
+    female_count = int((counts.female_count if counts else 0) or 0)
+
+    payload = api_success("Voter search fetched", result)
+    payload["data"]["meta"] = {
+        "total": total_count,
+        "male": male_count,
+        "female": female_count,
+        "returned": len(result),
+        "page": page,
+        "size": max(1, min(size, 2000)),
+        "hasMore": (max(page, 0) * max(1, min(size, 2000)) + len(result)) < total_count,
+    }
+    return payload
+
+
 @app.get(f"{CONTEXT_PATH}/api/voters/by-booth")
 def get_voters_by_booth(
     boothId: int,
