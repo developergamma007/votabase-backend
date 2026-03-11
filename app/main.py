@@ -1718,7 +1718,7 @@ def get_voters_by_booth(
 def get_snapshot(
     assemblyCode: str,
     request: Request,
-    includeVoters: bool = True,
+    includeVoters: bool = False,
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "USER", "ADMIN")),
 ):
@@ -2313,6 +2313,48 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
 
     voters_by_key: Dict[tuple, List[Dict[str, Any]]] = {}
     counts_by_key: Dict[tuple, Dict[str, int]] = {}
+    relevant_booths = [b for b in booth_rows if not allowed_ward_ids or b.ward_id in allowed_ward_ids]
+    allowed_ward_codes = sorted(
+        {
+            str(w.get("wardCode"))
+            for w in ward_map.values()
+            if w.get("wardCode") is not None and str(w.get("wardCode")).strip() != ""
+        }
+    )
+    allowed_booth_nos = sorted({str(b.booth_no) for b in relevant_booths if b.booth_no is not None})
+
+    def _build_in_clause(column_expr: str, values: List[str], prefix: str) -> tuple[str, Dict[str, Any]]:
+        params: Dict[str, Any] = {}
+        placeholders: List[str] = []
+        for idx, value in enumerate(values):
+            key = f"{prefix}_{idx}"
+            params[key] = value
+            placeholders.append(f":{key}")
+        return f"{column_expr} IN ({', '.join(placeholders)})", params
+
+    voter_where_parts: List[str] = []
+    voter_where_params: Dict[str, Any] = {}
+    if voter_ward_code_col and allowed_ward_codes:
+        clause, params = _build_in_clause(f"CAST({voter_ward_code_col} AS TEXT)", allowed_ward_codes, "ward_code")
+        voter_where_parts.append(clause)
+        voter_where_params.update(params)
+    if allowed_booth_nos:
+        clause, params = _build_in_clause(f"CAST({voter_booth_no_col} AS TEXT)", allowed_booth_nos, "booth_no")
+        voter_where_parts.append(clause)
+        voter_where_params.update(params)
+
+    if not voter_where_parts:
+        return {
+            "assembly": {
+                "assemblyId": assembly_row.assembly_pk,
+                "assemblyCode": assembly_row.assembly_code or requested_assembly_code,
+                "assemblyNameEn": assembly_row.assembly_name_en,
+                "assemblyNameLocal": assembly_row.assembly_name_local,
+                "wards": sorted(list(ward_map.values()), key=lambda w: (w.get("wardCode") or str(w["wardId"]))),
+            }
+        }
+
+    voter_where_sql = " WHERE " + " AND ".join(voter_where_parts)
 
     if include_voters:
         voter_rows = db.execute(
@@ -2329,8 +2371,10 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
                     {voter_booth_no_col} AS booth_no,
                     {voter_ward_code_col if voter_ward_code_col else 'NULL'} AS ward_code
                 FROM public.voters
+                {voter_where_sql}
                 """
-            )
+            ),
+            voter_where_params,
         ).all()
 
         for v in voter_rows:
@@ -2376,30 +2420,34 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
                 text(
                     f"""
                     SELECT
-                        {voter_ward_code_col if voter_ward_code_col else 'NULL'} AS ward_code,
-                        {voter_booth_no_col} AS booth_no,
-                        COUNT(*)::int AS total_count,
-                        SUM(CASE WHEN UPPER(COALESCE({voter_gender_col}, '')) LIKE 'M%' THEN 1 ELSE 0 END)::int AS male_count,
-                        SUM(CASE WHEN UPPER(COALESCE({voter_gender_col}, '')) LIKE 'F%' THEN 1 ELSE 0 END)::int AS female_count
+                    {voter_ward_code_col if voter_ward_code_col else 'NULL'} AS ward_code,
+                    {voter_booth_no_col} AS booth_no,
+                    COUNT(*)::int AS total_count,
+                    SUM(CASE WHEN UPPER(COALESCE({voter_gender_col}, '')) LIKE 'M%' THEN 1 ELSE 0 END)::int AS male_count,
+                    SUM(CASE WHEN UPPER(COALESCE({voter_gender_col}, '')) LIKE 'F%' THEN 1 ELSE 0 END)::int AS female_count
                     FROM public.voters
+                    {voter_where_sql}
                     GROUP BY {voter_ward_code_col if voter_ward_code_col else 'NULL'}, {voter_booth_no_col}
                     """
-                )
+                ),
+                voter_where_params,
             ).all()
         else:
             counts_rows = db.execute(
                 text(
                     f"""
                     SELECT
-                        {voter_ward_code_col if voter_ward_code_col else 'NULL'} AS ward_code,
-                        {voter_booth_no_col} AS booth_no,
-                        COUNT(*)::int AS total_count,
-                        0::int AS male_count,
-                        0::int AS female_count
+                    {voter_ward_code_col if voter_ward_code_col else 'NULL'} AS ward_code,
+                    {voter_booth_no_col} AS booth_no,
+                    COUNT(*)::int AS total_count,
+                    0::int AS male_count,
+                    0::int AS female_count
                     FROM public.voters
+                    {voter_where_sql}
                     GROUP BY {voter_ward_code_col if voter_ward_code_col else 'NULL'}, {voter_booth_no_col}
                     """
-                )
+                ),
+                voter_where_params,
             ).all()
         for row in counts_rows:
             key = (str(row.ward_code) if row.ward_code is not None else None, str(row.booth_no))
