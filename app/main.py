@@ -371,6 +371,18 @@ def _parse_token(token: str) -> Dict[str, Any]:
     return jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
 
 
+def _resolve_tenant_id(user: Optional[User] = None, payload: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    if user is not None and getattr(user, "tenant", None) is not None:
+        tenant_value = getattr(user.tenant, "tenant_id", None)
+        if tenant_value:
+            return str(tenant_value)
+    if payload is not None:
+        tenant_value = payload.get("tenantId")
+        if tenant_value:
+            return str(tenant_value)
+    return None
+
+
 def _auth_user(request: Request, db: Session) -> JwtUserDetails:
     auth = request.headers.get("Authorization")
     if not auth or not auth.startswith("Bearer "):
@@ -397,7 +409,7 @@ def _auth_user(request: Request, db: Session) -> JwtUserDetails:
         phone=payload.get("phone"),
         firstName=payload.get("firstName"),
         role=payload.get("role"),
-        tenantId=active_tenant_id(),
+        tenantId=_resolve_tenant_id(user=user, payload=payload),
         assignmentType=payload.get("assignmentType"),
         assignmentId=payload.get("assignmentId"),
     )
@@ -517,7 +529,7 @@ class UserProfileDto(BaseModel):
 def to_user_details(u: User) -> Dict[str, Any]:
     return {
         "role": u.role,
-        "tenantId": active_tenant_id(),
+        "tenantId": _resolve_tenant_id(user=u),
         "assignmentType": u.assignment_type,
         "assignmentId": u.assignment_id,
         "firstName": u.first_name,
@@ -814,6 +826,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     if user.role != "SUPER_ADMIN":
         if not user.tenant:
             raise InvalidCredentialsException("Tenant information missing for user")
+        tenant_id = user.tenant.tenant_id
         if user.role != "ADMIN":
             if user.assignment_type is None or user.assignment_id == -1:
                 raise InvalidCredentialsException("Assignment information missing for user")
@@ -1020,7 +1033,7 @@ def get_profile(db: Session = Depends(get_db), current: JwtUserDetails = Depends
         "userName": user.first_name,
         "phone": user.phone,
         "profilePicUrl": presigned,
-        "tenantId": active_tenant_id(),
+        "tenantId": _resolve_tenant_id(user=user),
         "role": user.role,
     }
 
@@ -1045,7 +1058,8 @@ def upload_profile(file: UploadFile = File(...), db: Session = Depends(get_db), 
         raise ResourceNotFoundException("User", "username", current.firstName)
 
     ext = Path(file.filename or "").suffix
-    key = f"{PROFILE_UPLOAD_DIR}/{active_tenant_id()}/{user.first_name}/{uuid.uuid4()}{ext}"
+    tenant_segment = _resolve_tenant_id(user=user) or "global"
+    key = f"{PROFILE_UPLOAD_DIR}/{tenant_segment}/{user.first_name}/{uuid.uuid4()}{ext}"
     raw = file.file.read()
     s3_url = s3_upload_bytes(raw, file.content_type or "application/octet-stream", key)
     user.profile_pic_url = s3_url
@@ -1058,7 +1072,7 @@ def upload_profile(file: UploadFile = File(...), db: Session = Depends(get_db), 
         "userName": user.first_name,
         "phone": user.phone,
         "profilePicUrl": presigned,
-        "tenantId": active_tenant_id(),
+        "tenantId": _resolve_tenant_id(user=user),
         "role": user.role,
     }
 
