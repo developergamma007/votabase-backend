@@ -387,8 +387,6 @@ def _auth_user(request: Request, db: Session) -> JwtUserDetails:
         .join(Tenant, User.tenant_ref == Tenant.id, isouter=True)
         .filter(User.first_name == payload.get("firstName"), User.phone == payload.get("phone"))
     )
-    if payload.get("tenantId") is not None:
-        base_query = base_query.filter(Tenant.tenant_id == payload.get("tenantId"))
     user = base_query.first()
 
     if user and (user.blocked or user.deleted):
@@ -399,7 +397,7 @@ def _auth_user(request: Request, db: Session) -> JwtUserDetails:
         phone=payload.get("phone"),
         firstName=payload.get("firstName"),
         role=payload.get("role"),
-        tenantId=payload.get("tenantId"),
+        tenantId=active_tenant_id(),
         assignmentType=payload.get("assignmentType"),
         assignmentId=payload.get("assignmentId"),
     )
@@ -519,7 +517,7 @@ class UserProfileDto(BaseModel):
 def to_user_details(u: User) -> Dict[str, Any]:
     return {
         "role": u.role,
-        "tenantId": u.tenant.tenant_id if u.tenant else None,
+        "tenantId": active_tenant_id(),
         "assignmentType": u.assignment_type,
         "assignmentId": u.assignment_id,
         "firstName": u.first_name,
@@ -819,7 +817,6 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
         if user.role != "ADMIN":
             if user.assignment_type is None or user.assignment_id == -1:
                 raise InvalidCredentialsException("Assignment information missing for user")
-        tenant_id = user.tenant.tenant_id
         assignment_type = user.assignment_type
         assignment_id = user.assignment_id
 
@@ -1023,7 +1020,7 @@ def get_profile(db: Session = Depends(get_db), current: JwtUserDetails = Depends
         "userName": user.first_name,
         "phone": user.phone,
         "profilePicUrl": presigned,
-        "tenantId": user.tenant.tenant_id if user.tenant else None,
+        "tenantId": active_tenant_id(),
         "role": user.role,
     }
 
@@ -1048,7 +1045,7 @@ def upload_profile(file: UploadFile = File(...), db: Session = Depends(get_db), 
         raise ResourceNotFoundException("User", "username", current.firstName)
 
     ext = Path(file.filename or "").suffix
-    key = f"{PROFILE_UPLOAD_DIR}/{user.tenant.tenant_id if user.tenant else 'public'}/{user.first_name}/{uuid.uuid4()}{ext}"
+    key = f"{PROFILE_UPLOAD_DIR}/{active_tenant_id()}/{user.first_name}/{uuid.uuid4()}{ext}"
     raw = file.file.read()
     s3_url = s3_upload_bytes(raw, file.content_type or "application/octet-stream", key)
     user.profile_pic_url = s3_url
@@ -1061,7 +1058,7 @@ def upload_profile(file: UploadFile = File(...), db: Session = Depends(get_db), 
         "userName": user.first_name,
         "phone": user.phone,
         "profilePicUrl": presigned,
-        "tenantId": user.tenant.tenant_id if user.tenant else None,
+        "tenantId": active_tenant_id(),
         "role": user.role,
     }
 
@@ -1718,94 +1715,6 @@ def get_snapshot(
         payload = api_success("Snapshot fetched successfully", snapshot_url)
         payload["snapshotMode"] = "link"
         return JSONResponse(content=payload, headers={"X-Snapshot-Mode": "link"})
-    except Exception:
-        # Fallback: retain legacy behavior over data.* tables.
-        pass
-
-    try:
-        assembly_q = db.query(Assembly).filter(Assembly.assembly_code == assemblyCode)
-        if current.role != "SUPER_ADMIN":
-            assembly_q = assembly_q.filter(Assembly.tenant_id == current.tenantId)
-        assembly = assembly_q.first()
-        if not assembly:
-            raise ValueError(f"Assembly not found for assemblyCode: {assemblyCode}")
-
-        if current.role == "SUPER_ADMIN":
-            wards = db.query(Ward).filter(Ward.assembly_id == assembly.assembly_id).all()
-            snapshot = _build_assembly_json(db, assembly, wards, True, None)
-        elif current.role == "ADMIN" or not current.assignmentType or current.assignmentType == "ASSEMBLY":
-            wards = db.query(Ward).filter(Ward.tenant_id == current.tenantId, Ward.assembly_id == assembly.assembly_id).all()
-            snapshot = _build_assembly_json(db, assembly, wards, True, current.tenantId)
-        elif current.assignmentType == "WARD":
-            ward = (
-                db.query(Ward)
-                .filter(
-                    Ward.tenant_id == current.tenantId,
-                    Ward.assembly_id == assembly.assembly_id,
-                    Ward.ward_code == str(current.assignmentId),
-                )
-                .first()
-            )
-            if not ward:
-                raise ValueError("No ward snapshot found")
-            snapshot = _build_assembly_json(db, assembly, [ward], True, current.tenantId)
-        elif current.assignmentType == "BOOTH":
-            booth_row = (
-                db.query(Booth)
-                .join(Ward, Booth.ward_id == Ward.ward_id)
-                .filter(
-                    Booth.tenant_id == current.tenantId,
-                    Booth.booth_id == current.assignmentId,
-                    Ward.assembly_id == assembly.assembly_id,
-                )
-                .first()
-            )
-            if not booth_row:
-                raise ValueError("No booth snapshot found")
-
-            ward = db.query(Ward).filter(Ward.ward_id == booth_row.ward_id).first()
-            if not ward:
-                raise ValueError("No ward found for booth")
-
-            voters = (
-                db.query(Voter)
-                .filter(
-                    Voter.tenant_id == current.tenantId,
-                    Voter.booth_id == booth_row.booth_id,
-                )
-                .all()
-            )
-
-            snapshot = {
-                "assembly": {
-                    "assemblyId": assembly.assembly_id,
-                    "assemblyNameEn": assembly.assembly_name_en,
-                    "assemblyNameLocal": assembly.assembly_name_local,
-                    "wards": [
-                        {
-                            "wardId": ward.ward_id,
-                            "wardNameEn": ward.ward_name_en,
-                            "wardNameLocal": ward.ward_name_local,
-                            "booths": [
-                                {
-                                    "boothId": booth_row.booth_id,
-                                    "boothNameEn": booth_row.polling_station_adr_en,
-                                    "boothNameLocal": booth_row.polling_station_adr_local,
-                                    "voters": [_build_voter_map(v) for v in voters],
-                                }
-                            ],
-                        }
-                    ],
-                }
-            }
-        else:
-            raise ValueError(f"Invalid role: {current.assignmentType}")
-
-        snapshot_id = _cache_snapshot(snapshot)
-        snapshot_url = f"{str(request.base_url).rstrip('/')}{CONTEXT_PATH}/api/voters/snapshot/content/{snapshot_id}"
-        payload = api_success("Snapshot fetched successfully", snapshot_url)
-        payload["snapshotMode"] = "link"
-        return JSONResponse(content=payload, headers={"X-Snapshot-Mode": "link"})
     except ValueError as ex:
         return JSONResponse(status_code=404, content=api_error("No snapshot found", str(ex)))
 
@@ -2235,10 +2144,65 @@ def _get_table_columns(db: Session, schema: str, table: str) -> set[str]:
     return {r[0] for r in rows}
 
 
+def _ensure_public_assembly_code(db: Session) -> set[str]:
+    assembly_cols = _get_table_columns(db, "public", "assembly")
+    if not assembly_cols:
+        raise ValueError("public.assembly table not found")
+    if "assembly_code" in assembly_cols:
+        return assembly_cols
+
+    assembly_no_col = "assembly_no" if "assembly_no" in assembly_cols else ("assembly_id" if "assembly_id" in assembly_cols else None)
+    if not assembly_no_col:
+        raise ValueError("public.assembly missing assembly_code and assembly_no/assembly_id")
+
+    db.execute(text("ALTER TABLE public.assembly ADD COLUMN IF NOT EXISTS assembly_code VARCHAR(12)"))
+    db.execute(
+        text(
+            f"""
+            UPDATE public.assembly
+            SET assembly_code = LPAD(CAST({assembly_no_col} AS TEXT), 12, '0')
+            WHERE assembly_code IS NULL OR TRIM(assembly_code) = ''
+            """
+        )
+    )
+    db.commit()
+    return _get_table_columns(db, "public", "assembly")
+
+
 def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool = True) -> Dict[str, Any]:
+    assembly_cols = _ensure_public_assembly_code(db)
     booth_cols = _get_table_columns(db, "public", "booths")
     voter_cols = _get_table_columns(db, "public", "voters")
     ward_cols = _get_table_columns(db, "public", "wards")
+
+    requested_assembly_code = normalize_assembly_code(assembly_code)
+    assembly_pk_col = "id" if "id" in assembly_cols else ("assembly_id" if "assembly_id" in assembly_cols else None)
+    assembly_no_col = "assembly_no" if "assembly_no" in assembly_cols else ("assembly_id" if "assembly_id" in assembly_cols else None)
+    assembly_name_en_col = "assembly_name_en" if "assembly_name_en" in assembly_cols else ("name_en" if "name_en" in assembly_cols else None)
+    assembly_name_local_col = "assembly_name_local" if "assembly_name_local" in assembly_cols else ("name_kannada" if "name_kannada" in assembly_cols else None)
+
+    assembly_row = db.execute(
+        text(
+            f"""
+            SELECT
+                assembly_code,
+                {assembly_pk_col if assembly_pk_col else 'NULL'} AS assembly_pk,
+                {assembly_no_col if assembly_no_col else 'NULL'} AS assembly_no,
+                {assembly_name_en_col if assembly_name_en_col else 'NULL'} AS assembly_name_en,
+                {assembly_name_local_col if assembly_name_local_col else 'NULL'} AS assembly_name_local
+            FROM public.assembly
+            WHERE assembly_code = :assembly_code
+               OR CAST({assembly_no_col if assembly_no_col else 'assembly_code'} AS TEXT) = :assembly_no_text
+            LIMIT 1
+            """
+        ),
+        {
+            "assembly_code": requested_assembly_code,
+            "assembly_no_text": str(int(requested_assembly_code)),
+        },
+    ).first()
+    if not assembly_row:
+        raise ValueError(f"Assembly not found in public.assembly for assemblyCode: {assembly_code}")
 
     booth_id_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
     booth_ward_id_col = "ward_id" if "ward_id" in booth_cols else None
@@ -2270,9 +2234,24 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
     ward_code_col = "ward_code" if "ward_code" in ward_cols else ("ward_no" if "ward_no" in ward_cols else None)
     ward_name_en_col = "ward_name_en" if "ward_name_en" in ward_cols else ("name_en" if "name_en" in ward_cols else None)
     ward_name_local_col = "ward_name_local" if "ward_name_local" in ward_cols else ("name_kannada" if "name_kannada" in ward_cols else None)
+    ward_assembly_id_col = "assembly_id" if "assembly_id" in ward_cols else None
+    ward_assembly_no_col = "assembly_no" if "assembly_no" in ward_cols else None
+    ward_assembly_code_col = "assembly_code" if "assembly_code" in ward_cols else None
 
     ward_map: Dict[Any, Dict[str, Any]] = {}
     if ward_id_col:
+        ward_where = ""
+        ward_params: Dict[str, Any] = {}
+        if ward_assembly_id_col and assembly_row.assembly_pk is not None:
+            ward_where = f"WHERE {ward_assembly_id_col} = :assembly_pk"
+            ward_params["assembly_pk"] = assembly_row.assembly_pk
+        elif ward_assembly_no_col and assembly_row.assembly_no is not None:
+            ward_where = f"WHERE {ward_assembly_no_col} = :assembly_no"
+            ward_params["assembly_no"] = assembly_row.assembly_no
+        elif ward_assembly_code_col:
+            ward_where = f"WHERE {ward_assembly_code_col} = :assembly_code"
+            ward_params["assembly_code"] = assembly_row.assembly_code or requested_assembly_code
+
         ward_rows = db.execute(
             text(
                 f"""
@@ -2282,8 +2261,10 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
                     {ward_name_en_col if ward_name_en_col else 'NULL'} AS ward_name_en,
                     {ward_name_local_col if ward_name_local_col else 'NULL'} AS ward_name_local
                 FROM public.wards
+                {ward_where}
                 """
-            )
+            ),
+            ward_params,
         ).all()
         for w in ward_rows:
             ward_map[w.ward_id] = {
@@ -2293,6 +2274,7 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
                 "wardNameLocal": w.ward_name_local,
                 "booths": [],
             }
+    allowed_ward_ids = set(ward_map.keys())
 
     voter_sr_col = "sl" if "sl" in voter_cols else ("sr_no" if "sr_no" in voter_cols else None)
     voter_epic_col = "epic" if "epic" in voter_cols else ("epic_no" if "epic_no" in voter_cols else None)
@@ -2406,6 +2388,8 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
 
     for b in booth_rows:
         ward_id = b.ward_id
+        if allowed_ward_ids and ward_id not in allowed_ward_ids:
+            continue
         if ward_id not in ward_map:
             ward_map[ward_id] = {
                 "wardId": ward_id,
@@ -2430,10 +2414,10 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
 
     return {
         "assembly": {
-            "assemblyId": None,
-            "assemblyCode": assembly_code,
-            "assemblyNameEn": None,
-            "assemblyNameLocal": None,
+            "assemblyId": assembly_row.assembly_pk,
+            "assemblyCode": assembly_row.assembly_code or requested_assembly_code,
+            "assemblyNameEn": assembly_row.assembly_name_en,
+            "assemblyNameLocal": assembly_row.assembly_name_local,
             "wards": sorted(list(ward_map.values()), key=lambda w: (w.get("wardCode") or str(w["wardId"]))),
         }
     }
