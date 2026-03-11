@@ -1717,6 +1717,8 @@ def get_snapshot(
         return JSONResponse(content=payload, headers={"X-Snapshot-Mode": "link"})
     except ValueError as ex:
         return JSONResponse(status_code=404, content=api_error("No snapshot found", str(ex)))
+    except Exception as ex:
+        return JSONResponse(status_code=500, content=api_error("Snapshot failed", str(ex)))
 
 
 @app.get(f"{CONTEXT_PATH}/api/voters/snapshot/content/{{snapshot_id}}")
@@ -2155,18 +2157,22 @@ def _ensure_public_assembly_code(db: Session) -> set[str]:
     if not assembly_no_col:
         raise ValueError("public.assembly missing assembly_code and assembly_no/assembly_id")
 
-    db.execute(text("ALTER TABLE public.assembly ADD COLUMN IF NOT EXISTS assembly_code VARCHAR(12)"))
-    db.execute(
-        text(
-            f"""
-            UPDATE public.assembly
-            SET assembly_code = LPAD(CAST({assembly_no_col} AS TEXT), 12, '0')
-            WHERE assembly_code IS NULL OR TRIM(assembly_code) = ''
-            """
+    try:
+        db.execute(text("ALTER TABLE public.assembly ADD COLUMN IF NOT EXISTS assembly_code VARCHAR(12)"))
+        db.execute(
+            text(
+                f"""
+                UPDATE public.assembly
+                SET assembly_code = LPAD(CAST({assembly_no_col} AS TEXT), 12, '0')
+                WHERE assembly_code IS NULL OR TRIM(assembly_code) = ''
+                """
+            )
         )
-    )
-    db.commit()
-    return _get_table_columns(db, "public", "assembly")
+        db.commit()
+        return _get_table_columns(db, "public", "assembly")
+    except Exception:
+        db.rollback()
+        return assembly_cols
 
 
 def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool = True) -> Dict[str, Any]:
@@ -2180,19 +2186,22 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
     assembly_no_col = "assembly_no" if "assembly_no" in assembly_cols else ("assembly_id" if "assembly_id" in assembly_cols else None)
     assembly_name_en_col = "assembly_name_en" if "assembly_name_en" in assembly_cols else ("name_en" if "name_en" in assembly_cols else None)
     assembly_name_local_col = "assembly_name_local" if "assembly_name_local" in assembly_cols else ("name_kannada" if "name_kannada" in assembly_cols else None)
+    assembly_code_expr = "assembly_code" if "assembly_code" in assembly_cols else (
+        f"LPAD(CAST({assembly_no_col} AS TEXT), 12, '0')" if assembly_no_col else "NULL"
+    )
 
     assembly_row = db.execute(
         text(
             f"""
             SELECT
-                assembly_code,
+                {assembly_code_expr} AS assembly_code,
                 {assembly_pk_col if assembly_pk_col else 'NULL'} AS assembly_pk,
                 {assembly_no_col if assembly_no_col else 'NULL'} AS assembly_no,
                 {assembly_name_en_col if assembly_name_en_col else 'NULL'} AS assembly_name_en,
                 {assembly_name_local_col if assembly_name_local_col else 'NULL'} AS assembly_name_local
             FROM public.assembly
-            WHERE assembly_code = :assembly_code
-               OR CAST({assembly_no_col if assembly_no_col else 'assembly_code'} AS TEXT) = :assembly_no_text
+            WHERE {assembly_code_expr} = :assembly_code
+               OR CAST({assembly_no_col if assembly_no_col else assembly_code_expr} AS TEXT) = :assembly_no_text
             LIMIT 1
             """
         ),
