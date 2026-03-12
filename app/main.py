@@ -285,6 +285,58 @@ class VoterChangeLog(Base):
     update_longitude: Mapped[Optional[float]] = mapped_column(Double)
 
 
+class VoterEnrichment(Base):
+    __tablename__ = "voter_enrichment"
+    __table_args__ = {"schema": "public"}
+
+    epic: Mapped[str] = mapped_column(String(20), primary_key=True)
+    ward_code: Mapped[Optional[str]] = mapped_column(String(20))
+    booth_no: Mapped[Optional[str]] = mapped_column(String(20))
+    first_middle_name_en: Mapped[Optional[str]] = mapped_column(String)
+    last_name_en: Mapped[Optional[str]] = mapped_column(String)
+    first_middle_name_local: Mapped[Optional[str]] = mapped_column(String)
+    last_name_local: Mapped[Optional[str]] = mapped_column(String)
+    relation_type: Mapped[Optional[str]] = mapped_column(String)
+    relation_first_middle_name_en: Mapped[Optional[str]] = mapped_column(String)
+    relation_last_name_en: Mapped[Optional[str]] = mapped_column(String)
+    relation_first_middle_name_local: Mapped[Optional[str]] = mapped_column(String)
+    relation_last_name_local: Mapped[Optional[str]] = mapped_column(String)
+    house_no_en: Mapped[Optional[str]] = mapped_column(String)
+    house_no_local: Mapped[Optional[str]] = mapped_column(String)
+    gender: Mapped[Optional[str]] = mapped_column(String(20))
+    age: Mapped[Optional[int]] = mapped_column(Integer)
+    dob: Mapped[Optional[str]] = mapped_column(String(50))
+    mobile: Mapped[Optional[str]] = mapped_column(String(30))
+    address_en: Mapped[Optional[str]] = mapped_column(String)
+    address_local: Mapped[Optional[str]] = mapped_column(String)
+    status: Mapped[Optional[str]] = mapped_column(String(100))
+    community: Mapped[Optional[str]] = mapped_column(String(100))
+    caste: Mapped[Optional[str]] = mapped_column(String(100))
+    residence_type: Mapped[Optional[str]] = mapped_column(String(100))
+    civic_issue: Mapped[Optional[str]] = mapped_column(String)
+    mother_tongue: Mapped[Optional[str]] = mapped_column(String(100))
+    team: Mapped[Optional[str]] = mapped_column(String(100))
+    ownership: Mapped[Optional[str]] = mapped_column(String(100))
+    education: Mapped[Optional[str]] = mapped_column(String(100))
+    nature_of_voter: Mapped[Optional[str]] = mapped_column(String(100))
+    voter_points: Mapped[Optional[str]] = mapped_column(String(100))
+    govt_scheme_tracking: Mapped[Optional[str]] = mapped_column(String)
+    engagement_potential: Mapped[Optional[str]] = mapped_column(String(100))
+    if_shifted: Mapped[Optional[str]] = mapped_column(String(100))
+    notes: Mapped[Optional[str]] = mapped_column(String)
+    present_address: Mapped[Optional[str]] = mapped_column(String)
+    new_ward: Mapped[Optional[str]] = mapped_column(String(100))
+    new_booth_no: Mapped[Optional[str]] = mapped_column(String(100))
+    new_serial_no: Mapped[Optional[str]] = mapped_column(String(100))
+    not_available_reason: Mapped[Optional[str]] = mapped_column(String)
+    latitude: Mapped[Optional[float]] = mapped_column(Double)
+    longitude: Mapped[Optional[float]] = mapped_column(Double)
+    updated_fields: Mapped[str] = mapped_column(String, default="[]")
+    updated_by: Mapped[Optional[int]] = mapped_column(ForeignKey("metastore.users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
@@ -482,6 +534,12 @@ class TenantDtoIn(BaseModel):
 class VoterUpdatePayload(BaseModel):
     updateLocationLat: Optional[float] = None
     updateLocationLng: Optional[float] = None
+    updateRequest: Dict[str, Any]
+
+
+class PublicVoterUpdatePayload(BaseModel):
+    wardCode: Optional[str] = None
+    boothNo: Optional[str] = None
     updateRequest: Dict[str, Any]
 
 
@@ -767,6 +825,24 @@ async def handle_resource_exists(_: Request, ex: ResourceAlreadyExistsException)
     )
 
 
+@app.exception_handler(ResourceNotFoundException)
+async def handle_resource_not_found(_: Request, ex: ResourceNotFoundException):
+    return JSONResponse(
+        status_code=404,
+        content=api_error(
+            "Resource not found",
+            {
+                "timestamp": now_iso(),
+                "code": ex.code,
+                "resource": ex.resource_name,
+                "field": ex.field_name,
+                "value": ex.field_value,
+                "details": ex.details,
+            },
+        ),
+    )
+
+
 @app.exception_handler(ValueError)
 async def handle_validation(_: Request, ex: ValueError):
     return JSONResponse(
@@ -809,6 +885,11 @@ def startup_seed_super_admin() -> None:
             db.commit()
     finally:
         db.close()
+
+
+@app.on_event("startup")
+def startup_ensure_voter_enrichment() -> None:
+    VoterEnrichment.__table__.create(bind=engine, checkfirst=True)
 
 
 # ---------------------------
@@ -1225,7 +1306,7 @@ def get_assemblies_plural(
 
 
 @app.put(f"{CONTEXT_PATH}/api/voters/{{voterId}}")
-def update_voter(voterId: int, payload: VoterUpdatePayload, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("USER"))):
+def update_voter(voterId: int, payload: VoterUpdatePayload, db: Session = Depends(get_db), current: JwtUserDetails = Depends(get_current_user)):
     req = dict(payload.updateRequest or {})
     req["voterId"] = voterId
 
@@ -1287,6 +1368,97 @@ def update_voter(voterId: int, payload: VoterUpdatePayload, db: Session = Depend
 
     voter_dict = {c.name: getattr(voter, c.name) for c in Voter.__table__.columns}
     return api_success("Voter updated successfully", voter_dict)
+
+
+@app.put(f"{CONTEXT_PATH}/api/voters/by-epic/{{epic}}")
+def update_public_voter_by_epic(epic: str, payload: PublicVoterUpdatePayload, db: Session = Depends(get_db), current: JwtUserDetails = Depends(get_current_user)):
+    normalized_epic = normalize_optional_text(epic)
+    if not normalized_epic:
+        raise ValueError("EPIC is required")
+
+    voter_cols = _get_table_columns(db, "public", "voters")
+    if not voter_cols:
+        raise ValueError("public.voters table not found")
+
+    req = dict(payload.updateRequest or {})
+    if not req:
+        raise ValueError("updateRequest is required")
+
+    unsupported = sorted(k for k in req.keys() if k not in VOTER_ENRICHMENT_FIELD_MAP)
+    if unsupported:
+        raise ValueError(f"Invalid field in update request: {unsupported[0]}")
+
+    normalized_values: Dict[str, Any] = {
+        api_field: _serialize_enrichment_value(api_field, req.get(api_field))
+        for api_field in req.keys()
+    }
+    if not normalized_values:
+        raise ValueError("No supported fields provided in updateRequest")
+
+    ward_code = normalize_optional_text(payload.wardCode)
+    booth_no = normalize_optional_text(payload.boothNo)
+
+    where_parts = ["epic = :epic"]
+    params: Dict[str, Any] = {"epic": normalized_epic}
+    if ward_code and "ward_code" in voter_cols:
+        where_parts.append("CAST(ward_code AS TEXT) = :ward_code")
+        params["ward_code"] = ward_code
+    if booth_no and "booth_no" in voter_cols:
+        where_parts.append("CAST(booth_no AS TEXT) = :booth_no")
+        params["booth_no"] = booth_no
+
+    public_voter = db.execute(
+        text(
+            f"""
+            SELECT epic, ward_code, booth_no, sl, house, name_en, name_kannada, gender, age, rel_eng, rel_kannada, rel_type, mobile
+            FROM public.voters
+            WHERE {" AND ".join(where_parts)}
+            LIMIT 1
+            """
+        ),
+        params,
+    ).first()
+    if not public_voter and (ward_code or booth_no):
+        public_voter = db.execute(
+            text(
+                """
+                SELECT epic, ward_code, booth_no, sl, house, name_en, name_kannada, gender, age, rel_eng, rel_kannada, rel_type, mobile
+                FROM public.voters
+                WHERE epic = :epic
+                LIMIT 1
+                """
+            ),
+            {"epic": normalized_epic},
+        ).first()
+    if not public_voter:
+        raise ResourceNotFoundException("Public voter", "epic", normalized_epic)
+
+    updated_by = db.query(User).filter(User.first_name == current.firstName, User.phone == current.phone).first()
+    enrichment = db.query(VoterEnrichment).filter(VoterEnrichment.epic == normalized_epic).first()
+    if not enrichment:
+        enrichment = VoterEnrichment(
+            epic=normalized_epic,
+            ward_code=str(public_voter.ward_code) if public_voter.ward_code is not None else ward_code,
+            booth_no=str(public_voter.booth_no) if public_voter.booth_no is not None else booth_no,
+        )
+        db.add(enrichment)
+
+    updated_fields = _parse_updated_fields(enrichment.updated_fields)
+    for api_field, serialized_value in normalized_values.items():
+        setattr(enrichment, VOTER_ENRICHMENT_FIELD_MAP[api_field], serialized_value)
+        updated_fields.add(api_field)
+
+    enrichment.ward_code = str(public_voter.ward_code) if public_voter.ward_code is not None else enrichment.ward_code
+    enrichment.booth_no = str(public_voter.booth_no) if public_voter.booth_no is not None else enrichment.booth_no
+    enrichment.updated_fields = json.dumps(sorted(updated_fields))
+    enrichment.updated_at = datetime.utcnow()
+    enrichment.updated_by = updated_by.id if updated_by else None
+    db.commit()
+    db.refresh(enrichment)
+    return api_success(
+        "Public voter updated successfully",
+        _merge_voter_payload_with_enrichment(_build_public_voter_result(public_voter), _build_voter_enrichment_payload(enrichment)),
+    )
 
 
 @app.get(f"{CONTEXT_PATH}/api/voters")
@@ -1511,8 +1683,12 @@ def search_voters(
                 "gender": v.gender,
                 "age": None,
                 "mobile": str(v.mobile) if v.mobile is not None else None,
+                "wardCode": ward_code,
+                "boothNo": booth_no,
                 "boothInfo": {
                     "boothId": booth.get("boothId") if booth else None,
+                    "boothNo": booth.get("boothNo") if booth else booth_no,
+                    "wardCode": booth.get("wardCode") if booth else ward_code,
                     "boothNameEn": booth.get("boothNameEn") if booth else None,
                     "boothNameLocal": booth.get("boothNameLocal") if booth else None,
                 },
@@ -1521,6 +1697,7 @@ def search_voters(
                 "wardNameLocal": ward_info.get("wardNameLocal") if ward_info else None,
             }
         )
+    _merge_voter_payloads_with_enrichment(db, result)
 
     count_sql = f"""
         SELECT
@@ -1681,6 +1858,8 @@ def get_voters_by_booth(
                 "age": None,
                 "dob": None,
                 "mobile": None,
+                "wardCode": str(booth_row.ward_code) if booth_row.ward_code is not None else None,
+                "boothNo": str(booth_row.booth_no) if booth_row.booth_no is not None else None,
                 "addressEn": None,
                 "addressLocal": None,
                 "status": None,
@@ -1697,6 +1876,7 @@ def get_voters_by_booth(
                 "longitude": None,
             }
         )
+    _merge_voter_payloads_with_enrichment(db, voters)
 
     return api_success(
         "Booth voters fetched",
@@ -2160,6 +2340,180 @@ def _get_table_columns(db: Session, schema: str, table: str) -> set[str]:
     return {r[0] for r in rows}
 
 
+def _get_public_voter_column_map(voter_cols: set[str]) -> Dict[str, str]:
+    field_map: Dict[str, str] = {}
+    if "mobile" in voter_cols:
+        field_map["mobile"] = "mobile"
+    if "gender" in voter_cols:
+        field_map["gender"] = "gender"
+    if "age" in voter_cols:
+        field_map["age"] = "age"
+    if "house" in voter_cols:
+        field_map["houseNoEn"] = "house"
+        field_map["houseNoLocal"] = "house"
+    if "name_en" in voter_cols:
+        field_map["firstMiddleNameEn"] = "name_en"
+    if "name_kannada" in voter_cols:
+        field_map["firstMiddleNameLocal"] = "name_kannada"
+    if "rel_eng" in voter_cols:
+        field_map["relationFirstMiddleNameEn"] = "rel_eng"
+    if "rel_kannada" in voter_cols:
+        field_map["relationFirstMiddleNameLocal"] = "rel_kannada"
+    if "rel_type" in voter_cols:
+        field_map["relationType"] = "rel_type"
+    return field_map
+
+
+VOTER_ENRICHMENT_FIELD_MAP: Dict[str, str] = {
+    "firstMiddleNameEn": "first_middle_name_en",
+    "lastNameEn": "last_name_en",
+    "firstMiddleNameLocal": "first_middle_name_local",
+    "lastNameLocal": "last_name_local",
+    "relationType": "relation_type",
+    "relationFirstMiddleNameEn": "relation_first_middle_name_en",
+    "relationLastNameEn": "relation_last_name_en",
+    "relationFirstMiddleNameLocal": "relation_first_middle_name_local",
+    "relationLastNameLocal": "relation_last_name_local",
+    "houseNoEn": "house_no_en",
+    "houseNoLocal": "house_no_local",
+    "gender": "gender",
+    "age": "age",
+    "dob": "dob",
+    "mobile": "mobile",
+    "addressEn": "address_en",
+    "addressLocal": "address_local",
+    "status": "status",
+    "community": "community",
+    "caste": "caste",
+    "residenceType": "residence_type",
+    "civicIssue": "civic_issue",
+    "motherTongue": "mother_tongue",
+    "team": "team",
+    "ownership": "ownership",
+    "education": "education",
+    "natureOfVoter": "nature_of_voter",
+    "voterPoints": "voter_points",
+    "govtSchemeTracking": "govt_scheme_tracking",
+    "engagementPotential": "engagement_potential",
+    "ifShifted": "if_shifted",
+    "notes": "notes",
+    "presentAddress": "present_address",
+    "newWard": "new_ward",
+    "newBoothNo": "new_booth_no",
+    "newSerialNo": "new_serial_no",
+    "notAvailableReason": "not_available_reason",
+    "latitude": "latitude",
+    "longitude": "longitude",
+}
+VOTER_ENRICHMENT_JSON_FIELDS = {"govtSchemeTracking"}
+VOTER_ENRICHMENT_INT_FIELDS = {"age"}
+VOTER_ENRICHMENT_FLOAT_FIELDS = {"latitude", "longitude"}
+
+
+def _parse_updated_fields(raw: Optional[str]) -> set[str]:
+    if not raw:
+        return set()
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return {str(item) for item in parsed if str(item).strip()}
+    except Exception:
+        return set()
+    return set()
+
+
+def _serialize_enrichment_value(api_field: str, value: Any) -> Any:
+    if api_field in VOTER_ENRICHMENT_JSON_FIELDS:
+        return json.dumps(value or [])
+    if api_field in VOTER_ENRICHMENT_INT_FIELDS:
+        if value in (None, ""):
+            return None
+        return int(value)
+    if api_field in VOTER_ENRICHMENT_FLOAT_FIELDS:
+        if value in (None, ""):
+            return None
+        return float(value)
+    if isinstance(value, str):
+        return normalize_optional_text(value)
+    return value
+
+
+def _deserialize_enrichment_value(api_field: str, value: Any) -> Any:
+    if api_field in VOTER_ENRICHMENT_JSON_FIELDS:
+        if value in (None, ""):
+            return []
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return value
+
+
+def _build_voter_enrichment_payload(enrichment: VoterEnrichment) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "epicNo": enrichment.epic,
+        "wardCode": enrichment.ward_code,
+        "boothNo": enrichment.booth_no,
+        "updatedFields": sorted(_parse_updated_fields(enrichment.updated_fields)),
+    }
+    for api_field, column_name in VOTER_ENRICHMENT_FIELD_MAP.items():
+        payload[api_field] = _deserialize_enrichment_value(api_field, getattr(enrichment, column_name))
+    return payload
+
+
+def _get_voter_enrichments(db: Session, epics: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    epic_list = sorted({str(epic).strip() for epic in epics if epic and str(epic).strip()})
+    if not epic_list:
+        return {}
+    rows = db.query(VoterEnrichment).filter(VoterEnrichment.epic.in_(epic_list)).all()
+    return {row.epic: _build_voter_enrichment_payload(row) for row in rows}
+
+
+def _merge_voter_payload_with_enrichment(voter_payload: Dict[str, Any], enrichment: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not enrichment:
+        return voter_payload
+    updated_fields = set(enrichment.get("updatedFields") or [])
+    for api_field in updated_fields:
+        if api_field in enrichment:
+            voter_payload[api_field] = enrichment.get(api_field)
+    if enrichment.get("wardCode") and not voter_payload.get("wardCode"):
+        voter_payload["wardCode"] = enrichment.get("wardCode")
+    if enrichment.get("boothNo") and not voter_payload.get("boothNo"):
+        voter_payload["boothNo"] = enrichment.get("boothNo")
+    return voter_payload
+
+
+def _merge_voter_payloads_with_enrichment(db: Session, voters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    enrichments = _get_voter_enrichments(db, [v.get("epicNo") for v in voters])
+    for voter in voters:
+        _merge_voter_payload_with_enrichment(voter, enrichments.get(voter.get("epicNo")))
+    return voters
+
+
+def _build_public_voter_result(row: Any) -> Dict[str, Any]:
+    return {
+        "epicNo": row.epic,
+        "wardCode": str(row.ward_code) if row.ward_code is not None else None,
+        "boothNo": str(row.booth_no) if row.booth_no is not None else None,
+        "srNo": row.sl,
+        "houseNoEn": row.house,
+        "houseNoLocal": row.house,
+        "firstMiddleNameEn": row.name_en,
+        "lastNameEn": "",
+        "firstMiddleNameLocal": row.name_kannada,
+        "lastNameLocal": "",
+        "relationFirstMiddleNameEn": row.rel_eng,
+        "relationLastNameEn": "",
+        "relationFirstMiddleNameLocal": row.rel_kannada,
+        "relationLastNameLocal": "",
+        "relationType": row.rel_type,
+        "gender": row.gender,
+        "age": row.age,
+        "mobile": row.mobile,
+    }
+
+
 def _ensure_public_assembly_code(db: Session) -> set[str]:
     assembly_cols = _get_table_columns(db, "public", "assembly")
     if not assembly_cols:
@@ -2411,6 +2765,7 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
                 }
             )
         for key, rows in voters_by_key.items():
+            _merge_voter_payloads_with_enrichment(db, rows)
             male = sum(1 for r in rows if (r.get("gender") or "").upper().startswith("M"))
             female = sum(1 for r in rows if (r.get("gender") or "").upper().startswith("F"))
             counts_by_key[key] = {"total": len(rows), "male": male, "female": female}
