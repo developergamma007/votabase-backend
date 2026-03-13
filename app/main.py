@@ -1223,16 +1223,25 @@ def list_tenants(page: int = 0, size: int = 10, db: Session = Depends(get_db), _
 
 
 @app.get(f"{CONTEXT_PATH}/api/assignments")
-def get_assignments(type: str = Query(...), db: Session = Depends(get_db), _: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER"))):
+def get_assignments(type: str = Query(...), db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER"))):
     t = type.upper()
     if t == "ASSEMBLY":
-        rows = db.query(Assembly).order_by(Assembly.assembly_name_en.asc()).all()
+        q = db.query(Assembly)
+        if current.tenantId is not None:
+            q = q.filter(Assembly.tenant_id == current.tenantId)
+        rows = q.order_by(Assembly.assembly_name_en.asc()).all()
         return [{"id": r.assembly_id, "name": r.assembly_name_en} for r in rows]
     if t == "WARD":
-        rows = db.query(Ward).order_by(Ward.ward_name_en.asc()).all()
+        q = db.query(Ward)
+        if current.tenantId is not None:
+            q = q.filter(Ward.tenant_id == current.tenantId)
+        rows = q.order_by(Ward.ward_name_en.asc()).all()
         return [{"id": r.ward_id, "name": r.ward_name_en} for r in rows]
     if t == "BOOTH":
-        rows = db.query(Booth).order_by(Booth.polling_station_adr_en.asc()).all()
+        q = db.query(Booth)
+        if current.tenantId is not None:
+            q = q.filter(Booth.tenant_id == current.tenantId)
+        rows = q.order_by(Booth.polling_station_adr_en.asc()).all()
         return [{"id": r.booth_id, "name": r.polling_station_adr_en} for r in rows]
     raise ValueError("Invalid assignment type")
 
@@ -1257,28 +1266,124 @@ def get_booths(db: Session = Depends(get_db), current: JwtUserDetails = Depends(
 @app.get(f"{CONTEXT_PATH}/api/booths")
 def get_booths_plural(
     assemblyCode: Optional[str] = None,
+    wardId: Optional[int] = None,
     db: Session = Depends(get_db),
-    current: JwtUserDetails = Depends(require_roles("ADMIN", "USER")),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER")),
 ):
     q = (
         db.query(Booth)
         .join(Ward, Booth.ward_id == Ward.ward_id)
         .join(Assembly, Ward.assembly_id == Assembly.assembly_id)
-        .filter(Booth.tenant_id == current.tenantId)
     )
+    if current.tenantId is not None:
+        q = q.filter(Booth.tenant_id == current.tenantId)
     if assemblyCode:
         q = q.filter(Assembly.assembly_code == assemblyCode)
+    if wardId:
+        q = q.filter(Ward.ward_id == wardId)
 
     booths = q.order_by(Booth.booth_id.asc()).all()
+    if booths:
+        return [
+            {
+                "boothId": b.booth_id,
+                "pollingStationAdrEn": b.polling_station_adr_en,
+                "pollingStationAdrLocal": b.polling_station_adr_local,
+                "wardId": b.ward_id,
+                "tenantId": b.tenant_id,
+            }
+            for b in booths
+        ]
+
+    booth_cols = _get_table_columns(db, "public", "booths")
+    id_col = "booth_id" if "booth_id" in booth_cols else ("booth_no" if "booth_no" in booth_cols else ("id" if "id" in booth_cols else None))
+    name_col = "polling_station_adr_en" if "polling_station_adr_en" in booth_cols else ("booth_add_en" if "booth_add_en" in booth_cols else ("name_en" if "name_en" in booth_cols else None))
+    ward_ref = "ward_id" if "ward_id" in booth_cols else ("ward_no" if "ward_no" in booth_cols else None)
+    if not id_col or not name_col:
+        return []
+    where = []
+    params: Dict[str, Any] = {}
+    if wardId and ward_ref:
+        where.append(f"{ward_ref} = :ward_id")
+        params["ward_id"] = wardId
+    where_clause = f"WHERE {' AND '.join(where)}" if where else ""
+    rows = db.execute(
+        text(
+            f"""
+            SELECT {id_col} AS id, {name_col} AS name, {ward_ref if ward_ref else 'NULL'} AS ward_id
+            FROM public.booths
+            {where_clause}
+            ORDER BY {name_col}
+            """
+        ),
+        params,
+    ).all()
     return [
         {
-            "boothId": b.booth_id,
-            "pollingStationAdrEn": b.polling_station_adr_en,
-            "pollingStationAdrLocal": b.polling_station_adr_local,
-            "wardId": b.ward_id,
-            "tenantId": b.tenant_id,
+            "boothId": int(r.id),
+            "pollingStationAdrEn": r.name,
+            "pollingStationAdrLocal": None,
+            "wardId": int(r.ward_id) if r.ward_id is not None else None,
+            "tenantId": None,
         }
-        for b in booths
+        for r in rows
+    ]
+
+
+@app.get(f"{CONTEXT_PATH}/api/wards")
+def get_wards(
+    assemblyId: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER")),
+):
+    q = db.query(Ward)
+    if current.tenantId is not None:
+        q = q.filter(Ward.tenant_id == current.tenantId)
+    if assemblyId:
+        q = q.filter(Ward.assembly_id == assemblyId)
+    wards = q.order_by(Ward.ward_name_en.asc()).all()
+    if wards:
+        return [
+            {
+                "wardId": w.ward_id,
+                "wardNameEn": w.ward_name_en,
+                "assemblyId": w.assembly_id,
+                "tenantId": w.tenant_id,
+            }
+            for w in wards
+        ]
+
+    ward_cols = _get_table_columns(db, "public", "wards")
+    id_col = "ward_id" if "ward_id" in ward_cols else ("ward_no" if "ward_no" in ward_cols else ("id" if "id" in ward_cols else None))
+    name_col = "ward_name_en" if "ward_name_en" in ward_cols else ("name_en" if "name_en" in ward_cols else ("ward_name_local" if "ward_name_local" in ward_cols else ("name_kannada" if "name_kannada" in ward_cols else None)))
+    assembly_ref = "assembly_id" if "assembly_id" in ward_cols else ("assembly_no" if "assembly_no" in ward_cols else None)
+    if not id_col or not name_col:
+        return []
+    where = []
+    params: Dict[str, Any] = {}
+    if assemblyId and assembly_ref:
+        where.append(f"{assembly_ref} = :assembly_id")
+        params["assembly_id"] = assemblyId
+    where_clause = f"WHERE {' AND '.join(where)}" if where else ""
+    rows = db.execute(
+        text(
+            f"""
+            SELECT {id_col} AS id, {name_col} AS name, {assembly_ref if assembly_ref else 'NULL'} AS assembly_id
+            FROM public.wards
+            {where_clause}
+            ORDER BY {name_col}
+            """
+        ),
+        params,
+    ).all()
+    return [
+        {
+            "wardId": int(r.id),
+            "wardNameEn": r.name,
+            "assemblyId": int(r.assembly_id) if r.assembly_id is not None else None,
+            "tenantId": None,
+        }
+        for r in rows
     ]
 
 
@@ -2184,10 +2289,34 @@ def volunteer_dropdown(level: str, parentId: Optional[int] = None, db: Session =
     if level == "ASSEMBLY":
         rows = (
             db.query(Assembly.assembly_id, Assembly.assembly_name_en)
-            .filter(Assembly.tenant_id == current.tenantId)
             .order_by(Assembly.assembly_name_en)
             .all()
         )
+        if current.tenantId is not None:
+            rows = (
+                db.query(Assembly.assembly_id, Assembly.assembly_name_en)
+                .filter(Assembly.tenant_id == current.tenantId)
+                .order_by(Assembly.assembly_name_en)
+                .all()
+            )
+        if not rows:
+            assembly_cols = _ensure_public_assembly_code(db)
+            id_col = "id" if "id" in assembly_cols else ("assembly_id" if "assembly_id" in assembly_cols else ("assembly_no" if "assembly_no" in assembly_cols else None))
+            name_col = "assembly_name_en" if "assembly_name_en" in assembly_cols else ("name_en" if "name_en" in assembly_cols else ("assembly_name_local" if "assembly_name_local" in assembly_cols else ("name_kannada" if "name_kannada" in assembly_cols else None)))
+            code_expr = "assembly_code" if "assembly_code" in assembly_cols else "NULL"
+            if id_col and name_col:
+                rows = db.execute(
+                    text(
+                        f"""
+                        SELECT {id_col} AS id, {name_col} AS name, {code_expr} AS code
+                        FROM public.assembly
+                        ORDER BY {name_col}
+                        """
+                    )
+                ).all()
+                for row in rows:
+                    out.append({"id": int(row.id), "code": str(row.code or row.id), "name": row.name})
+                return out
         for row in rows:
             out.append({"id": row[0], "code": str(row[0]), "name": row[1]})
     elif level == "WARD":
@@ -2195,10 +2324,38 @@ def volunteer_dropdown(level: str, parentId: Optional[int] = None, db: Session =
             raise ValueError("assemblyId is required for WARD")
         rows = (
             db.query(Ward.ward_id, Ward.ward_name_en)
-            .filter(Ward.assembly_id == parentId, Ward.tenant_id == current.tenantId)
+            .filter(Ward.assembly_id == parentId)
             .order_by(Ward.ward_name_en)
             .all()
         )
+        if current.tenantId is not None:
+            rows = (
+                db.query(Ward.ward_id, Ward.ward_name_en)
+                .filter(Ward.assembly_id == parentId, Ward.tenant_id == current.tenantId)
+                .order_by(Ward.ward_name_en)
+                .all()
+            )
+        if not rows:
+            ward_cols = _get_table_columns(db, "public", "wards")
+            id_col = "ward_id" if "ward_id" in ward_cols else ("ward_no" if "ward_no" in ward_cols else ("id" if "id" in ward_cols else None))
+            name_col = "ward_name_en" if "ward_name_en" in ward_cols else ("name_en" if "name_en" in ward_cols else ("ward_name_local" if "ward_name_local" in ward_cols else ("name_kannada" if "name_kannada" in ward_cols else None)))
+            assembly_ref = "assembly_id" if "assembly_id" in ward_cols else ("assembly_no" if "assembly_no" in ward_cols else None)
+            if id_col and name_col:
+                where = f"WHERE {assembly_ref} = :assembly_id" if assembly_ref else ""
+                rows = db.execute(
+                    text(
+                        f"""
+                        SELECT {id_col} AS id, {name_col} AS name
+                        FROM public.wards
+                        {where}
+                        ORDER BY {name_col}
+                        """
+                    ),
+                    {"assembly_id": parentId},
+                ).all()
+                for row in rows:
+                    out.append({"id": int(row.id), "code": str(row.id), "name": row.name})
+                return out
         for row in rows:
             out.append({"id": row[0], "code": str(row[0]), "name": row[1]})
     elif level == "BOOTH":
@@ -2206,10 +2363,38 @@ def volunteer_dropdown(level: str, parentId: Optional[int] = None, db: Session =
             raise ValueError("wardId is required for BOOTH")
         rows = (
             db.query(Booth.booth_id, Booth.polling_station_adr_en)
-            .filter(Booth.ward_id == parentId, Booth.tenant_id == current.tenantId)
+            .filter(Booth.ward_id == parentId)
             .order_by(Booth.polling_station_adr_en)
             .all()
         )
+        if current.tenantId is not None:
+            rows = (
+                db.query(Booth.booth_id, Booth.polling_station_adr_en)
+                .filter(Booth.ward_id == parentId, Booth.tenant_id == current.tenantId)
+                .order_by(Booth.polling_station_adr_en)
+                .all()
+            )
+        if not rows:
+            booth_cols = _get_table_columns(db, "public", "booths")
+            id_col = "booth_id" if "booth_id" in booth_cols else ("booth_no" if "booth_no" in booth_cols else ("id" if "id" in booth_cols else None))
+            name_col = "polling_station_adr_en" if "polling_station_adr_en" in booth_cols else ("booth_add_en" if "booth_add_en" in booth_cols else ("name_en" if "name_en" in booth_cols else None))
+            ward_ref = "ward_id" if "ward_id" in booth_cols else ("ward_no" if "ward_no" in booth_cols else None)
+            if id_col and name_col:
+                where = f"WHERE {ward_ref} = :ward_id" if ward_ref else ""
+                rows = db.execute(
+                    text(
+                        f"""
+                        SELECT {id_col} AS id, {name_col} AS name
+                        FROM public.booths
+                        {where}
+                        ORDER BY {name_col}
+                        """
+                    ),
+                    {"ward_id": parentId},
+                ).all()
+                for row in rows:
+                    out.append({"id": int(row.id), "code": str(row.id), "name": row.name})
+                return out
         for row in rows:
             out.append({"id": row[0], "code": str(row[0]), "name": row[1]})
     else:
