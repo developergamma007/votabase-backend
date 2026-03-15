@@ -1434,7 +1434,7 @@ def get_wards(
         q = q.filter(Ward.tenant_id == current.tenantId)
     if assemblyId:
         q = q.filter(Ward.assembly_id == assemblyId)
-    wards = q.order_by(Ward.ward_name_en.asc()).all()
+    wards = q.order_by(Ward.ward_id.asc()).all()
     if wards:
         return [
             {
@@ -1464,7 +1464,7 @@ def get_wards(
             SELECT {id_col} AS id, {name_col} AS name, {assembly_ref if assembly_ref else 'NULL'} AS assembly_id
             FROM public.wards
             {where_clause}
-            ORDER BY {name_col}
+            ORDER BY {id_col}
             """
         ),
         params,
@@ -1771,12 +1771,20 @@ def search_voters(
         booth_by_key[(row["wardCode"], row["boothNo"])] = row
         booths_by_no.setdefault(row["boothNo"], []).append(row)
 
+    voter_id_col = "voter_id" if "voter_id" in voter_cols else ("id" if "id" in voter_cols else None)
     voter_sr_col = "sl" if "sl" in voter_cols else ("sr_no" if "sr_no" in voter_cols else None)
     voter_epic_col = "epic" if "epic" in voter_cols else ("epic_no" if "epic_no" in voter_cols else None)
     voter_name_en_col = "name_en" if "name_en" in voter_cols else ("first_middle_name_en" if "first_middle_name_en" in voter_cols else None)
     voter_name_local_col = "name_kannada" if "name_kannada" in voter_cols else ("first_middle_name_local" if "first_middle_name_local" in voter_cols else None)
-    voter_relation_en_col = "relation_name_en" if "relation_name_en" in voter_cols else ("relation_first_middle_name_en" if "relation_first_middle_name_en" in voter_cols else None)
+    voter_relation_en_col = "relation_name_en" if "relation_name_en" in voter_cols else ("relation_first_middle_name_en" if "relation_first_middle_name_en" in voter_cols else ("rel_eng" if "rel_eng" in voter_cols else None))
+    voter_relation_local_col = "relation_name_local" if "relation_name_local" in voter_cols else ("relation_first_middle_name_local" if "relation_first_middle_name_local" in voter_cols else ("rel_kannada" if "rel_kannada" in voter_cols else None))
+    voter_relation_type_col = "relation_type" if "relation_type" in voter_cols else ("rel_type" if "rel_type" in voter_cols else None)
+    voter_age_col = "age" if "age" in voter_cols else None
     voter_house_col = "house" if "house" in voter_cols else ("house_no_en" if "house_no_en" in voter_cols else None)
+    voter_relation_en_col = "relation_name_en" if "relation_name_en" in voter_cols else ("relation_first_middle_name_en" if "relation_first_middle_name_en" in voter_cols else ("rel_eng" if "rel_eng" in voter_cols else None))
+    voter_relation_local_col = "relation_name_local" if "relation_name_local" in voter_cols else ("relation_first_middle_name_local" if "relation_first_middle_name_local" in voter_cols else ("rel_kannada" if "rel_kannada" in voter_cols else None))
+    voter_relation_type_col = "relation_type" if "relation_type" in voter_cols else ("rel_type" if "rel_type" in voter_cols else None)
+    voter_age_col = "age" if "age" in voter_cols else None
     voter_gender_col = "gender" if "gender" in voter_cols else None
     voter_mobile_col = "mobile" if "mobile" in voter_cols else None
     voter_booth_no_col = "booth_no" if "booth_no" in voter_cols else ("booth_id" if "booth_id" in voter_cols else None)
@@ -1827,24 +1835,29 @@ def search_voters(
 
     where_sql = " AND ".join(where_parts)
 
+    order_expr = f"CAST({voter_epic_col} AS TEXT) ASC NULLS LAST" if voter_epic_col else (f"CAST({voter_sr_col} AS INT)" if voter_sr_col else voter_booth_no_col)
+    voter_id_expr = f"{voter_id_col}" if voter_id_col else (f"COALESCE(CAST({voter_sr_col} AS BIGINT), ROW_NUMBER() OVER ())" if voter_sr_col else "ROW_NUMBER() OVER ()")
     voters_rows = db.execute(
         text(
             f"""
             SELECT
-                ROW_NUMBER() OVER () AS voter_id,
-                {voter_sr_col if voter_sr_col else 'NULL'} AS sr_no,
+                {voter_id_expr} AS voter_id,
+                {voter_sr_col if voter_sr_col else 'NULL'} AS sl,
                 {voter_epic_col if voter_epic_col else 'NULL'} AS epic_no,
                 {voter_name_en_col if voter_name_en_col else 'NULL'} AS name_en,
                 {voter_name_local_col if voter_name_local_col else 'NULL'} AS name_local,
                 {voter_relation_en_col if voter_relation_en_col else 'NULL'} AS relation_name_en,
+                {voter_relation_local_col if voter_relation_local_col else 'NULL'} AS relation_name_local,
+                {voter_relation_type_col if voter_relation_type_col else 'NULL'} AS relation_type,
                 {voter_house_col if voter_house_col else 'NULL'} AS house_no_en,
                 {voter_gender_col if voter_gender_col else 'NULL'} AS gender,
+                {voter_age_col if voter_age_col else 'NULL'} AS age,
                 {voter_mobile_col if voter_mobile_col else 'NULL'} AS mobile,
                 {voter_booth_no_col} AS booth_no,
                 {voter_ward_code_col if voter_ward_code_col else 'NULL'} AS ward_code
             FROM public.voters
             WHERE {where_sql}
-            ORDER BY {voter_booth_no_col}
+            ORDER BY {order_expr}
             LIMIT :limit OFFSET :offset
             """
         ),
@@ -1867,19 +1880,21 @@ def search_voters(
         ward_info = ward_by_id.get(int(ward_id_mapped)) if ward_id_mapped is not None else None
         result.append(
             {
-                "voterId": int(v.voter_id),
-                "srNo": v.sr_no,
+                "voterId": int(v.voter_id) if v.voter_id is not None else None,
+                "sl": v.sl,
                 "epicNo": v.epic_no,
                 "firstMiddleNameEn": v.name_en,
                 "lastNameEn": "",
                 "firstMiddleNameLocal": v.name_local,
                 "lastNameLocal": "",
                 "relationFirstMiddleNameEn": v.relation_name_en,
+                "relationFirstMiddleNameLocal": v.relation_name_local,
+                "relationType": v.relation_type,
                 "relationLastNameEn": "",
                 "houseNoEn": str(v.house_no_en) if v.house_no_en is not None else None,
                 "houseNoLocal": None,
                 "gender": v.gender,
-                "age": None,
+                "age": v.age,
                 "mobile": str(v.mobile) if v.mobile is not None else None,
                 "wardCode": ward_code,
                 "boothNo": booth_no,
@@ -1996,10 +2011,15 @@ def get_voters_by_booth(
                 ward_name_en = ward_row.ward_name_en
                 ward_name_local = ward_row.ward_name_local
 
+    voter_id_col = "voter_id" if "voter_id" in voter_cols else ("id" if "id" in voter_cols else None)
     voter_sr_col = "sl" if "sl" in voter_cols else ("sr_no" if "sr_no" in voter_cols else None)
     voter_epic_col = "epic" if "epic" in voter_cols else ("epic_no" if "epic_no" in voter_cols else None)
     voter_name_en_col = "name_en" if "name_en" in voter_cols else ("first_middle_name_en" if "first_middle_name_en" in voter_cols else None)
     voter_name_local_col = "name_kannada" if "name_kannada" in voter_cols else ("first_middle_name_local" if "first_middle_name_local" in voter_cols else None)
+    voter_relation_en_col = "relation_name_en" if "relation_name_en" in voter_cols else ("relation_first_middle_name_en" if "relation_first_middle_name_en" in voter_cols else ("rel_eng" if "rel_eng" in voter_cols else None))
+    voter_relation_local_col = "relation_name_local" if "relation_name_local" in voter_cols else ("relation_first_middle_name_local" if "relation_first_middle_name_local" in voter_cols else ("rel_kannada" if "rel_kannada" in voter_cols else None))
+    voter_relation_type_col = "relation_type" if "relation_type" in voter_cols else ("rel_type" if "rel_type" in voter_cols else None)
+    voter_age_col = "age" if "age" in voter_cols else None
     voter_house_col = "house" if "house" in voter_cols else ("house_no_en" if "house_no_en" in voter_cols else None)
     voter_gender_col = "gender" if "gender" in voter_cols else None
     voter_booth_no_col = "booth_no" if "booth_no" in voter_cols else ("booth_id" if "booth_id" in voter_cols else None)
@@ -2014,19 +2034,26 @@ def get_voters_by_booth(
         where_clause += f" AND {voter_ward_code_col} = :ward_code"
         params["ward_code"] = booth_row.ward_code
 
+    voter_id_expr = f"{voter_id_col}" if voter_id_col else (f"COALESCE(CAST({voter_sr_col} AS BIGINT), ROW_NUMBER() OVER ())" if voter_sr_col else "ROW_NUMBER() OVER ()")
+    order_expr = f"CAST({voter_epic_col} AS TEXT) ASC NULLS LAST" if voter_epic_col else (f"CAST({voter_sr_col} AS INT)" if voter_sr_col else voter_booth_no_col)
     voters_rows = db.execute(
         text(
             f"""
             SELECT
-                ROW_NUMBER() OVER () AS voter_id,
-                {voter_sr_col if voter_sr_col else 'NULL'} AS sr_no,
+                {voter_id_expr} AS voter_id,
+                {voter_sr_col if voter_sr_col else 'NULL'} AS sl,
                 {voter_epic_col if voter_epic_col else 'NULL'} AS epic_no,
                 {voter_name_en_col if voter_name_en_col else 'NULL'} AS name_en,
                 {voter_name_local_col if voter_name_local_col else 'NULL'} AS name_local,
+                {voter_relation_en_col if voter_relation_en_col else 'NULL'} AS relation_name_en,
+                {voter_relation_local_col if voter_relation_local_col else 'NULL'} AS relation_name_local,
+                {voter_relation_type_col if voter_relation_type_col else 'NULL'} AS relation_type,
                 {voter_house_col if voter_house_col else 'NULL'} AS house_no_en,
-                {voter_gender_col if voter_gender_col else 'NULL'} AS gender
+                {voter_gender_col if voter_gender_col else 'NULL'} AS gender,
+                {voter_age_col if voter_age_col else 'NULL'} AS age
             FROM public.voters
             WHERE {where_clause}
+            ORDER BY {order_expr}
             """
         ),
         params,
@@ -2043,17 +2070,20 @@ def get_voters_by_booth(
             female += 1
         voters.append(
             {
-                "voterId": int(v.voter_id),
-                "srNo": v.sr_no,
+                "voterId": int(v.voter_id) if v.voter_id is not None else None,
+                "sl": v.sl,
                 "epicNo": v.epic_no,
                 "firstMiddleNameEn": v.name_en,
                 "lastNameEn": "",
                 "firstMiddleNameLocal": v.name_local,
                 "lastNameLocal": "",
+                "relationFirstMiddleNameEn": v.relation_name_en,
+                "relationFirstMiddleNameLocal": v.relation_name_local,
+                "relationType": v.relation_type,
                 "houseNoEn": str(v.house_no_en) if v.house_no_en is not None else None,
                 "houseNoLocal": None,
                 "gender": v.gender,
-                "age": None,
+                "age": v.age,
                 "dob": None,
                 "mobile": None,
                 "wardCode": str(booth_row.ward_code) if booth_row.ward_code is not None else None,
@@ -2931,9 +2961,9 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
             }
     allowed_ward_ids = set(ward_map.keys())
 
+    voter_id_col = "voter_id" if "voter_id" in voter_cols else ("id" if "id" in voter_cols else None)
     voter_sr_col = "sl" if "sl" in voter_cols else ("sr_no" if "sr_no" in voter_cols else None)
     voter_epic_col = "epic" if "epic" in voter_cols else ("epic_no" if "epic_no" in voter_cols else None)
-    voter_name_en_col = "name_en" if "name_en" in voter_cols else ("first_middle_name_en" if "first_middle_name_en" in voter_cols else None)
     voter_name_local_col = "name_kannada" if "name_kannada" in voter_cols else ("first_middle_name_local" if "first_middle_name_local" in voter_cols else None)
     voter_house_col = "house" if "house" in voter_cols else ("house_no_en" if "house_no_en" in voter_cols else None)
     voter_gender_col = "gender" if "gender" in voter_cols else None
@@ -2989,11 +3019,12 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
     voter_where_sql = " WHERE " + " AND ".join(voter_where_parts)
 
     if include_voters:
+        voter_id_expr = f"{voter_id_col}" if voter_id_col else "ROW_NUMBER() OVER ()"
         voter_rows = db.execute(
             text(
                 f"""
                 SELECT
-                    ROW_NUMBER() OVER () AS voter_id,
+                    {voter_id_expr} AS voter_id,
                     {voter_sr_col if voter_sr_col else 'NULL'} AS sr_no,
                     {voter_epic_col if voter_epic_col else 'NULL'} AS epic_no,
                     {voter_name_en_col if voter_name_en_col else 'NULL'} AS name_en,
