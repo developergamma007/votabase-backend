@@ -133,6 +133,21 @@ class User(Base):
     tenant: Mapped[Optional[Tenant]] = relationship(Tenant)
 
 
+class VolunteerUser(Base):
+    __tablename__ = "volunteer_users"
+    __table_args__ = {"schema": "metastore"}
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(20))
+    role: Mapped[str] = mapped_column(String(30), default="USER")
+    assignment_type: Mapped[Optional[str]] = mapped_column(String(30))
+    assignment_id: Mapped[Optional[str]] = mapped_column(String)
+    first_name: Mapped[str] = mapped_column(String(100))
+    phone: Mapped[str] = mapped_column(String(10), unique=True)
+    profile_pic_url: Mapped[Optional[str]] = mapped_column(String)
+    blocked: Mapped[bool] = mapped_column(Boolean, default=False)
+    deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+
 class Assembly(Base):
     __tablename__ = "assembly"
     __table_args__ = {"schema": "data"}
@@ -401,10 +416,10 @@ class JwtUserDetails:
     role: str
     tenantId: Optional[str]
     assignmentType: Optional[str]
-    assignmentId: Optional[int]
+    assignmentId: Optional[str]
 
 
-def _generate_token(first_name: str, role: str, tenant_id: Optional[str], assignment_type: Optional[str], assignment_id: Optional[int], phone: str) -> str:
+def _generate_token(first_name: str, role: str, tenant_id: Optional[str], assignment_type: Optional[str], assignment_id: Optional[str], phone: str) -> str:
     payload = {
         "sub": first_name,
         "role": role,
@@ -423,6 +438,16 @@ def _parse_token(token: str) -> Dict[str, Any]:
     return jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
 
 
+def _external_base_url(request: Request) -> str:
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    forwarded_host = request.headers.get("x-forwarded-host")
+    host = forwarded_host or request.headers.get("host")
+    scheme = forwarded_proto or request.url.scheme
+    if host:
+        return f"{scheme}://{host}"
+    return str(request.base_url).rstrip("/")
+
+
 def _resolve_tenant_id(user: Optional[User] = None, payload: Optional[Dict[str, Any]] = None) -> Optional[str]:
     if user is not None and getattr(user, "tenant", None) is not None:
         tenant_value = getattr(user.tenant, "tenant_id", None)
@@ -433,6 +458,14 @@ def _resolve_tenant_id(user: Optional[User] = None, payload: Optional[Dict[str, 
         if tenant_value:
             return str(tenant_value)
     return None
+
+
+def _resolve_tenant_id_for_entity(entity: Any) -> Optional[str]:
+    if entity is None:
+        return None
+    if isinstance(entity, VolunteerUser):
+        return entity.tenant_id
+    return _resolve_tenant_id(user=entity)
 
 
 def _auth_user(request: Request, db: Session) -> JwtUserDetails:
@@ -452,16 +485,24 @@ def _auth_user(request: Request, db: Session) -> JwtUserDetails:
         .filter(User.first_name == payload.get("firstName"), User.phone == payload.get("phone"))
     )
     user = base_query.first()
+    volunteer = None
+    if not user:
+        volunteer = (
+            db.query(VolunteerUser)
+            .filter(VolunteerUser.first_name == payload.get("firstName"), VolunteerUser.phone == payload.get("phone"))
+            .first()
+        )
 
-    if user and (user.blocked or user.deleted):
-        reason = "blocked" if user.blocked else "deleted"
+    target = user or volunteer
+    if target and (target.blocked or target.deleted):
+        reason = "blocked" if target.blocked else "deleted"
         raise HTTPException(status_code=403, detail=f"User is {reason}")
 
     return JwtUserDetails(
         phone=payload.get("phone"),
         firstName=payload.get("firstName"),
         role=payload.get("role"),
-        tenantId=_resolve_tenant_id(user=user, payload=payload),
+        tenantId=_resolve_tenant_id_for_entity(target) or payload.get("tenantId"),
         assignmentType=payload.get("assignmentType"),
         assignmentId=payload.get("assignmentId"),
     )
@@ -493,7 +534,7 @@ class UserDetailsIn(BaseModel):
     role: str
     tenantId: Optional[str] = None
     assignmentType: Optional[str] = None
-    assignmentId: Optional[int] = None
+    assignmentId: Optional[str] = None
     firstName: str
     phone: Optional[str] = None
     profilePicUrl: Optional[str] = None
@@ -587,7 +628,7 @@ class UserProfileDto(BaseModel):
 def to_user_details(u: User) -> Dict[str, Any]:
     return {
         "role": u.role,
-        "tenantId": _resolve_tenant_id(user=u),
+        "tenantId": _resolve_tenant_id_for_entity(u),
         "assignmentType": u.assignment_type,
         "assignmentId": u.assignment_id,
         "firstName": u.first_name,
@@ -890,6 +931,27 @@ def startup_seed_super_admin() -> None:
 @app.on_event("startup")
 def startup_ensure_voter_enrichment() -> None:
     VoterEnrichment.__table__.create(bind=engine, checkfirst=True)
+    VolunteerUser.__table__.create(bind=engine, checkfirst=True)
+    db = SessionLocal()
+    try:
+        col = db.execute(
+            text(
+                """
+                SELECT data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'metastore'
+                  AND table_name = 'volunteer_users'
+                  AND column_name = 'assignment_id'
+                """
+            )
+        ).scalar()
+        if col and col not in {"character varying", "text"}:
+            db.execute(text("ALTER TABLE metastore.volunteer_users ALTER COLUMN assignment_id TYPE text USING assignment_id::text"))
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
 
 
 # ---------------------------
@@ -898,13 +960,16 @@ def startup_ensure_voter_enrichment() -> None:
 @app.post(f"{CONTEXT_PATH}/api/auth/login")
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.first_name == payload.firstName, User.phone == payload.phone).first()
+    volunteer = None
     if not user:
-        raise InvalidCredentialsException("Invalid firstname or phone")
+        volunteer = db.query(VolunteerUser).filter(VolunteerUser.first_name == payload.firstName, VolunteerUser.phone == payload.phone).first()
+        if not volunteer:
+            raise InvalidCredentialsException("Invalid firstname or phone")
 
     tenant_id = None
     assignment_type = None
     assignment_id = 0
-    if user.role != "SUPER_ADMIN":
+    if user and user.role != "SUPER_ADMIN":
         if not user.tenant:
             raise InvalidCredentialsException("Tenant information missing for user")
         tenant_id = user.tenant.tenant_id
@@ -913,14 +978,22 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
                 raise InvalidCredentialsException("Assignment information missing for user")
         assignment_type = user.assignment_type
         assignment_id = user.assignment_id
+    elif volunteer:
+        if volunteer.blocked or volunteer.deleted:
+            reason = "blocked" if volunteer.blocked else "deleted"
+            raise HTTPException(status_code=403, detail=f"User is {reason}")
+        tenant_id = volunteer.tenant_id
+        assignment_type = volunteer.assignment_type
+        assignment_id = volunteer.assignment_id
 
-    token = _generate_token(user.first_name, user.role, tenant_id, assignment_type, assignment_id, user.phone)
+    effective = user or volunteer
+    token = _generate_token(effective.first_name, effective.role, tenant_id, assignment_type, assignment_id, effective.phone)
     return api_success(
         "Login successful",
         {
             "userName": payload.firstName,
             "token": token,
-            "role": user.role,
+            "role": effective.role,
             "tenantId": tenant_id,
         },
     )
@@ -932,26 +1005,38 @@ def get_dashboard(user: JwtUserDetails = Depends(require_roles("ADMIN"))):
 
 
 @app.post(f"{CONTEXT_PATH}/api/user/register")
-def register_user(payload: UserDetailsIn, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN"))):
-    if current.role != "ADMIN":
+def register_user(
+    payload: UserDetailsIn,
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN")),
+):
+    if current.role not in {"ADMIN", "SUPER_ADMIN"}:
         raise HTTPException(status_code=403, detail="You are not authorized to create users")
 
     requested_role = (payload.role or "").strip().upper()
     role_to_create = "USER"
-    if requested_role not in {"", "USER", "ADMIN"}:
+    if requested_role not in {"", "USER"}:
         raise ValueError("Invalid role in register request")
 
-    tenant = db.query(Tenant).filter(Tenant.tenant_id == current.tenantId).first()
-    if not tenant:
-        raise ResourceNotFoundException("Tenant", "tenantId", current.tenantId)
+    tenant_id = current.tenantId if current.role == "ADMIN" else (payload.tenantId or "").strip()
+    if not tenant_id and current.role == "SUPER_ADMIN":
+        tenants = db.query(Tenant).all()
+        if len(tenants) == 1:
+            tenant_id = tenants[0].tenant_id
+        else:
+            raise HTTPException(status_code=400, detail="tenantId is required for SUPER_ADMIN")
 
-    exists = db.query(User).filter(User.first_name == payload.firstName, User.phone == payload.phone).first()
+    tenant = db.query(Tenant).filter(Tenant.tenant_id == tenant_id).first()
+    if not tenant:
+        raise ResourceNotFoundException("Tenant", "tenantId", tenant_id)
+
+    exists = db.query(VolunteerUser).filter(VolunteerUser.first_name == payload.firstName, VolunteerUser.phone == payload.phone).first()
     if exists:
         raise ResourceAlreadyExistsException("registerUser", "userName", payload.firstName)
 
-    user = User(
+    volunteer = VolunteerUser(
         role=role_to_create,
-        tenant_ref=tenant.id,
+        tenant_id=tenant.tenant_id,
         assignment_type=payload.assignmentType,
         assignment_id=payload.assignmentId,
         first_name=payload.firstName,
@@ -959,12 +1044,12 @@ def register_user(payload: UserDetailsIn, db: Session = Depends(get_db), current
         blocked=False,
         deleted=False,
     )
-    db.add(user)
+    db.add(volunteer)
     db.commit()
 
     out = payload.model_dump()
     out["role"] = role_to_create
-    out["tenantId"] = current.tenantId
+    out["tenantId"] = tenant_id
     out["userName"] = payload.firstName
     return api_success("User registered successfully", out)
 
@@ -976,9 +1061,8 @@ def block_user(payload: UserBlockRequest, db: Session = Depends(get_db), current
         raise ValueError("firstName or userEmail is required")
 
     user = (
-        db.query(User)
-        .join(Tenant, User.tenant_ref == Tenant.id)
-        .filter(User.first_name == target_first_name, Tenant.tenant_id == current.tenantId)
+        db.query(VolunteerUser)
+        .filter(VolunteerUser.first_name == target_first_name, VolunteerUser.tenant_id == current.tenantId)
         .first()
     )
     if not user:
@@ -1004,32 +1088,32 @@ def list_users(
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("ADMIN")),
 ):
-    q = db.query(User).join(Tenant, User.tenant_ref == Tenant.id).filter(User.role == "USER", Tenant.tenant_id == current.tenantId)
+    q = db.query(VolunteerUser).filter(VolunteerUser.role == "USER", VolunteerUser.tenant_id == current.tenantId)
 
     blocked_filter = parse_optional_bool(blocked)
     deleted_filter = parse_optional_bool(deleted)
     assignment_type_filter = normalize_optional_text(assignmentType)
 
     if blocked_filter is not None:
-        q = q.filter(User.blocked == blocked_filter)
+        q = q.filter(VolunteerUser.blocked == blocked_filter)
     if deleted_filter is not None:
-        q = q.filter(User.deleted == deleted_filter)
+        q = q.filter(VolunteerUser.deleted == deleted_filter)
     if assignment_type_filter is not None:
-        q = q.filter(User.assignment_type == assignment_type_filter)
+        q = q.filter(VolunteerUser.assignment_type == assignment_type_filter)
     if search and search.strip():
         s = f"%{search.lower()}%"
-        q = q.filter(or_(func.lower(User.first_name).like(s), User.phone.like(f"%{search}%")))
+        q = q.filter(or_(func.lower(VolunteerUser.first_name).like(s), VolunteerUser.phone.like(f"%{search}%")))
 
     sort_map = {
-        "firstName": User.first_name,
-        "phone": User.phone,
-        "role": User.role,
-        "assignmentType": User.assignment_type,
-        "assignmentId": User.assignment_id,
-        "blocked": User.blocked,
-        "deleted": User.deleted,
+        "firstName": VolunteerUser.first_name,
+        "phone": VolunteerUser.phone,
+        "role": VolunteerUser.role,
+        "assignmentType": VolunteerUser.assignment_type,
+        "assignmentId": VolunteerUser.assignment_id,
+        "blocked": VolunteerUser.blocked,
+        "deleted": VolunteerUser.deleted,
     }
-    sort_col = sort_map.get(sortBy, User.first_name)
+    sort_col = sort_map.get(sortBy, VolunteerUser.first_name)
     q = q.order_by(desc(sort_col) if direction.lower() == "desc" else asc(sort_col))
 
     total = q.count()
@@ -1045,9 +1129,8 @@ def delete_user(payload: UserDeleteRequest, db: Session = Depends(get_db), curre
         raise ValueError("firstName or userEmail is required")
 
     user = (
-        db.query(User)
-        .join(Tenant, User.tenant_ref == Tenant.id)
-        .filter(User.first_name == target_first_name, Tenant.tenant_id == current.tenantId)
+        db.query(VolunteerUser)
+        .filter(VolunteerUser.first_name == target_first_name, VolunteerUser.tenant_id == current.tenantId)
         .first()
     )
     if not user:
@@ -1063,9 +1146,8 @@ def delete_user(payload: UserDeleteRequest, db: Session = Depends(get_db), curre
 def bulk_block(payload: UserBulkActionRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN"))):
     usernames = resolve_bulk_usernames(payload)
     users = (
-        db.query(User)
-        .join(Tenant, User.tenant_ref == Tenant.id)
-        .filter(Tenant.tenant_id == current.tenantId, User.first_name.in_(usernames))
+        db.query(VolunteerUser)
+        .filter(VolunteerUser.tenant_id == current.tenantId, VolunteerUser.first_name.in_(usernames))
         .all()
     )
     if len(users) != len(usernames):
@@ -1082,9 +1164,8 @@ def bulk_block(payload: UserBulkActionRequest, db: Session = Depends(get_db), cu
 def bulk_delete(payload: UserBulkActionRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN"))):
     usernames = resolve_bulk_usernames(payload)
     users = (
-        db.query(User)
-        .join(Tenant, User.tenant_ref == Tenant.id)
-        .filter(Tenant.tenant_id == current.tenantId, User.first_name.in_(usernames))
+        db.query(VolunteerUser)
+        .filter(VolunteerUser.tenant_id == current.tenantId, VolunteerUser.first_name.in_(usernames))
         .all()
     )
     if len(users) != len(usernames):
@@ -1100,61 +1181,73 @@ def bulk_delete(payload: UserBulkActionRequest, db: Session = Depends(get_db), c
 @app.get(f"{CONTEXT_PATH}/api/user/profile")
 def get_profile(db: Session = Depends(get_db), current: JwtUserDetails = Depends(get_current_user)):
     user = db.query(User).filter(User.first_name == current.firstName, User.phone == current.phone).first()
+    volunteer = None
     if not user:
-        raise ResourceNotFoundException("User", "username", current.firstName)
+        volunteer = db.query(VolunteerUser).filter(VolunteerUser.first_name == current.firstName, VolunteerUser.phone == current.phone).first()
+        if not volunteer:
+            raise ResourceNotFoundException("User", "username", current.firstName)
 
+    target = user or volunteer
     presigned = ""
-    if user.profile_pic_url:
-        key = s3_extract_key(user.profile_pic_url)
-        presigned = s3_presigned_url(key, 15, fallback_url=user.profile_pic_url)
+    if target.profile_pic_url:
+        key = s3_extract_key(target.profile_pic_url)
+        presigned = s3_presigned_url(key, 15, fallback_url=target.profile_pic_url)
 
     return {
-        "firstName": user.first_name,
+        "firstName": target.first_name,
         "lastName": "",
-        "userName": user.first_name,
-        "phone": user.phone,
+        "userName": target.first_name,
+        "phone": target.phone,
         "profilePicUrl": presigned,
-        "tenantId": _resolve_tenant_id(user=user),
-        "role": user.role,
+        "tenantId": _resolve_tenant_id_for_entity(target),
+        "role": target.role,
     }
 
 
 @app.put(f"{CONTEXT_PATH}/api/user/profile")
 def update_profile(payload: UserProfileDto, db: Session = Depends(get_db), current: JwtUserDetails = Depends(get_current_user)):
     user = db.query(User).filter(User.first_name == current.firstName, User.phone == current.phone).first()
+    volunteer = None
     if not user:
-        raise ResourceNotFoundException("User", "username", current.firstName)
+        volunteer = db.query(VolunteerUser).filter(VolunteerUser.first_name == current.firstName, VolunteerUser.phone == current.phone).first()
+        if not volunteer:
+            raise ResourceNotFoundException("User", "username", current.firstName)
 
-    user.first_name = payload.firstName
-    user.phone = payload.phone
+    target = user or volunteer
+    target.first_name = payload.firstName
+    target.phone = payload.phone
     db.commit()
-    db.refresh(user)
-    return get_profile(db, JwtUserDetails(phone=user.phone, firstName=user.first_name, role=user.role, tenantId=current.tenantId, assignmentType=current.assignmentType, assignmentId=current.assignmentId))
+    db.refresh(target)
+    return get_profile(db, JwtUserDetails(phone=target.phone, firstName=target.first_name, role=target.role, tenantId=current.tenantId, assignmentType=current.assignmentType, assignmentId=current.assignmentId))
 
 
 @app.post(f"{CONTEXT_PATH}/api/user/profile/upload")
 def upload_profile(file: UploadFile = File(...), db: Session = Depends(get_db), current: JwtUserDetails = Depends(get_current_user)):
     user = db.query(User).filter(User.first_name == current.firstName, User.phone == current.phone).first()
+    volunteer = None
     if not user:
-        raise ResourceNotFoundException("User", "username", current.firstName)
+        volunteer = db.query(VolunteerUser).filter(VolunteerUser.first_name == current.firstName, VolunteerUser.phone == current.phone).first()
+        if not volunteer:
+            raise ResourceNotFoundException("User", "username", current.firstName)
 
     ext = Path(file.filename or "").suffix
-    tenant_segment = _resolve_tenant_id(user=user) or "global"
-    key = f"{PROFILE_UPLOAD_DIR}/{tenant_segment}/{user.first_name}/{uuid.uuid4()}{ext}"
+    target = user or volunteer
+    tenant_segment = _resolve_tenant_id_for_entity(target) or "global"
+    key = f"{PROFILE_UPLOAD_DIR}/{tenant_segment}/{target.first_name}/{uuid.uuid4()}{ext}"
     raw = file.file.read()
     s3_url = s3_upload_bytes(raw, file.content_type or "application/octet-stream", key)
-    user.profile_pic_url = s3_url
+    target.profile_pic_url = s3_url
     db.commit()
 
     presigned = s3_presigned_url(key, 15, fallback_url=s3_url)
     return {
-        "firstName": user.first_name,
+        "firstName": target.first_name,
         "lastName": "",
-        "userName": user.first_name,
-        "phone": user.phone,
+        "userName": target.first_name,
+        "phone": target.phone,
         "profilePicUrl": presigned,
-        "tenantId": _resolve_tenant_id(user=user),
-        "role": user.role,
+        "tenantId": _resolve_tenant_id_for_entity(target),
+        "role": target.role,
     }
 
 
@@ -2010,7 +2103,7 @@ def get_snapshot(
     try:
         public_snapshot = _build_public_snapshot(assemblyCode, db, include_voters=includeVoters)
         snapshot_id = _cache_snapshot(public_snapshot)
-        snapshot_url = f"{str(request.base_url).rstrip('/')}{CONTEXT_PATH}/api/voters/snapshot/content/{snapshot_id}"
+        snapshot_url = f"{_external_base_url(request)}{CONTEXT_PATH}/api/voters/snapshot/content/{snapshot_id}"
         payload = api_success("Snapshot fetched successfully", snapshot_url)
         payload["snapshotMode"] = "link"
         return JSONResponse(content=payload, headers={"X-Snapshot-Mode": "link"})
