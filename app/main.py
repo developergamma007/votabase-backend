@@ -140,8 +140,12 @@ class VolunteerUser(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(20))
     role: Mapped[str] = mapped_column(String(30), default="USER")
+    working_level: Mapped[Optional[str]] = mapped_column(String(30))
     assignment_type: Mapped[Optional[str]] = mapped_column(String(30))
     assignment_id: Mapped[Optional[str]] = mapped_column(String)
+    assembly_ids: Mapped[Optional[str]] = mapped_column(String)
+    ward_ids: Mapped[Optional[str]] = mapped_column(String)
+    booth_ids: Mapped[Optional[str]] = mapped_column(String)
     first_name: Mapped[str] = mapped_column(String(100))
     phone: Mapped[str] = mapped_column(String(10), unique=True)
     profile_pic_url: Mapped[Optional[str]] = mapped_column(String)
@@ -516,6 +520,8 @@ def require_roles(*roles: str):
     def dep(user: JwtUserDetails = Depends(get_current_user)) -> JwtUserDetails:
         role = (user.role or "").replace("ROLE_", "")
         if role not in roles:
+            if role in {"ASSEMBLY", "WARD", "BOOTH"} and "USER" in roles:
+                return user
             raise HTTPException(status_code=401, detail="Access denied")
         return user
 
@@ -622,15 +628,33 @@ class UserProfileDto(BaseModel):
     role: Optional[str] = None
 
 
+class VolunteerCreateRequest(BaseModel):
+    firstName: str
+    phone: str
+    workingLevel: str
+    assemblyIds: Optional[List[int]] = None
+    wardIds: Optional[List[int]] = None
+    boothIds: Optional[List[int]] = None
+
+
 # ---------------------------
 # Utility converters
 # ---------------------------
 def to_user_details(u: User) -> Dict[str, Any]:
+    def parse_ids(value: Optional[str]) -> List[int]:
+        if not value:
+            return []
+        return [int(v) for v in str(value).split(",") if str(v).strip().isdigit()]
+
     return {
         "role": u.role,
         "tenantId": _resolve_tenant_id_for_entity(u),
         "assignmentType": u.assignment_type,
         "assignmentId": u.assignment_id,
+        "workingLevel": getattr(u, "working_level", None) or u.assignment_type,
+        "assemblyIds": parse_ids(getattr(u, "assembly_ids", None)),
+        "wardIds": parse_ids(getattr(u, "ward_ids", None)),
+        "boothIds": parse_ids(getattr(u, "booth_ids", None)),
         "firstName": u.first_name,
         "lastName": "",
         "userName": u.first_name,
@@ -651,6 +675,21 @@ def to_tenant_dto(t: Tenant) -> Dict[str, Any]:
         "contactPhone": t.contact_phone,
         "active": t.active,
     }
+
+
+def _serialize_id_list(values: Optional[List[int]]) -> Optional[str]:
+    if not values:
+        return None
+    return ",".join(str(int(v)) for v in values if v is not None)
+
+
+def _first_id(values: Optional[List[int]]) -> Optional[int]:
+    if not values:
+        return None
+    for v in values:
+        if v is not None:
+            return int(v)
+    return None
 
 
 def build_page(content: List[Any], page: int, size: int, total: int, sort_field: str = "", direction: str = "asc") -> Dict[str, Any]:
@@ -934,6 +973,28 @@ def startup_ensure_voter_enrichment() -> None:
     VolunteerUser.__table__.create(bind=engine, checkfirst=True)
     db = SessionLocal()
     try:
+        existing_cols = {
+            row[0]
+            for row in db.execute(
+                text(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'metastore'
+                      AND table_name = 'volunteer_users'
+                    """
+                )
+            ).all()
+        }
+        if "working_level" not in existing_cols:
+            db.execute(text("ALTER TABLE metastore.volunteer_users ADD COLUMN working_level varchar(30)"))
+        if "assembly_ids" not in existing_cols:
+            db.execute(text("ALTER TABLE metastore.volunteer_users ADD COLUMN assembly_ids text"))
+        if "ward_ids" not in existing_cols:
+            db.execute(text("ALTER TABLE metastore.volunteer_users ADD COLUMN ward_ids text"))
+        if "booth_ids" not in existing_cols:
+            db.execute(text("ALTER TABLE metastore.volunteer_users ADD COLUMN booth_ids text"))
+
         col = db.execute(
             text(
                 """
@@ -947,7 +1008,7 @@ def startup_ensure_voter_enrichment() -> None:
         ).scalar()
         if col and col not in {"character varying", "text"}:
             db.execute(text("ALTER TABLE metastore.volunteer_users ALTER COLUMN assignment_id TYPE text USING assignment_id::text"))
-            db.commit()
+        db.commit()
     except Exception:
         db.rollback()
     finally:
@@ -1037,6 +1098,7 @@ def register_user(
     volunteer = VolunteerUser(
         role=role_to_create,
         tenant_id=tenant.tenant_id,
+        working_level=payload.assignmentType,
         assignment_type=payload.assignmentType,
         assignment_id=payload.assignmentId,
         first_name=payload.firstName,
@@ -1052,6 +1114,113 @@ def register_user(
     out["tenantId"] = tenant_id
     out["userName"] = payload.firstName
     return api_success("User registered successfully", out)
+
+
+@app.post(f"{CONTEXT_PATH}/api/volunteers")
+def create_volunteer(
+    payload: VolunteerCreateRequest,
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD")),
+):
+    if current.role not in {"ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD"}:
+        raise HTTPException(status_code=403, detail="You are not authorized to create volunteers")
+
+    working_level = (payload.workingLevel or "").strip().upper()
+    if working_level not in {"ASSEMBLY", "WARD", "BOOTH"}:
+        raise ValueError("workingLevel must be ASSEMBLY, WARD, or BOOTH")
+
+    phone = normalize_optional_text(payload.phone)
+    if not phone or not phone.isdigit() or len(phone) != 10:
+        raise ValueError("phone must be a 10 digit number")
+
+    tenant_id = current.tenantId
+    if not tenant_id:
+        tenants = db.query(Tenant).all()
+        if len(tenants) == 1:
+            tenant_id = tenants[0].tenant_id
+        elif len(tenants) == 0:
+            tenant_id = ""
+        else:
+            raise HTTPException(status_code=400, detail="tenantId is required for SUPER_ADMIN")
+
+    exists = db.query(VolunteerUser).filter(VolunteerUser.first_name == payload.firstName, VolunteerUser.phone == phone).first()
+    if exists:
+        raise ResourceAlreadyExistsException("volunteer", "userName", payload.firstName)
+
+    assembly_ids = payload.assemblyIds or []
+    ward_ids = payload.wardIds or []
+    booth_ids = payload.boothIds or []
+    assignment_id = _first_id(assembly_ids) or _first_id(ward_ids) or _first_id(booth_ids)
+
+    volunteer = VolunteerUser(
+        role=working_level,
+        tenant_id=tenant_id,
+        working_level=working_level,
+        assignment_type=working_level,
+        assignment_id=str(assignment_id) if assignment_id is not None else None,
+        assembly_ids=_serialize_id_list(assembly_ids),
+        ward_ids=_serialize_id_list(ward_ids),
+        booth_ids=_serialize_id_list(booth_ids),
+        first_name=payload.firstName,
+        phone=phone,
+        blocked=False,
+        deleted=False,
+    )
+    db.add(volunteer)
+    db.commit()
+
+    return api_success(
+        "Volunteer created successfully",
+        to_user_details(volunteer),
+    )
+
+
+@app.get(f"{CONTEXT_PATH}/api/volunteers")
+def list_volunteers(
+    page: int = 0,
+    size: int = 10,
+    search: Optional[str] = None,
+    blocked: Optional[str] = None,
+    deleted: Optional[str] = None,
+    workingLevel: Optional[str] = None,
+    sortBy: str = "firstName",
+    direction: str = "asc",
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("ADMIN")),
+):
+    q = db.query(VolunteerUser).filter(VolunteerUser.role.in_(["USER", "ASSEMBLY", "WARD", "BOOTH"]), VolunteerUser.tenant_id == current.tenantId)
+
+    blocked_filter = parse_optional_bool(blocked)
+    deleted_filter = parse_optional_bool(deleted)
+    level_filter = normalize_optional_text(workingLevel)
+
+    if blocked_filter is not None:
+        q = q.filter(VolunteerUser.blocked == blocked_filter)
+    if deleted_filter is not None:
+        q = q.filter(VolunteerUser.deleted == deleted_filter)
+    if level_filter is not None:
+        q = q.filter(VolunteerUser.working_level == level_filter)
+    if search and search.strip():
+        s = f"%{search.lower()}%"
+        q = q.filter(or_(func.lower(VolunteerUser.first_name).like(s), VolunteerUser.phone.like(f"%{search}%")))
+
+    sort_map = {
+        "firstName": VolunteerUser.first_name,
+        "phone": VolunteerUser.phone,
+        "role": VolunteerUser.role,
+        "workingLevel": VolunteerUser.working_level,
+        "assignmentType": VolunteerUser.assignment_type,
+        "assignmentId": VolunteerUser.assignment_id,
+        "blocked": VolunteerUser.blocked,
+        "deleted": VolunteerUser.deleted,
+    }
+    sort_col = sort_map.get(sortBy, VolunteerUser.first_name)
+    q = q.order_by(desc(sort_col) if direction.lower() == "desc" else asc(sort_col))
+
+    total = q.count()
+    users = q.offset(page * size).limit(size).all()
+    content = [to_user_details(u) for u in users]
+    return build_page(content, page, size, total, sortBy, direction)
 
 
 @app.put(f"{CONTEXT_PATH}/api/user/block")
