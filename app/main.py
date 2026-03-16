@@ -1345,14 +1345,17 @@ def get_booths(db: Session = Depends(get_db), current: JwtUserDetails = Depends(
         text(
             """
             SELECT
-                b.id AS id,
+                COALESCE(b.booth_no, b.id) AS id,
+                b.booth_no AS booth_id,
                 COALESCE(NULLIF(b.booth_add_en, ''), 'Booth ' || COALESCE(b.booth_no::text, b.id::text)) AS name_en
             FROM public.booths b
-            ORDER BY LOWER(COALESCE(NULLIF(b.booth_add_en, ''), 'Booth ' || COALESCE(b.booth_no::text, b.id::text)))
+            ORDER BY
+                b.booth_no ASC NULLS LAST,
+                b.id ASC
             """
         )
     ).all()
-    dto = [{"id": int(r.id), "nameEn": r.name_en} for r in rows]
+    dto = [{"id": int(r.id), "boothId": int(r.booth_id), "nameEn": r.name_en} for r in rows]
     return api_success("Booths fetched successfully", dto)
 
 
@@ -1762,7 +1765,7 @@ def search_voters(
     for b in booth_rows:
         row = {
             "boothId": int(b.booth_id),
-            "boothNo": str(b.booth_no),
+            "boothNo": str(b.booth_no if b.booth_no is not None else b.booth_id),
             "wardCode": str(b.ward_code) if b.ward_code is not None else None,
             "wardId": int(b.ward_id) if b.ward_id is not None else None,
             "boothNameEn": b.booth_name_en,
@@ -1835,7 +1838,7 @@ def search_voters(
 
     where_sql = " AND ".join(where_parts)
 
-    order_expr = f"CAST({voter_epic_col} AS TEXT) ASC NULLS LAST" if voter_epic_col else (f"CAST({voter_sr_col} AS INT)" if voter_sr_col else voter_booth_no_col)
+    order_expr = f"CAST({voter_sr_col} AS INT)" if voter_sr_col else (f"CAST({voter_epic_col} AS TEXT) ASC NULLS LAST" if voter_epic_col else voter_booth_no_col)
     voter_id_expr = f"{voter_id_col}" if voter_id_col else (f"COALESCE(CAST({voter_sr_col} AS BIGINT), ROW_NUMBER() OVER ())" if voter_sr_col else "ROW_NUMBER() OVER ()")
     voters_rows = db.execute(
         text(
@@ -2035,7 +2038,11 @@ def get_voters_by_booth(
         params["ward_code"] = booth_row.ward_code
 
     voter_id_expr = f"{voter_id_col}" if voter_id_col else (f"COALESCE(CAST({voter_sr_col} AS BIGINT), ROW_NUMBER() OVER ())" if voter_sr_col else "ROW_NUMBER() OVER ()")
-    order_expr = f"CAST({voter_epic_col} AS TEXT) ASC NULLS LAST" if voter_epic_col else (f"CAST({voter_sr_col} AS INT)" if voter_sr_col else voter_booth_no_col)
+    order_expr = (
+        f"CAST({voter_sr_col} AS INT) ASC NULLS LAST, CAST({voter_epic_col} AS TEXT) ASC NULLS LAST"
+        if (voter_sr_col and voter_epic_col)
+        else (f"CAST({voter_sr_col} AS INT) ASC NULLS LAST" if voter_sr_col else (f"CAST({voter_epic_col} AS TEXT) ASC NULLS LAST" if voter_epic_col else voter_booth_no_col))
+    )
     voters_rows = db.execute(
         text(
             f"""
@@ -3137,6 +3144,7 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
         key = (str(b.ward_code) if b.ward_code is not None else None, str(b.booth_no))
         booth_entry = {
             "boothId": int(b.booth_id),
+            "boothNo": int(b.booth_no) if b.booth_no is not None else None,
             "boothNameEn": b.booth_name_en or (f"Booth {b.booth_no}"),
             "boothNameLocal": b.booth_name_local,
             "voterStats": counts_by_key.get(key, {"total": 0, "male": 0, "female": 0}),
@@ -3153,9 +3161,15 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
             "assemblyCode": assembly_row.assembly_code or requested_assembly_code,
             "assemblyNameEn": assembly_row.assembly_name_en,
             "assemblyNameLocal": assembly_row.assembly_name_local,
-            "wards": sorted(list(ward_map.values()), key=lambda w: (w.get("wardCode") or str(w["wardId"]))),
+            "wards": sorted(
+                [
+                    {**ward, "booths": sorted(ward.get("booths", []), key=lambda b: (b.get("boothNo") or 0, b.get("boothId") or 0))}
+                    for ward in ward_map.values()
+                ],
+                key=lambda w: (w.get("wardCode") or str(w["wardId"])),
+            ),
+            }
         }
-    }
 
 
 def _upload_and_save_snapshot(db: Session, data: Dict[str, Any], key: str, tenant_id: str, assembly_code: str, ward_code: Optional[str], booth_id: Optional[int], level: str) -> None:
