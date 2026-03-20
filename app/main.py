@@ -1,4 +1,5 @@
 import json
+import traceback
 import os
 import re
 import tempfile
@@ -716,6 +717,135 @@ def build_page(content: List[Any], page: int, size: int, total: int, sort_field:
     }
 
 
+def _parse_id_list(raw: Optional[str]) -> List[int]:
+    if not raw:
+        return []
+    items = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if part.isdigit():
+            items.append(int(part))
+    return items
+
+
+def _get_access_scope(db: Session, current: JwtUserDetails) -> Optional[Dict[str, Any]]:
+    role = (current.role or "").replace("ROLE_", "")
+    if role in {"SUPER_ADMIN", "ADMIN"}:
+        return None
+
+    volunteer = (
+        db.query(VolunteerUser)
+        .filter(VolunteerUser.first_name == current.firstName, VolunteerUser.phone == current.phone)
+        .first()
+    )
+    assignment_type = normalize_optional_text(current.assignmentType) or (
+        normalize_optional_text(volunteer.assignment_type) if volunteer else None
+    ) or (normalize_optional_text(volunteer.working_level) if volunteer else None) or role
+    assignment_type = (assignment_type or role).upper()
+
+    assembly_ids = _parse_id_list(volunteer.assembly_ids) if volunteer else []
+    ward_ids = _parse_id_list(volunteer.ward_ids) if volunteer else []
+    booth_ids = _parse_id_list(volunteer.booth_ids) if volunteer else []
+
+    if not (assembly_ids or ward_ids or booth_ids):
+        fallback_ids = _parse_id_list(str(current.assignmentId or ""))
+        if assignment_type == "ASSEMBLY":
+            assembly_ids = fallback_ids
+        elif assignment_type == "WARD":
+            ward_ids = fallback_ids
+        elif assignment_type == "BOOTH":
+            booth_ids = fallback_ids
+
+    return {
+        "assignment_type": assignment_type,
+        "assembly_ids": assembly_ids,
+        "ward_ids": ward_ids,
+        "booth_ids": booth_ids,
+        "role": role,
+    }
+
+
+def _resolve_access_scope_ids(db: Session, current: JwtUserDetails) -> Optional[Dict[str, Any]]:
+    scope = _get_access_scope(db, current)
+    if not scope:
+        return None
+
+    allowed_assembly_ids = set(scope.get("assembly_ids") or [])
+    allowed_ward_ids = set(scope.get("ward_ids") or [])
+    allowed_booth_ids = set(scope.get("booth_ids") or [])
+
+    # booth_ids may be stored as booth_no values, so map both booth_id and booth_no to booth_id
+    if allowed_booth_ids:
+        booth_cols = _get_table_columns(db, "public", "booths")
+        booth_pk_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
+        booth_no_col = "booth_no" if "booth_no" in booth_cols else None
+        if booth_pk_col:
+            raw_values = [str(v).strip() for v in allowed_booth_ids if v is not None and str(v).strip() != ""]
+            ids_int = sorted({int(v) for v in raw_values if v.isdigit()})
+            ids_text = sorted({str(v) for v in raw_values if str(v).strip()})
+            where_parts = []
+            params: Dict[str, Any] = {}
+            if ids_int:
+                clause_id, params_id = _build_in_clause(booth_pk_col, ids_int, "scope_booth_id")
+                where_parts.append(f"({clause_id})")
+                params.update(params_id)
+            if booth_no_col and ids_text:
+                clause_no, params_no = _build_in_clause(f"CAST({booth_no_col} AS TEXT)", ids_text, "scope_booth_no")
+                where_parts.append(f"({clause_no})")
+                params.update(params_no)
+            if not where_parts:
+                where_parts.append("1=0")
+            where_clause = f"WHERE {' OR '.join(where_parts)}"
+            rows = db.execute(
+                text(
+                    f"""
+                    SELECT {booth_pk_col} AS booth_id, {booth_no_col if booth_no_col else booth_pk_col} AS booth_no
+                    FROM public.booths
+                    {where_clause}
+                    """
+                ),
+                params,
+            ).all()
+            allowed_booth_ids = {row.booth_id for row in rows if row.booth_id is not None}
+
+    if allowed_assembly_ids:
+        ward_rows = db.query(Ward.ward_id).filter(Ward.assembly_id.in_(allowed_assembly_ids)).all()
+        allowed_ward_ids.update([row[0] for row in ward_rows])
+
+    if allowed_booth_ids:
+        ward_rows = db.query(Booth.ward_id).filter(Booth.booth_id.in_(allowed_booth_ids)).all()
+        allowed_ward_ids.update([row[0] for row in ward_rows if row[0] is not None])
+
+    if allowed_ward_ids:
+        booth_rows = db.query(Booth.booth_id).filter(Booth.ward_id.in_(allowed_ward_ids)).all()
+        allowed_booth_ids.update([row[0] for row in booth_rows])
+        assembly_rows = db.query(Ward.assembly_id).filter(Ward.ward_id.in_(allowed_ward_ids)).all()
+        allowed_assembly_ids.update([row[0] for row in assembly_rows if row[0] is not None])
+
+    allowed_assembly_ids = {v for v in allowed_assembly_ids if v is not None}
+    allowed_ward_ids = {v for v in allowed_ward_ids if v is not None}
+    allowed_booth_ids = {v for v in allowed_booth_ids if v is not None}
+
+    return {
+        **scope,
+        "allowed_assembly_ids": allowed_assembly_ids,
+        "allowed_ward_ids": allowed_ward_ids,
+        "allowed_booth_ids": allowed_booth_ids,
+    }
+
+
+def _build_in_clause(column_expr: str, values: List[Any], prefix: str) -> tuple[str, Dict[str, Any]]:
+    if not values:
+        return "1=0", {}
+    params: Dict[str, Any] = {}
+    placeholders: List[str] = []
+    for idx, value in enumerate(values):
+        key = f"{prefix}_{idx}"
+        params[key] = value
+        placeholders.append(f":{key}")
+    return f"{column_expr} IN ({', '.join(placeholders)})", params
+
+
 def _get_s3_client():
     return boto3.client(
         "s3",
@@ -1186,9 +1316,11 @@ def list_volunteers(
     sortBy: str = "firstName",
     direction: str = "asc",
     db: Session = Depends(get_db),
-    current: JwtUserDetails = Depends(require_roles("ADMIN")),
+    current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD")),
 ):
-    q = db.query(VolunteerUser).filter(VolunteerUser.role.in_(["USER", "ASSEMBLY", "WARD", "BOOTH"]), VolunteerUser.tenant_id == current.tenantId)
+    q = db.query(VolunteerUser).filter(VolunteerUser.role.in_(["USER", "ASSEMBLY", "WARD", "BOOTH"]))
+    if current.role != "SUPER_ADMIN" and current.tenantId:
+        q = q.filter(VolunteerUser.tenant_id == current.tenantId)
 
     blocked_filter = parse_optional_bool(blocked)
     deleted_filter = parse_optional_bool(deleted)
@@ -1224,16 +1356,15 @@ def list_volunteers(
 
 
 @app.put(f"{CONTEXT_PATH}/api/user/block")
-def block_user(payload: UserBlockRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN"))):
+def block_user(payload: UserBlockRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD"))):
     target_first_name = resolve_user_first_name(payload.firstName, payload.userEmail)
     if not target_first_name:
         raise ValueError("firstName or userEmail is required")
 
-    user = (
-        db.query(VolunteerUser)
-        .filter(VolunteerUser.first_name == target_first_name, VolunteerUser.tenant_id == current.tenantId)
-        .first()
-    )
+    q = db.query(VolunteerUser).filter(VolunteerUser.first_name == target_first_name)
+    if current.tenantId:
+        q = q.filter(VolunteerUser.tenant_id == current.tenantId)
+    user = q.first()
     if not user:
         return api_error("User not found", {"details": f"User not found with FirstName: '{target_first_name}'"})
 
@@ -1292,16 +1423,15 @@ def list_users(
 
 
 @app.put(f"{CONTEXT_PATH}/api/user/delete")
-def delete_user(payload: UserDeleteRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN"))):
+def delete_user(payload: UserDeleteRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD"))):
     target_first_name = resolve_user_first_name(payload.firstName, payload.userEmail)
     if not target_first_name:
         raise ValueError("firstName or userEmail is required")
 
-    user = (
-        db.query(VolunteerUser)
-        .filter(VolunteerUser.first_name == target_first_name, VolunteerUser.tenant_id == current.tenantId)
-        .first()
-    )
+    q = db.query(VolunteerUser).filter(VolunteerUser.first_name == target_first_name)
+    if current.tenantId:
+        q = q.filter(VolunteerUser.tenant_id == current.tenantId)
+    user = q.first()
     if not user:
         return api_error("User not found", {"details": f"User not found with FirstName: '{target_first_name}'"})
 
@@ -1312,13 +1442,12 @@ def delete_user(payload: UserDeleteRequest, db: Session = Depends(get_db), curre
 
 
 @app.put(f"{CONTEXT_PATH}/api/user/block/bulk")
-def bulk_block(payload: UserBulkActionRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN"))):
+def bulk_block(payload: UserBulkActionRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD"))):
     usernames = resolve_bulk_usernames(payload)
-    users = (
-        db.query(VolunteerUser)
-        .filter(VolunteerUser.tenant_id == current.tenantId, VolunteerUser.first_name.in_(usernames))
-        .all()
-    )
+    q = db.query(VolunteerUser).filter(VolunteerUser.first_name.in_(usernames))
+    if current.tenantId:
+        q = q.filter(VolunteerUser.tenant_id == current.tenantId)
+    users = q.all()
     if len(users) != len(usernames):
         return api_error("Some users not found", {"details": "Some users not found"})
 
@@ -1330,13 +1459,12 @@ def bulk_block(payload: UserBulkActionRequest, db: Session = Depends(get_db), cu
 
 
 @app.put(f"{CONTEXT_PATH}/api/user/delete/bulk")
-def bulk_delete(payload: UserBulkActionRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN"))):
+def bulk_delete(payload: UserBulkActionRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD"))):
     usernames = resolve_bulk_usernames(payload)
-    users = (
-        db.query(VolunteerUser)
-        .filter(VolunteerUser.tenant_id == current.tenantId, VolunteerUser.first_name.in_(usernames))
-        .all()
-    )
+    q = db.query(VolunteerUser).filter(VolunteerUser.first_name.in_(usernames))
+    if current.tenantId:
+        q = q.filter(VolunteerUser.tenant_id == current.tenantId)
+    users = q.all()
     if len(users) != len(usernames):
         return api_error("Some users not found", {"details": "Some users not found"})
 
@@ -1486,23 +1614,32 @@ def list_tenants(page: int = 0, size: int = 10, db: Session = Depends(get_db), _
 
 @app.get(f"{CONTEXT_PATH}/api/assignments")
 def get_assignments(type: str = Query(...), db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER"))):
+    scope = _resolve_access_scope_ids(db, current)
+    if scope and not (scope.get("allowed_assembly_ids") or scope.get("allowed_ward_ids") or scope.get("allowed_booth_ids")):
+        return []
     t = type.upper()
     if t == "ASSEMBLY":
         q = db.query(Assembly)
         if current.tenantId is not None:
             q = q.filter(Assembly.tenant_id == current.tenantId)
+        if scope and scope.get("allowed_assembly_ids"):
+            q = q.filter(Assembly.assembly_id.in_(scope.get("allowed_assembly_ids")))
         rows = q.order_by(Assembly.assembly_name_en.asc()).all()
         return [{"id": r.assembly_id, "name": r.assembly_name_en} for r in rows]
     if t == "WARD":
         q = db.query(Ward)
         if current.tenantId is not None:
             q = q.filter(Ward.tenant_id == current.tenantId)
+        if scope and scope.get("allowed_ward_ids"):
+            q = q.filter(Ward.ward_id.in_(scope.get("allowed_ward_ids")))
         rows = q.order_by(Ward.ward_name_en.asc()).all()
         return [{"id": r.ward_id, "name": r.ward_name_en} for r in rows]
     if t == "BOOTH":
         q = db.query(Booth)
         if current.tenantId is not None:
             q = q.filter(Booth.tenant_id == current.tenantId)
+        if scope and scope.get("allowed_booth_ids"):
+            q = q.filter(Booth.booth_id.in_(scope.get("allowed_booth_ids")))
         rows = q.order_by(Booth.polling_station_adr_en.asc()).all()
         return [{"id": r.booth_id, "name": r.polling_station_adr_en} for r in rows]
     raise ValueError("Invalid assignment type")
@@ -1510,19 +1647,43 @@ def get_assignments(type: str = Query(...), db: Session = Depends(get_db), curre
 
 @app.get(f"{CONTEXT_PATH}/api/booth")
 def get_booths(db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER"))):
+    scope = _resolve_access_scope_ids(db, current)
+    if scope and not (scope.get("allowed_assembly_ids") or scope.get("allowed_ward_ids") or scope.get("allowed_booth_ids")):
+        return api_success("Booths fetched successfully", [])
+    booth_cols = _get_table_columns(db, "public", "booths")
+    booth_pk_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else "id")
+    booth_ward_id_col = "ward_id" if "ward_id" in booth_cols else None
+
+    where_parts: List[str] = []
+    params: Dict[str, Any] = {}
+    if scope:
+        allowed_booth_ids = sorted([v for v in (scope.get("allowed_booth_ids") or []) if v is not None])
+        allowed_ward_ids = sorted([v for v in (scope.get("allowed_ward_ids") or []) if v is not None])
+        if allowed_booth_ids:
+            clause, clause_params = _build_in_clause(f"b.{booth_pk_col}", allowed_booth_ids, "scope_booth")
+            where_parts.append(clause)
+            params.update(clause_params)
+        elif allowed_ward_ids and booth_ward_id_col:
+            clause, clause_params = _build_in_clause(f"b.{booth_ward_id_col}", allowed_ward_ids, "scope_ward")
+            where_parts.append(clause)
+            params.update(clause_params)
+
+    where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
     rows = db.execute(
         text(
-            """
+            f"""
             SELECT
-                COALESCE(b.booth_no, b.id) AS id,
+                COALESCE(b.booth_no, b.{booth_pk_col}) AS id,
                 b.booth_no AS booth_id,
-                COALESCE(NULLIF(b.booth_add_en, ''), 'Booth ' || COALESCE(b.booth_no::text, b.id::text)) AS name_en
+                COALESCE(NULLIF(b.booth_add_en, ''), 'Booth ' || COALESCE(b.booth_no::text, b.{booth_pk_col}::text)) AS name_en
             FROM public.booths b
+            {where_clause}
             ORDER BY
                 b.booth_no ASC NULLS LAST,
-                b.id ASC
+                b.{booth_pk_col} ASC
             """
-        )
+        ),
+        params,
     ).all()
     dto = [{"id": int(r.id), "boothId": int(r.booth_id), "nameEn": r.name_en} for r in rows]
     return api_success("Booths fetched successfully", dto)
@@ -1535,6 +1696,9 @@ def get_booths_plural(
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER")),
 ):
+    scope = _resolve_access_scope_ids(db, current)
+    if scope and not (scope.get("allowed_assembly_ids") or scope.get("allowed_ward_ids") or scope.get("allowed_booth_ids")):
+        return []
     q = (
         db.query(Booth)
         .join(Ward, Booth.ward_id == Ward.ward_id)
@@ -1542,9 +1706,18 @@ def get_booths_plural(
     )
     if current.tenantId is not None:
         q = q.filter(Booth.tenant_id == current.tenantId)
+    if scope:
+        allowed_booth_ids = {v for v in (scope.get("allowed_booth_ids") or set()) if v is not None}
+        allowed_ward_ids = {v for v in (scope.get("allowed_ward_ids") or set()) if v is not None}
+        if allowed_booth_ids:
+            q = q.filter(Booth.booth_id.in_(allowed_booth_ids))
+        elif allowed_ward_ids:
+            q = q.filter(Booth.ward_id.in_(allowed_ward_ids))
     if assemblyCode:
         q = q.filter(Assembly.assembly_code == assemblyCode)
     if wardId:
+        if scope and (scope.get("allowed_ward_ids") or set()) and wardId not in (scope.get("allowed_ward_ids") or set()):
+            return []
         q = q.filter(Ward.ward_id == wardId)
 
     booths = q.order_by(Booth.booth_id.asc()).all()
@@ -1583,6 +1756,15 @@ def get_booths_plural(
         ),
         params,
     ).all()
+    if scope:
+        allowed_booth_ids = scope.get("allowed_booth_ids") or set()
+        allowed_ward_ids = scope.get("allowed_ward_ids") or set()
+        rows = [
+            r
+            for r in rows
+            if (not allowed_booth_ids or int(r.id) in allowed_booth_ids)
+            and (not allowed_ward_ids or (r.ward_id is not None and int(r.ward_id) in allowed_ward_ids))
+        ]
     return [
         {
             "boothId": int(r.id),
@@ -1601,11 +1783,18 @@ def get_wards(
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER")),
 ):
+    scope = _resolve_access_scope_ids(db, current)
+    if scope and not (scope.get("allowed_assembly_ids") or scope.get("allowed_ward_ids") or scope.get("allowed_booth_ids")):
+        return []
     q = db.query(Ward)
     if current.tenantId is not None:
         q = q.filter(Ward.tenant_id == current.tenantId)
     if assemblyId:
         q = q.filter(Ward.assembly_id == assemblyId)
+    if scope:
+        allowed_ward_ids = {v for v in (scope.get("allowed_ward_ids") or set()) if v is not None}
+        if allowed_ward_ids:
+            q = q.filter(Ward.ward_id.in_(allowed_ward_ids))
     wards = q.order_by(Ward.ward_id.asc()).all()
     if wards:
         return [
@@ -1641,6 +1830,12 @@ def get_wards(
         ),
         params,
     ).all()
+    if scope:
+        allowed_ward_ids = scope.get("allowed_ward_ids") or set()
+        if allowed_ward_ids:
+            rows = [r for r in rows if int(r.id) in allowed_ward_ids]
+        else:
+            rows = []
     return [
         {
             "wardId": int(r.id),
@@ -1839,6 +2034,9 @@ def get_voters(
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("ADMIN", "USER")),
 ):
+    scope = _resolve_access_scope_ids(db, current)
+    if scope and not (scope.get("allowed_assembly_ids") or scope.get("allowed_ward_ids") or scope.get("allowed_booth_ids")):
+        return []
     q = (
         db.query(Voter)
         .join(Booth, Voter.booth_id == Booth.booth_id)
@@ -1850,6 +2048,11 @@ def get_voters(
         )
         .order_by(Voter.voter_id.asc())
     )
+    if scope:
+        if scope.get("allowed_booth_ids"):
+            q = q.filter(Booth.booth_id.in_(scope.get("allowed_booth_ids")))
+        elif scope.get("allowed_ward_ids"):
+            q = q.filter(Ward.ward_id.in_(scope.get("allowed_ward_ids")))
 
     total = q.count()
     voters = q.offset(page * size).limit(size).all()
@@ -1872,7 +2075,19 @@ def search_voters(
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "USER", "ADMIN")),
 ):
-    _ = current
+    scope = _resolve_access_scope_ids(db, current)
+    if scope and not (scope.get("allowed_assembly_ids") or scope.get("allowed_ward_ids") or scope.get("allowed_booth_ids")):
+        empty_payload = api_success("Voter search fetched", [])
+        empty_payload["data"]["meta"] = {
+            "total": 0,
+            "male": 0,
+            "female": 0,
+            "returned": 0,
+            "page": page,
+            "size": max(1, min(size, 2000)),
+            "hasMore": False,
+        }
+        return empty_payload
     booth_cols = _get_table_columns(db, "public", "booths")
     voter_cols = _get_table_columns(db, "public", "voters")
     ward_cols = _get_table_columns(db, "public", "wards")
@@ -1892,6 +2107,36 @@ def search_voters(
     ward_name_en_col = "ward_name_en" if "ward_name_en" in ward_cols else ("name_en" if "name_en" in ward_cols else None)
     ward_name_local_col = "ward_name_local" if "ward_name_local" in ward_cols else ("name_kannada" if "name_kannada" in ward_cols else None)
 
+    if scope and scope.get("allowed_assembly_ids"):
+        assembly_cols = _ensure_public_assembly_code(db)
+        assembly_pk_col = "id" if "id" in assembly_cols else ("assembly_id" if "assembly_id" in assembly_cols else None)
+        assembly_no_col = "assembly_no" if "assembly_no" in assembly_cols else ("assembly_id" if "assembly_id" in assembly_cols else None)
+        assembly_code_expr = "assembly_code" if "assembly_code" in assembly_cols else (
+            f"LPAD(CAST({assembly_no_col} AS TEXT), 12, '0')" if assembly_no_col else "NULL"
+        )
+        assembly_row = db.execute(
+            text(
+                f"""
+                SELECT {assembly_pk_col if assembly_pk_col else 'NULL'} AS assembly_pk,
+                       {assembly_no_col if assembly_no_col else 'NULL'} AS assembly_no
+                FROM public.assembly
+                WHERE {assembly_code_expr} = :assembly_code
+                   OR CAST({assembly_no_col if assembly_no_col else assembly_code_expr} AS TEXT) = :assembly_no_text
+                LIMIT 1
+                """
+            ),
+            {
+                "assembly_code": normalize_assembly_code(assemblyCode),
+                "assembly_no_text": str(int(normalize_assembly_code(assemblyCode))),
+            },
+        ).first()
+        if not assembly_row:
+            raise HTTPException(status_code=404, detail="Assembly not found")
+        allowed_assembly_ids = {v for v in (scope.get("allowed_assembly_ids") or set()) if v is not None}
+        assembly_id = assembly_row.assembly_pk if assembly_row.assembly_pk is not None else assembly_row.assembly_no
+        if allowed_assembly_ids and assembly_id not in allowed_assembly_ids:
+            raise HTTPException(status_code=403, detail="Access denied for requested assembly")
+
     ward_by_id: Dict[int, Dict[str, Any]] = {}
     if ward_id_col:
         ward_rows = db.execute(
@@ -1907,6 +2152,8 @@ def search_voters(
             )
         ).all()
         for r in ward_rows:
+            if scope and scope.get("allowed_ward_ids") and int(r.ward_id) not in scope.get("allowed_ward_ids"):
+                continue
             ward_by_id[int(r.ward_id)] = {
                 "wardId": int(r.ward_id),
                 "wardCode": str(r.ward_code) if r.ward_code is not None else None,
@@ -1917,6 +2164,18 @@ def search_voters(
     ward_code_filter: Optional[str] = None
     if wardId is not None and wardId in ward_by_id:
         ward_code_filter = ward_by_id[wardId].get("wardCode")
+    if scope and scope.get("allowed_ward_ids") and wardId is not None and wardId not in scope.get("allowed_ward_ids"):
+        empty_payload = api_success("Voter search fetched", [])
+        empty_payload["data"]["meta"] = {
+            "total": 0,
+            "male": 0,
+            "female": 0,
+            "returned": 0,
+            "page": page,
+            "size": max(1, min(size, 2000)),
+            "hasMore": False,
+        }
+        return empty_payload
 
     booth_sql = f"""
         SELECT
@@ -1932,6 +2191,15 @@ def search_voters(
     booth_by_key: Dict[tuple, Dict[str, Any]] = {}
     booths_by_no: Dict[str, List[Dict[str, Any]]] = {}
     for b in booth_rows:
+        if scope:
+            allowed_booth_ids = {v for v in (scope.get("allowed_booth_ids") or set()) if v is not None}
+            allowed_ward_ids = {v for v in (scope.get("allowed_ward_ids") or set()) if v is not None}
+            booth_pk = int(b.booth_id)
+            ward_pk = int(b.ward_id) if b.ward_id is not None else None
+            if allowed_booth_ids and booth_pk not in allowed_booth_ids:
+                continue
+            if allowed_ward_ids and ward_pk is not None and ward_pk not in allowed_ward_ids:
+                continue
         row = {
             "boothId": int(b.booth_id),
             "boothNo": str(b.booth_no if b.booth_no is not None else b.booth_id),
@@ -1967,6 +2235,18 @@ def search_voters(
 
     where_parts = ["1=1"]
     params: Dict[str, Any] = {"limit": max(1, min(size, 2000)), "offset": max(page, 0) * max(1, min(size, 2000))}
+
+    if scope:
+        allowed_ward_codes = sorted({str(v.get("wardCode")) for v in ward_by_id.values() if v.get("wardCode")})
+        allowed_booth_nos = sorted({row.get("boothNo") for row in booth_by_key.values() if row.get("boothNo")})
+        if allowed_ward_codes and voter_ward_code_col:
+            clause, clause_params = _build_in_clause(f"CAST({voter_ward_code_col} AS TEXT)", allowed_ward_codes, "scope_ward_code")
+            where_parts.append(clause)
+            params.update(clause_params)
+        if allowed_booth_nos:
+            clause, clause_params = _build_in_clause(f"CAST({voter_booth_no_col} AS TEXT)", allowed_booth_nos, "scope_booth_no")
+            where_parts.append(clause)
+            params.update(clause_params)
 
     if ward_code_filter and voter_ward_code_col:
         where_parts.append(f"{voter_ward_code_col} = :ward_code")
@@ -2124,7 +2404,9 @@ def get_voters_by_booth(
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "USER", "ADMIN")),
 ):
-    _ = current
+    scope = _resolve_access_scope_ids(db, current)
+    if scope and not (scope.get("allowed_assembly_ids") or scope.get("allowed_ward_ids") or scope.get("allowed_booth_ids")):
+        raise HTTPException(status_code=403, detail="No access scope defined for this user")
     booth_cols = _get_table_columns(db, "public", "booths")
     voter_cols = _get_table_columns(db, "public", "voters")
     ward_cols = _get_table_columns(db, "public", "wards")
@@ -2158,6 +2440,13 @@ def get_voters_by_booth(
     ).first()
     if not booth_row:
         return JSONResponse(status_code=404, content=api_error("Booth not found", f"Invalid boothId: {boothId}"))
+    if scope:
+        allowed_booth_ids = scope.get("allowed_booth_ids") or set()
+        allowed_ward_ids = scope.get("allowed_ward_ids") or set()
+        if allowed_booth_ids and int(booth_row.booth_id) not in allowed_booth_ids:
+            raise HTTPException(status_code=403, detail="Access denied for requested booth")
+        if allowed_ward_ids and booth_row.ward_id is not None and int(booth_row.ward_id) not in allowed_ward_ids:
+            raise HTTPException(status_code=403, detail="Access denied for requested booth")
 
     ward_name_en = None
     ward_name_local = None
@@ -2307,15 +2596,29 @@ def get_snapshot(
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "USER", "ADMIN")),
 ):
     try:
-        public_snapshot = _build_public_snapshot(assemblyCode, db, include_voters=includeVoters)
+        scope = _resolve_access_scope_ids(db, current)
+        if scope and not (scope.get("allowed_assembly_ids") or scope.get("allowed_ward_ids") or scope.get("allowed_booth_ids")):
+            raise HTTPException(status_code=403, detail="No access scope defined for this user")
+        public_snapshot = _build_public_snapshot(
+            assemblyCode,
+            db,
+            include_voters=includeVoters,
+            allowed_assembly_ids=scope.get("allowed_assembly_ids") if scope else None,
+            allowed_ward_ids=scope.get("allowed_ward_ids") if scope else None,
+            allowed_booth_ids=scope.get("allowed_booth_ids") if scope else None,
+        )
         snapshot_id = _cache_snapshot(public_snapshot)
         snapshot_url = f"{_external_base_url(request)}{CONTEXT_PATH}/api/voters/snapshot/content/{snapshot_id}"
         payload = api_success("Snapshot fetched successfully", snapshot_url)
         payload["snapshotMode"] = "link"
         return JSONResponse(content=payload, headers={"X-Snapshot-Mode": "link"})
+    except HTTPException as ex:
+        return JSONResponse(status_code=ex.status_code, content=api_error("Snapshot failed", str(ex.detail)))
     except ValueError as ex:
         return JSONResponse(status_code=404, content=api_error("No snapshot found", str(ex)))
     except Exception as ex:
+        print("[SNAPSHOT_ERROR]", ex)
+        print(traceback.format_exc())
         return JSONResponse(status_code=500, content=api_error("Snapshot failed", str(ex)))
 
 
@@ -3027,7 +3330,17 @@ def _ensure_public_assembly_code(db: Session) -> set[str]:
         return assembly_cols
 
 
-def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool = True) -> Dict[str, Any]:
+def _build_public_snapshot(
+    assembly_code: str,
+    db: Session,
+    include_voters: bool = True,
+    allowed_assembly_ids: Optional[set[int]] = None,
+    allowed_ward_ids: Optional[set[int]] = None,
+    allowed_booth_ids: Optional[set[int]] = None,
+) -> Dict[str, Any]:
+    allowed_assembly_ids = {v for v in (allowed_assembly_ids or set()) if v is not None}
+    allowed_ward_ids = {v for v in (allowed_ward_ids or set()) if v is not None}
+    allowed_booth_ids = {v for v in (allowed_booth_ids or set()) if v is not None}
     assembly_cols = _ensure_public_assembly_code(db)
     booth_cols = _get_table_columns(db, "public", "booths")
     voter_cols = _get_table_columns(db, "public", "voters")
@@ -3064,6 +3377,10 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
     ).first()
     if not assembly_row:
         raise ValueError(f"Assembly not found in public.assembly for assemblyCode: {assembly_code}")
+    if allowed_assembly_ids:
+        assembly_pk = assembly_row.assembly_pk if assembly_row.assembly_pk is not None else assembly_row.assembly_no
+        if assembly_pk not in allowed_assembly_ids and assembly_row.assembly_no not in allowed_assembly_ids:
+            raise HTTPException(status_code=403, detail="Access denied for requested assembly")
 
     booth_id_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
     booth_ward_id_col = "ward_id" if "ward_id" in booth_cols else None
@@ -3075,6 +3392,17 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
     if not booth_id_col or not booth_ward_id_col:
         raise ValueError("public.booths missing required columns")
 
+    booth_filters: List[str] = []
+    booth_params: Dict[str, Any] = {}
+    if allowed_booth_ids:
+        clause, params = _build_in_clause(booth_id_col, sorted(allowed_booth_ids), "scope_booth")
+        booth_filters.append(clause)
+        booth_params.update(params)
+    if allowed_ward_ids:
+        clause, params = _build_in_clause(booth_ward_id_col, sorted(allowed_ward_ids), "scope_ward")
+        booth_filters.append(clause)
+        booth_params.update(params)
+    booth_where = f"WHERE {' AND '.join(booth_filters)}" if booth_filters else ""
     booth_rows = db.execute(
         text(
             f"""
@@ -3086,9 +3414,11 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
                 {booth_name_en_col if booth_name_en_col else 'NULL'} AS booth_name_en,
                 {booth_name_local_col if booth_name_local_col else 'NULL'} AS booth_name_local
             FROM public.booths
+            {booth_where}
             ORDER BY {booth_ward_id_col}, {booth_no_col}
             """
-        )
+        ),
+        booth_params,
     ).all()
 
     ward_id_col = "id" if "id" in ward_cols else ("ward_id" if "ward_id" in ward_cols else None)
@@ -3101,17 +3431,23 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
 
     ward_map: Dict[Any, Dict[str, Any]] = {}
     if ward_id_col:
-        ward_where = ""
+        ward_filters: List[str] = []
         ward_params: Dict[str, Any] = {}
         if ward_assembly_id_col and assembly_row.assembly_pk is not None:
-            ward_where = f"WHERE {ward_assembly_id_col} = :assembly_pk"
+            ward_filters.append(f"{ward_assembly_id_col} = :assembly_pk")
             ward_params["assembly_pk"] = assembly_row.assembly_pk
         elif ward_assembly_no_col and assembly_row.assembly_no is not None:
-            ward_where = f"WHERE {ward_assembly_no_col} = :assembly_no"
+            ward_filters.append(f"{ward_assembly_no_col} = :assembly_no")
             ward_params["assembly_no"] = assembly_row.assembly_no
         elif ward_assembly_code_col:
-            ward_where = f"WHERE {ward_assembly_code_col} = :assembly_code"
+            ward_filters.append(f"{ward_assembly_code_col} = :assembly_code")
             ward_params["assembly_code"] = assembly_row.assembly_code or requested_assembly_code
+        if allowed_ward_ids:
+            clause, params = _build_in_clause(ward_id_col, sorted(allowed_ward_ids), "scope_ward")
+            ward_filters.append(clause)
+            ward_params.update(params)
+
+        ward_where = f"WHERE {' AND '.join(ward_filters)}" if ward_filters else ""
 
         ward_rows = db.execute(
             text(
@@ -3151,7 +3487,12 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
 
     voters_by_key: Dict[tuple, List[Dict[str, Any]]] = {}
     counts_by_key: Dict[tuple, Dict[str, int]] = {}
-    relevant_booths = [b for b in booth_rows if not allowed_ward_ids or b.ward_id in allowed_ward_ids]
+    relevant_booths = [
+        b
+        for b in booth_rows
+        if (not allowed_ward_ids or b.ward_id in allowed_ward_ids)
+        and (not allowed_booth_ids or b.booth_id in allowed_booth_ids)
+    ]
     allowed_ward_codes = sorted(
         {
             str(w.get("wardCode"))
@@ -3160,15 +3501,6 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
         }
     )
     allowed_booth_nos = sorted({str(b.booth_no) for b in relevant_booths if b.booth_no is not None})
-
-    def _build_in_clause(column_expr: str, values: List[str], prefix: str) -> tuple[str, Dict[str, Any]]:
-        params: Dict[str, Any] = {}
-        placeholders: List[str] = []
-        for idx, value in enumerate(values):
-            key = f"{prefix}_{idx}"
-            params[key] = value
-            placeholders.append(f":{key}")
-        return f"{column_expr} IN ({', '.join(placeholders)})", params
 
     voter_where_parts: List[str] = []
     voter_where_params: Dict[str, Any] = {}
@@ -3300,6 +3632,8 @@ def _build_public_snapshot(assembly_code: str, db: Session, include_voters: bool
     for b in booth_rows:
         ward_id = b.ward_id
         if allowed_ward_ids and ward_id not in allowed_ward_ids:
+            continue
+        if allowed_booth_ids and b.booth_id not in allowed_booth_ids:
             continue
         if ward_id not in ward_map:
             ward_map[ward_id] = {
