@@ -846,6 +846,19 @@ def _build_in_clause(column_expr: str, values: List[Any], prefix: str) -> tuple[
     return f"{column_expr} IN ({', '.join(placeholders)})", params
 
 
+def _build_comma_list_filter(column, values: List[int]):
+    if not values:
+        return None
+    clauses = []
+    for value in values:
+        value_str = str(value)
+        clauses.append(column == value_str)
+        clauses.append(column.like(f"{value_str},%"))
+        clauses.append(column.like(f"%,{value_str},%"))
+        clauses.append(column.like(f"%,{value_str}"))
+    return or_(*clauses) if clauses else None
+
+
 def _get_s3_client():
     return boto3.client(
         "s3",
@@ -1321,6 +1334,20 @@ def list_volunteers(
     q = db.query(VolunteerUser).filter(VolunteerUser.role.in_(["USER", "ASSEMBLY", "WARD", "BOOTH"]))
     if current.role != "SUPER_ADMIN" and current.tenantId:
         q = q.filter(VolunteerUser.tenant_id == current.tenantId)
+    if current.role == "WARD":
+        scope = _resolve_access_scope_ids(db, current)
+        allowed_ward_ids = sorted(scope.get("allowed_ward_ids") or []) if scope else []
+        allowed_booth_ids = sorted(scope.get("allowed_booth_ids") or []) if scope else []
+        ward_filter = _build_comma_list_filter(VolunteerUser.ward_ids, allowed_ward_ids)
+        booth_filter = _build_comma_list_filter(VolunteerUser.booth_ids, allowed_booth_ids)
+        if ward_filter is not None and booth_filter is not None:
+            q = q.filter(or_(ward_filter, booth_filter))
+        elif ward_filter is not None:
+            q = q.filter(ward_filter)
+        elif booth_filter is not None:
+            q = q.filter(booth_filter)
+        else:
+            q = q.filter(text("1=0"))
 
     blocked_filter = parse_optional_bool(blocked)
     deleted_filter = parse_optional_bool(deleted)
