@@ -1382,6 +1382,146 @@ def list_volunteers(
     return build_page(content, page, size, total, sortBy, direction)
 
 
+def _enrichment_has_value(enrichment: VoterEnrichment, api_field: str) -> bool:
+    column_name = VOTER_ENRICHMENT_FIELD_MAP.get(api_field, api_field)
+    if not hasattr(enrichment, column_name):
+        return False
+    value = getattr(enrichment, column_name, None)
+    if value is None:
+        return False
+    if isinstance(value, str):
+        if api_field in VOTER_ENRICHMENT_JSON_FIELDS:
+            try:
+                parsed = json.loads(value)
+                return bool(parsed)
+            except Exception:
+                return bool(value.strip())
+        return bool(value.strip())
+    return True
+
+
+@app.get(f"{CONTEXT_PATH}/api/volunteers/analysis")
+def volunteer_analysis(
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD")),
+):
+    scope = _resolve_access_scope_ids(db, current)
+
+    allowed_ward_codes: set[str] = set()
+    allowed_booth_nos: set[str] = set()
+
+    if scope:
+        allowed_ward_ids = sorted(scope.get("allowed_ward_ids") or [])
+        allowed_booth_ids = sorted(scope.get("allowed_booth_ids") or [])
+
+        if allowed_ward_ids:
+            ward_cols = _get_table_columns(db, "public", "wards")
+            ward_id_col = "id" if "id" in ward_cols else ("ward_id" if "ward_id" in ward_cols else None)
+            ward_code_col = "ward_code" if "ward_code" in ward_cols else None
+            if ward_id_col and ward_code_col:
+                clause, params = _build_in_clause(ward_id_col, allowed_ward_ids, "scope_ward_id")
+                rows = db.execute(
+                    text(
+                        f"""
+                        SELECT {ward_code_col} AS ward_code
+                        FROM public.wards
+                        WHERE {clause}
+                        """
+                    ),
+                    params,
+                ).all()
+                allowed_ward_codes.update([str(r.ward_code) for r in rows if r.ward_code is not None])
+
+        if allowed_booth_ids:
+            booth_cols = _get_table_columns(db, "public", "booths")
+            booth_id_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
+            booth_no_col = "booth_no" if "booth_no" in booth_cols else None
+            if booth_id_col and booth_no_col:
+                clause, params = _build_in_clause(booth_id_col, allowed_booth_ids, "scope_booth_id")
+                rows = db.execute(
+                    text(
+                        f"""
+                        SELECT {booth_no_col} AS booth_no
+                        FROM public.booths
+                        WHERE {clause}
+                        """
+                    ),
+                    params,
+                ).all()
+                allowed_booth_nos.update([str(r.booth_no) for r in rows if r.booth_no is not None])
+
+    q = db.query(VoterEnrichment).filter(VoterEnrichment.updated_by.isnot(None))
+    if scope:
+        filters = []
+        if allowed_ward_codes:
+            filters.append(VoterEnrichment.ward_code.in_(allowed_ward_codes))
+        if allowed_booth_nos:
+            filters.append(VoterEnrichment.booth_no.in_(allowed_booth_nos))
+        if filters:
+            q = q.filter(or_(*filters))
+        else:
+            q = q.filter(text("1=0"))
+
+    enrichments = q.all()
+    if not enrichments:
+        return api_success("Volunteer analysis fetched", [])
+
+    def _label_from_key(key: str) -> str:
+        return " ".join([part.capitalize() for part in key.replace("_", " ").split()])
+
+    exclude_keys = {
+        "firstMiddleNameEn",
+        "lastNameEn",
+        "firstMiddleNameLocal",
+        "lastNameLocal",
+        "relationType",
+        "relationFirstMiddleNameEn",
+        "relationLastNameEn",
+        "relationFirstMiddleNameLocal",
+        "relationLastNameLocal",
+        "houseNoEn",
+        "houseNoLocal",
+        "gender",
+        "age",
+    }
+    enrichment_keys = [key for key in VOTER_ENRICHMENT_FIELD_MAP.keys() if key not in exclude_keys]
+    extra_keys = ["ward_code", "booth_no", "updated_fields", "created_at", "updated_at"]
+    analysis_fields = [{"key": key, "label": _label_from_key(key)} for key in enrichment_keys + extra_keys]
+
+    counters: Dict[int, Dict[str, Any]] = {}
+    for enrichment in enrichments:
+        user_id = enrichment.updated_by
+        if user_id is None:
+            continue
+        bucket = counters.setdefault(
+            int(user_id),
+            {"userId": int(user_id), "counts": {item["key"]: 0 for item in analysis_fields}, "total": 0},
+        )
+        bucket["total"] += 1
+        for item in analysis_fields:
+            if _enrichment_has_value(enrichment, item["key"]):
+                bucket["counts"][item["key"]] += 1
+
+    user_rows = db.query(User).filter(User.id.in_(list(counters.keys()))).all()
+    user_map = {u.id: u for u in user_rows}
+
+    results = []
+    for user_id, bucket in counters.items():
+        user = user_map.get(user_id)
+        results.append(
+            {
+                "userId": user_id,
+                "agentName": user.first_name if user else f"User {user_id}",
+                "phone": user.phone if user else "",
+                "total": bucket["total"],
+                "counts": bucket["counts"],
+            }
+        )
+
+    results.sort(key=lambda item: item.get("agentName") or "")
+    return api_success("Volunteer analysis fetched", {"fields": analysis_fields, "rows": results})
+
+
 @app.put(f"{CONTEXT_PATH}/api/user/block")
 def block_user(payload: UserBlockRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD"))):
     target_first_name = resolve_user_first_name(payload.firstName, payload.userEmail)
@@ -2026,6 +2166,10 @@ def update_public_voter_by_epic(epic: str, payload: PublicVoterUpdatePayload, db
         raise ResourceNotFoundException("Public voter", "epic", normalized_epic)
 
     updated_by = db.query(User).filter(User.first_name == current.firstName, User.phone == current.phone).first()
+    if not updated_by:
+        volunteer_user = db.query(VolunteerUser).filter(VolunteerUser.first_name == current.firstName, VolunteerUser.phone == current.phone).first()
+        if volunteer_user:
+            updated_by = _ensure_user_from_volunteer(db, volunteer_user)
     enrichment = db.query(VoterEnrichment).filter(VoterEnrichment.epic == normalized_epic).first()
     if not enrichment:
         enrichment = VoterEnrichment(
@@ -3250,6 +3394,37 @@ def _serialize_enrichment_value(api_field: str, value: Any) -> Any:
     if isinstance(value, str):
         return normalize_optional_text(value)
     return value
+
+
+def _ensure_user_from_volunteer(db: Session, volunteer: VolunteerUser) -> Optional[User]:
+    if not volunteer:
+        return None
+    existing = db.query(User).filter(User.first_name == volunteer.first_name, User.phone == volunteer.phone).first()
+    if existing:
+        return existing
+
+    tenant_ref = None
+    if volunteer.tenant_id:
+        tenant = db.query(Tenant).filter(Tenant.tenant_id == volunteer.tenant_id).first()
+        tenant_ref = tenant.id if tenant else None
+
+    assignment_id = None
+    if volunteer.assignment_id and str(volunteer.assignment_id).isdigit():
+        assignment_id = int(str(volunteer.assignment_id))
+
+    user = User(
+        first_name=volunteer.first_name,
+        phone=volunteer.phone,
+        role=volunteer.role or "USER",
+        tenant_ref=tenant_ref,
+        assignment_type=volunteer.assignment_type,
+        assignment_id=assignment_id,
+        blocked=bool(volunteer.blocked),
+        deleted=bool(volunteer.deleted),
+    )
+    db.add(user)
+    db.flush()
+    return user
 
 
 def _deserialize_enrichment_value(api_field: str, value: Any) -> Any:
