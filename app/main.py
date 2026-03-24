@@ -911,6 +911,13 @@ def normalize_optional_text(value: Optional[str]) -> Optional[str]:
     return trimmed if trimmed else None
 
 
+def normalize_phone(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    digits = "".join(ch for ch in str(value) if ch.isdigit())
+    return digits if digits else None
+
+
 def parse_optional_bool(value: Optional[str | bool]) -> Optional[bool]:
     if isinstance(value, bool):
         return value
@@ -1163,11 +1170,18 @@ def startup_ensure_voter_enrichment() -> None:
 # ---------------------------
 @app.post(f"{CONTEXT_PATH}/api/auth/login")
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.first_name == payload.firstName, User.phone == payload.phone).first()
+    normalized_name = normalize_optional_text(payload.firstName) or ""
+    normalized_phone = normalize_phone(payload.phone) or ""
+    user = db.query(User).filter(func.lower(User.first_name) == normalized_name.lower(), User.phone == normalized_phone).first()
+    if user and user.role not in {"SUPER_ADMIN", "ADMIN"} and not user.tenant:
+        user = None
     volunteer = None
     if not user:
-        volunteer = db.query(VolunteerUser).filter(VolunteerUser.first_name == payload.firstName, VolunteerUser.phone == payload.phone).first()
-        if not volunteer:
+        volunteer = db.query(VolunteerUser).filter(func.lower(VolunteerUser.first_name) == normalized_name.lower(), VolunteerUser.phone == normalized_phone).first()
+        if not volunteer and normalized_phone:
+            # Fallback: allow login by phone only if the number matches a unique volunteer.
+            volunteer = db.query(VolunteerUser).filter(VolunteerUser.phone == normalized_phone).first()
+        if not volunteer and not user:
             raise InvalidCredentialsException("Invalid firstname or phone")
 
     tenant_id = None
@@ -2762,7 +2776,7 @@ def get_voters_by_booth(
 def get_snapshot(
     assemblyCode: str,
     request: Request,
-    includeVoters: bool = False,
+    includeVoters: bool = True,
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "USER", "ADMIN")),
 ):
@@ -2770,19 +2784,25 @@ def get_snapshot(
         scope = _resolve_access_scope_ids(db, current)
         if scope and not (scope.get("allowed_assembly_ids") or scope.get("allowed_ward_ids") or scope.get("allowed_booth_ids")):
             raise HTTPException(status_code=403, detail="No access scope defined for this user")
-        public_snapshot = _build_public_snapshot(
-            assemblyCode,
-            db,
-            include_voters=includeVoters,
-            allowed_assembly_ids=scope.get("allowed_assembly_ids") if scope else None,
-            allowed_ward_ids=scope.get("allowed_ward_ids") if scope else None,
-            allowed_booth_ids=scope.get("allowed_booth_ids") if scope else None,
-        )
-        snapshot_id = _cache_snapshot(public_snapshot)
-        snapshot_url = f"{_external_base_url(request)}{CONTEXT_PATH}/api/voters/snapshot/content/{snapshot_id}"
-        payload = api_success("Snapshot fetched successfully", snapshot_url)
-        payload["snapshotMode"] = "link"
-        return JSONResponse(content=payload, headers={"X-Snapshot-Mode": "link"})
+        try:
+            public_snapshot = _build_public_snapshot(
+                assemblyCode,
+                db,
+                include_voters=includeVoters,
+                allowed_assembly_ids=scope.get("allowed_assembly_ids") if scope else None,
+                allowed_ward_ids=scope.get("allowed_ward_ids") if scope else None,
+                allowed_booth_ids=scope.get("allowed_booth_ids") if scope else None,
+            )
+            snapshot_id = _cache_snapshot(public_snapshot)
+            snapshot_url = f"{_external_base_url(request)}{CONTEXT_PATH}/api/voters/snapshot/content/{snapshot_id}"
+            payload = api_success("Snapshot fetched successfully", snapshot_url)
+            payload["snapshotMode"] = "link"
+            return JSONResponse(content=payload, headers={"X-Snapshot-Mode": "link"})
+        except Exception:
+            local_snapshot = _build_snapshot_from_data(db, assemblyCode, includeVoters, current)
+            payload = api_success("Snapshot fetched successfully", local_snapshot)
+            payload["snapshotMode"] = "direct"
+            return JSONResponse(content=payload, headers={"X-Snapshot-Mode": "direct"})
     except HTTPException as ex:
         return JSONResponse(status_code=ex.status_code, content=api_error("Snapshot failed", str(ex.detail)))
     except ValueError as ex:
@@ -3912,12 +3932,34 @@ def _upload_and_save_snapshot(db: Session, data: Dict[str, Any], key: str, tenan
         )
 
 
+def _build_booth_stats(db: Session, booth_ids: List[int], tenant_id: Optional[str]) -> Dict[int, Dict[str, int]]:
+    if not booth_ids:
+        return {}
+    q = db.query(Voter.booth_id, Voter.gender, func.count(Voter.voter_id))
+    q = q.filter(Voter.booth_id.in_(booth_ids))
+    if tenant_id is not None:
+        q = q.filter(Voter.tenant_id == tenant_id)
+    q = q.group_by(Voter.booth_id, Voter.gender)
+    rows = q.all()
+    stats: Dict[int, Dict[str, int]] = {}
+    for booth_id, gender, count in rows:
+        booth_stat = stats.setdefault(int(booth_id), {"total": 0, "male": 0, "female": 0})
+        booth_stat["total"] += int(count)
+        g = (gender or "").upper()
+        if g.startswith("M"):
+            booth_stat["male"] += int(count)
+        elif g.startswith("F"):
+            booth_stat["female"] += int(count)
+    return stats
+
+
 def _build_assembly_json(
     db: Session,
     assembly: Assembly,
     wards: List[Ward],
     include_voters: bool,
     tenant_id: Optional[str],
+    booth_stats: Optional[Dict[int, Dict[str, int]]] = None,
 ) -> Dict[str, Any]:
     assembly_map: Dict[str, Any] = {
         "assemblyId": assembly.assembly_id,
@@ -3950,6 +3992,8 @@ def _build_assembly_json(
                     voters_q = voters_q.filter(Voter.tenant_id == tenant_id)
                 voters = voters_q.all()
                 booth_map["voters"] = [_build_voter_map(v) for v in voters]
+            elif booth_stats is not None:
+                booth_map["voterStats"] = booth_stats.get(booth.booth_id, {"total": 0, "male": 0, "female": 0})
             booth_list.append(booth_map)
 
         ward_map["booths"] = booth_list
@@ -3957,6 +4001,110 @@ def _build_assembly_json(
 
     assembly_map["wards"] = ward_list
     return {"assembly": assembly_map}
+
+
+def _build_snapshot_from_data(
+    db: Session,
+    assembly_code: str,
+    include_voters: bool,
+    current: JwtUserDetails,
+) -> Dict[str, Any]:
+    tenant_id = current.tenantId
+    normalized_code = normalize_assembly_code(assembly_code)
+    assembly = (
+        db.query(Assembly)
+        .filter(Assembly.assembly_code == normalized_code)
+        .filter(Assembly.tenant_id == tenant_id if tenant_id else True)
+        .first()
+    )
+    if not assembly:
+        raise ValueError(f"Assembly not found for assemblyCode: {assembly_code}")
+
+    assignment = (current.assignmentType or "ASSEMBLY").upper()
+    if assignment == "ASSEMBLY":
+        wards = db.query(Ward).filter(Ward.assembly_id == assembly.assembly_id).all()
+        if tenant_id:
+            wards = [w for w in wards if w.tenant_id == tenant_id]
+        booth_ids = []
+        if not include_voters:
+            booth_ids = [
+                b.booth_id
+                for b in db.query(Booth)
+                .filter(Booth.ward_id.in_([w.ward_id for w in wards]) if wards else True)
+                .filter(Booth.tenant_id == tenant_id if tenant_id else True)
+                .all()
+            ]
+        stats = _build_booth_stats(db, booth_ids, tenant_id) if not include_voters else None
+        return _build_assembly_json(db, assembly, wards, include_voters, tenant_id, stats)
+
+    if assignment == "WARD":
+        ward = (
+            db.query(Ward)
+            .filter(Ward.assembly_id == assembly.assembly_id)
+            .filter(
+                (Ward.ward_id == current.assignmentId) | (Ward.ward_code == str(current.assignmentId))
+            )
+            .first()
+        )
+        if not ward:
+            raise ValueError("No ward snapshot found")
+        booth_ids = []
+        if not include_voters:
+            booth_ids = [
+                b.booth_id
+                for b in db.query(Booth)
+                .filter(Booth.ward_id == ward.ward_id)
+                .filter(Booth.tenant_id == tenant_id if tenant_id else True)
+                .all()
+            ]
+        stats = _build_booth_stats(db, booth_ids, tenant_id) if not include_voters else None
+        return _build_assembly_json(db, assembly, [ward], include_voters, tenant_id, stats)
+
+    if assignment == "BOOTH":
+        booth_row = (
+            db.query(Booth)
+            .filter(Booth.booth_id == current.assignmentId)
+            .filter(Booth.tenant_id == tenant_id if tenant_id else True)
+            .first()
+        )
+        if not booth_row:
+            raise ValueError("No booth snapshot found")
+        ward = db.query(Ward).filter(Ward.ward_id == booth_row.ward_id).first()
+        if not ward:
+            raise ValueError("No ward found for booth")
+        voters = []
+        if include_voters:
+            voters_q = db.query(Voter).filter(Voter.booth_id == booth_row.booth_id)
+            if tenant_id:
+                voters_q = voters_q.filter(Voter.tenant_id == tenant_id)
+            voters = voters_q.all()
+        stats = _build_booth_stats(db, [booth_row.booth_id], tenant_id) if not include_voters else None
+        booth_payload = {
+            "boothId": booth_row.booth_id,
+            "boothNameEn": booth_row.polling_station_adr_en,
+            "boothNameLocal": booth_row.polling_station_adr_local,
+        }
+        if include_voters:
+            booth_payload["voters"] = [_build_voter_map(v) for v in voters]
+        elif stats is not None:
+            booth_payload["voterStats"] = stats.get(booth_row.booth_id, {"total": 0, "male": 0, "female": 0})
+        return {
+            "assembly": {
+                "assemblyId": assembly.assembly_id,
+                "assemblyNameEn": assembly.assembly_name_en,
+                "assemblyNameLocal": assembly.assembly_name_local,
+                "wards": [
+                    {
+                        "wardId": ward.ward_id,
+                        "wardNameEn": ward.ward_name_en,
+                        "wardNameLocal": ward.ward_name_local,
+                        "booths": [booth_payload],
+                    }
+                ],
+            }
+        }
+
+    raise ValueError(f"Invalid role: {current.assignmentType}")
 
 
 def generate_snapshots(db: Session, assembly_id: int, tenant_id: str) -> None:
