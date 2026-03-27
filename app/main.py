@@ -353,6 +353,8 @@ class VoterEnrichment(Base):
     longitude: Mapped[Optional[float]] = mapped_column(Double)
     updated_fields: Mapped[str] = mapped_column(String, default="[]")
     updated_by: Mapped[Optional[int]] = mapped_column(ForeignKey("metastore.users.id"))
+    updated_by_name: Mapped[Optional[str]] = mapped_column(String(255))
+    updated_by_phone: Mapped[Optional[str]] = mapped_column(String(50))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -648,6 +650,7 @@ def to_user_details(u: User) -> Dict[str, Any]:
         return [int(v) for v in str(value).split(",") if str(v).strip().isdigit()]
 
     return {
+        "id": u.id,
         "role": u.role,
         "tenantId": _resolve_tenant_id_for_entity(u),
         "assignmentType": u.assignment_type,
@@ -1123,6 +1126,24 @@ def startup_ensure_voter_enrichment() -> None:
     VolunteerUser.__table__.create(bind=engine, checkfirst=True)
     db = SessionLocal()
     try:
+        enrichment_cols = {
+            row[0]
+            for row in db.execute(
+                text(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'voter_enrichment'
+                    """
+                )
+            ).all()
+        }
+        if "updated_by_name" not in enrichment_cols:
+            db.execute(text("ALTER TABLE public.voter_enrichment ADD COLUMN updated_by_name varchar(255)"))
+        if "updated_by_phone" not in enrichment_cols:
+            db.execute(text("ALTER TABLE public.voter_enrichment ADD COLUMN updated_by_phone varchar(50)"))
+
         existing_cols = {
             row[0]
             for row in db.execute(
@@ -1378,6 +1399,7 @@ def list_volunteers(
         q = q.filter(or_(func.lower(VolunteerUser.first_name).like(s), VolunteerUser.phone.like(f"%{search}%")))
 
     sort_map = {
+        "id": VolunteerUser.id,
         "firstName": VolunteerUser.first_name,
         "phone": VolunteerUser.phone,
         "role": VolunteerUser.role,
@@ -1509,8 +1531,18 @@ def volunteer_analysis(
             continue
         bucket = counters.setdefault(
             int(user_id),
-            {"userId": int(user_id), "counts": {item["key"]: 0 for item in analysis_fields}, "total": 0},
+            {
+                "userId": int(user_id),
+                "counts": {item["key"]: 0 for item in analysis_fields},
+                "total": 0,
+                "agentName": None,
+                "phone": None,
+            },
         )
+        if not bucket.get("agentName") and enrichment.updated_by_name:
+            bucket["agentName"] = enrichment.updated_by_name
+        if not bucket.get("phone") and enrichment.updated_by_phone:
+            bucket["phone"] = enrichment.updated_by_phone
         bucket["total"] += 1
         for item in analysis_fields:
             if _enrichment_has_value(enrichment, item["key"]):
@@ -1525,8 +1557,8 @@ def volunteer_analysis(
         results.append(
             {
                 "userId": user_id,
-                "agentName": user.first_name if user else f"User {user_id}",
-                "phone": user.phone if user else "",
+                "agentName": user.first_name if user else (bucket.get("agentName") or f"User {user_id}"),
+                "phone": user.phone if user else (bucket.get("phone") or ""),
                 "total": bucket["total"],
                 "counts": bucket["counts"],
             }
@@ -1586,6 +1618,7 @@ def list_users(
         q = q.filter(or_(func.lower(VolunteerUser.first_name).like(s), VolunteerUser.phone.like(f"%{search}%")))
 
     sort_map = {
+        "id": VolunteerUser.id,
         "firstName": VolunteerUser.first_name,
         "phone": VolunteerUser.phone,
         "role": VolunteerUser.role,
@@ -2203,6 +2236,8 @@ def update_public_voter_by_epic(epic: str, payload: PublicVoterUpdatePayload, db
     enrichment.updated_fields = json.dumps(sorted(updated_fields))
     enrichment.updated_at = datetime.utcnow()
     enrichment.updated_by = updated_by.id if updated_by else None
+    enrichment.updated_by_name = updated_by.first_name if updated_by else None
+    enrichment.updated_by_phone = updated_by.phone if updated_by else None
     db.commit()
     db.refresh(enrichment)
     return api_success(
@@ -3465,6 +3500,8 @@ def _build_voter_enrichment_payload(enrichment: VoterEnrichment) -> Dict[str, An
         "wardCode": enrichment.ward_code,
         "boothNo": enrichment.booth_no,
         "updatedFields": sorted(_parse_updated_fields(enrichment.updated_fields)),
+        "updatedByName": enrichment.updated_by_name,
+        "updatedByPhone": enrichment.updated_by_phone,
     }
     for api_field, column_name in VOTER_ENRICHMENT_FIELD_MAP.items():
         payload[api_field] = _deserialize_enrichment_value(api_field, getattr(enrichment, column_name))
