@@ -1440,6 +1440,7 @@ def _enrichment_has_value(enrichment: VoterEnrichment, api_field: str) -> bool:
 def volunteer_analysis(
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD")),
+    wardId: Optional[int] = None,
 ):
     scope = _resolve_access_scope_ids(db, current)
 
@@ -1497,6 +1498,27 @@ def volunteer_analysis(
             q = q.filter(or_(*filters))
         else:
             q = q.filter(text("1=0"))
+
+    if wardId:
+        ward_cols = _get_table_columns(db, "public", "wards")
+        ward_id_col = "id" if "id" in ward_cols else ("ward_id" if "ward_id" in ward_cols else None)
+        ward_code_col = "ward_code" if "ward_code" in ward_cols else None
+        if ward_id_col and ward_code_col:
+            row = db.execute(
+                text(
+                    f"""
+                    SELECT {ward_code_col} AS ward_code
+                    FROM public.wards
+                    WHERE {ward_id_col} = :ward_id
+                    LIMIT 1
+                    """
+                ),
+                {"ward_id": wardId},
+            ).first()
+            if row and row.ward_code is not None:
+                q = q.filter(VoterEnrichment.ward_code == str(row.ward_code))
+            else:
+                q = q.filter(text("1=0"))
 
     enrichments = q.all()
     if not enrichments:
@@ -1566,6 +1588,115 @@ def volunteer_analysis(
 
     results.sort(key=lambda item: item.get("agentName") or "")
     return api_success("Volunteer analysis fetched", {"fields": analysis_fields, "rows": results})
+
+
+@app.get(f"{CONTEXT_PATH}/api/volunteers/analysis/enrichment")
+def volunteer_analysis_enrichment(
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN")),
+    wardId: Optional[int] = None,
+):
+    exclude_keys = {
+        "firstMiddleNameLocal",
+        "lastNameLocal",
+        "relationType",
+        "relationFirstMiddleNameEn",
+        "relationLastNameEn",
+        "relationFirstMiddleNameLocal",
+        "relationLastNameLocal",
+        "houseNoEn",
+        "houseNoLocal",
+        "addressEn",
+        "addressLocal",
+        "team",
+    }
+    ordered_keys = [
+        "serialNumber",
+        "wardName",
+        "firstMiddleNameEn",
+        "lastNameEn",
+        "epicNo",
+        "boothNo",
+        "voterSerialNo",
+    ]
+    ward_name_map: Dict[str, str] = {}
+    ward_cols = _get_table_columns(db, "public", "wards")
+    ward_code_col = "ward_code" if "ward_code" in ward_cols else None
+    ward_name_col = (
+        "ward_name_en"
+        if "ward_name_en" in ward_cols
+        else ("name_en" if "name_en" in ward_cols else ("ward_name_local" if "ward_name_local" in ward_cols else None))
+    )
+    if ward_code_col and ward_name_col:
+        ward_rows = db.execute(
+            text(
+                f"""
+                SELECT {ward_code_col} AS ward_code, {ward_name_col} AS ward_name
+                FROM public.wards
+                """
+            )
+        ).all()
+        ward_name_map = {
+            str(r.ward_code): str(r.ward_name) for r in ward_rows if r.ward_code is not None and r.ward_name is not None
+        }
+
+    enrichments_q = db.query(VoterEnrichment)
+    if wardId:
+        ward_cols = _get_table_columns(db, "public", "wards")
+        ward_id_col = "id" if "id" in ward_cols else ("ward_id" if "ward_id" in ward_cols else None)
+        ward_code_col = "ward_code" if "ward_code" in ward_cols else None
+        if ward_id_col and ward_code_col:
+            row = db.execute(
+                text(
+                    f"""
+                    SELECT {ward_code_col} AS ward_code
+                    FROM public.wards
+                    WHERE {ward_id_col} = :ward_id
+                    LIMIT 1
+                    """
+                ),
+                {"ward_id": wardId},
+            ).first()
+            if row and row.ward_code is not None:
+                enrichments_q = enrichments_q.filter(VoterEnrichment.ward_code == str(row.ward_code))
+            else:
+                enrichments_q = enrichments_q.filter(text("1=0"))
+    enrichments = enrichments_q.all()
+    if not enrichments:
+        return api_success("Volunteer enrichment fetched", [])
+
+    epics = [e.epic for e in enrichments if e.epic]
+    voter_rows = db.query(Voter).filter(Voter.epic_no.in_(epics)).all() if epics else []
+    voter_map = {v.epic_no: v for v in voter_rows}
+
+    rows: List[Dict[str, Any]] = []
+    for idx, enrichment in enumerate(enrichments, start=1):
+        payload = _build_voter_enrichment_payload(enrichment)
+        ward_name = ward_name_map.get(str(enrichment.ward_code), None) if enrichment.ward_code is not None else None
+        voter = voter_map.get(enrichment.epic)
+        ordered: Dict[str, Any] = {}
+        ordered["serialNumber"] = idx
+        ordered["wardName"] = ward_name
+        ordered["firstMiddleNameEn"] = (payload.get("firstMiddleNameEn") or (voter.first_middle_name_en if voter else None))
+        ordered["lastNameEn"] = (payload.get("lastNameEn") or (voter.last_name_en if voter else None))
+        ordered["epicNo"] = payload.get("epicNo")
+        ordered["boothNo"] = payload.get("boothNo")
+        ordered["voterSerialNo"] = (voter.sr_no if voter else payload.get("newSerialNo"))
+
+        remaining_keys = [
+            key
+            for key in (
+                ["wardCode", "boothNo", "updatedFields", "updatedByName", "updatedByPhone"]
+                + list(VOTER_ENRICHMENT_FIELD_MAP.keys())
+            )
+            if key not in ordered_keys and key not in exclude_keys and key != "updatedFields"
+        ]
+        for key in remaining_keys:
+            if key in payload:
+                ordered[key] = payload.get(key)
+        rows.append(ordered)
+
+    return api_success("Volunteer enrichment fetched", rows)
 
 
 @app.put(f"{CONTEXT_PATH}/api/user/block")
