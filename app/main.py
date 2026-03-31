@@ -640,6 +640,10 @@ class VolunteerCreateRequest(BaseModel):
     boothIds: Optional[List[int]] = None
 
 
+class VolunteerUpdateRequest(VolunteerCreateRequest):
+    pass
+
+
 # ---------------------------
 # Utility converters
 # ---------------------------
@@ -1353,6 +1357,45 @@ def create_volunteer(
     )
 
 
+@app.put(f"{CONTEXT_PATH}/api/volunteers")
+def update_volunteer(
+    payload: VolunteerUpdateRequest,
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD")),
+):
+    phone = normalize_optional_text(payload.phone)
+    if not phone or not phone.isdigit() or len(phone) != 10:
+        raise ValueError("phone must be a 10 digit number")
+
+    q = db.query(VolunteerUser).filter(VolunteerUser.phone == phone)
+    if current.role != "SUPER_ADMIN" and current.tenantId:
+        q = q.filter(VolunteerUser.tenant_id == current.tenantId)
+    volunteer = q.first()
+    if not volunteer:
+        return api_error("Volunteer not found", {"details": f"Volunteer not found with phone: '{phone}'"})
+
+    working_level = (payload.workingLevel or "").strip().upper()
+    if working_level not in {"ASSEMBLY", "WARD", "BOOTH"}:
+        raise ValueError("workingLevel must be ASSEMBLY, WARD, or BOOTH")
+
+    assembly_ids = payload.assemblyIds or []
+    ward_ids = payload.wardIds or []
+    booth_ids = payload.boothIds or []
+    assignment_id = _first_id(assembly_ids) or _first_id(ward_ids) or _first_id(booth_ids)
+
+    volunteer.first_name = payload.firstName
+    volunteer.working_level = working_level
+    volunteer.assignment_type = working_level
+    volunteer.assignment_id = str(assignment_id) if assignment_id is not None else None
+    volunteer.assembly_ids = _serialize_id_list(assembly_ids)
+    volunteer.ward_ids = _serialize_id_list(ward_ids)
+    volunteer.booth_ids = _serialize_id_list(booth_ids)
+
+    db.commit()
+    db.refresh(volunteer)
+    return api_success("Volunteer updated successfully", to_user_details(volunteer))
+
+
 @app.get(f"{CONTEXT_PATH}/api/volunteers")
 def list_volunteers(
     page: int = 0,
@@ -1414,7 +1457,40 @@ def list_volunteers(
 
     total = q.count()
     users = q.offset(page * size).limit(size).all()
-    content = [to_user_details(u) for u in users]
+    def parse_ids(value: Optional[str]) -> List[int]:
+        if not value:
+            return []
+        return [int(v) for v in str(value).split(",") if str(v).strip().isdigit()]
+
+    ward_ids: set[int] = set()
+    booth_ids: set[int] = set()
+    for u in users:
+        ward_ids.update(parse_ids(getattr(u, "ward_ids", None)))
+        booth_ids.update(parse_ids(getattr(u, "booth_ids", None)))
+
+    ward_name_map: Dict[int, str] = {}
+    booth_name_map: Dict[int, str] = {}
+    if ward_ids:
+        ward_q = db.query(Ward.ward_id, Ward.ward_name_en)
+        if current.tenantId is not None:
+            ward_q = ward_q.filter(Ward.tenant_id == current.tenantId)
+        ward_rows = ward_q.filter(Ward.ward_id.in_(list(ward_ids))).all()
+        ward_name_map = {row.ward_id: row.ward_name_en or f"Ward {row.ward_id}" for row in ward_rows}
+    if booth_ids:
+        booth_q = db.query(Booth.booth_id, Booth.polling_station_adr_en)
+        if current.tenantId is not None:
+            booth_q = booth_q.filter(Booth.tenant_id == current.tenantId)
+        booth_rows = booth_q.filter(Booth.booth_id.in_(list(booth_ids))).all()
+        booth_name_map = {row.booth_id: row.polling_station_adr_en or f"Booth {row.booth_id}" for row in booth_rows}
+
+    content = []
+    for u in users:
+        item = to_user_details(u)
+        u_ward_ids = parse_ids(getattr(u, "ward_ids", None))
+        u_booth_ids = parse_ids(getattr(u, "booth_ids", None))
+        item["wardNames"] = [ward_name_map.get(i, f"Ward {i}") for i in u_ward_ids]
+        item["boothNames"] = [booth_name_map.get(i, f"Booth {i}") for i in u_booth_ids]
+        content.append(item)
     return build_page(content, page, size, total, sortBy, direction)
 
 
@@ -1543,7 +1619,7 @@ def volunteer_analysis(
         "age",
     }
     enrichment_keys = [key for key in VOTER_ENRICHMENT_FIELD_MAP.keys() if key not in exclude_keys]
-    extra_keys = ["ward_code", "booth_no", "updated_fields", "created_at", "updated_at"]
+    extra_keys = ["ward_code", "booth_no", "updated_fields"]
     analysis_fields = [{"key": key, "label": _label_from_key(key)} for key in enrichment_keys + extra_keys]
 
     counters: Dict[int, Dict[str, Any]] = {}
@@ -1559,6 +1635,7 @@ def volunteer_analysis(
                 "total": 0,
                 "agentName": None,
                 "phone": None,
+                "lastUpdatedAt": None,
             },
         )
         if not bucket.get("agentName") and enrichment.updated_by_name:
@@ -1566,6 +1643,10 @@ def volunteer_analysis(
         if not bucket.get("phone") and enrichment.updated_by_phone:
             bucket["phone"] = enrichment.updated_by_phone
         bucket["total"] += 1
+        if enrichment.updated_at:
+            existing = bucket.get("lastUpdatedAt")
+            if not existing or enrichment.updated_at > existing:
+                bucket["lastUpdatedAt"] = enrichment.updated_at
         for item in analysis_fields:
             if _enrichment_has_value(enrichment, item["key"]):
                 bucket["counts"][item["key"]] += 1
@@ -1583,6 +1664,7 @@ def volunteer_analysis(
                 "phone": user.phone if user else (bucket.get("phone") or ""),
                 "total": bucket["total"],
                 "counts": bucket["counts"],
+                "lastUpdatedAt": bucket.get("lastUpdatedAt").isoformat() if bucket.get("lastUpdatedAt") else None,
             }
         )
 
@@ -1595,8 +1677,12 @@ def volunteer_analysis_enrichment(
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN")),
     wardId: Optional[int] = None,
+    updatedFrom: Optional[str] = None,
+    updatedTo: Optional[str] = None,
 ):
     exclude_keys = {
+        "firstMiddleNameEn",
+        "lastNameEn",
         "firstMiddleNameLocal",
         "lastNameLocal",
         "relationType",
@@ -1613,11 +1699,11 @@ def volunteer_analysis_enrichment(
     ordered_keys = [
         "serialNumber",
         "wardName",
-        "firstMiddleNameEn",
-        "lastNameEn",
+        "name",
         "epicNo",
         "boothNo",
         "voterSerialNo",
+        "lastUpdatedAt",
     ]
     ward_name_map: Dict[str, str] = {}
     ward_cols = _get_table_columns(db, "public", "wards")
@@ -1661,27 +1747,60 @@ def volunteer_analysis_enrichment(
                 enrichments_q = enrichments_q.filter(VoterEnrichment.ward_code == str(row.ward_code))
             else:
                 enrichments_q = enrichments_q.filter(text("1=0"))
+
+    def _parse_date(value: Optional[str], end_of_day: bool = False) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except Exception:
+            try:
+                parsed = datetime.strptime(value, "%Y-%m-%d")
+            except Exception:
+                return None
+        if end_of_day and parsed.hour == 0 and parsed.minute == 0 and parsed.second == 0 and len(value) <= 10:
+            parsed = parsed + timedelta(hours=23, minutes=59, seconds=59)
+        return parsed
+
+    from_dt = _parse_date(updatedFrom)
+    to_dt = _parse_date(updatedTo, end_of_day=True)
+    if from_dt:
+        enrichments_q = enrichments_q.filter(VoterEnrichment.updated_at >= from_dt)
+    if to_dt:
+        enrichments_q = enrichments_q.filter(VoterEnrichment.updated_at <= to_dt)
     enrichments = enrichments_q.all()
     if not enrichments:
         return api_success("Volunteer enrichment fetched", [])
 
-    epics = [e.epic for e in enrichments if e.epic]
+    def _normalize_epic(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = str(value).strip().upper()
+        return normalized or None
+
+    epics = [_normalize_epic(e.epic) for e in enrichments if _normalize_epic(e.epic)]
     voter_rows = db.query(Voter).filter(Voter.epic_no.in_(epics)).all() if epics else []
-    voter_map = {v.epic_no: v for v in voter_rows}
+    voter_map = {(_normalize_epic(v.epic_no)): v for v in voter_rows if _normalize_epic(v.epic_no)}
 
     rows: List[Dict[str, Any]] = []
     for idx, enrichment in enumerate(enrichments, start=1):
         payload = _build_voter_enrichment_payload(enrichment)
         ward_name = ward_name_map.get(str(enrichment.ward_code), None) if enrichment.ward_code is not None else None
-        voter = voter_map.get(enrichment.epic)
+        epic_key = _normalize_epic(enrichment.epic) or _normalize_epic(payload.get("epicNo"))
+        voter = voter_map.get(epic_key)
+        name_parts = [
+            payload.get("firstMiddleNameEn") or (voter.first_middle_name_en if voter else None),
+            payload.get("lastNameEn") or (voter.last_name_en if voter else None),
+        ]
+        full_name = " ".join([part for part in name_parts if part]).strip() or None
         ordered: Dict[str, Any] = {}
         ordered["serialNumber"] = idx
         ordered["wardName"] = ward_name
-        ordered["firstMiddleNameEn"] = (payload.get("firstMiddleNameEn") or (voter.first_middle_name_en if voter else None))
-        ordered["lastNameEn"] = (payload.get("lastNameEn") or (voter.last_name_en if voter else None))
+        ordered["name"] = full_name
         ordered["epicNo"] = payload.get("epicNo")
         ordered["boothNo"] = payload.get("boothNo")
-        ordered["voterSerialNo"] = (voter.sr_no if voter else payload.get("newSerialNo"))
+        ordered["voterSerialNo"] = (voter.sr_no if voter and voter.sr_no is not None else payload.get("newSerialNo"))
+        ordered["lastUpdatedAt"] = enrichment.updated_at.isoformat() if enrichment.updated_at else None
 
         remaining_keys = [
             key
@@ -1697,6 +1816,55 @@ def volunteer_analysis_enrichment(
         rows.append(ordered)
 
     return api_success("Volunteer enrichment fetched", rows)
+
+
+@app.get(f"{CONTEXT_PATH}/api/volunteers/analysis/locations")
+def volunteer_analysis_locations(
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD")),
+    wardId: Optional[int] = None,
+):
+    scope = _resolve_access_scope_ids(db, current)
+    allowed_ward_ids = set(scope.get("allowed_ward_ids") or []) if scope else set()
+    allowed_booth_ids = set(scope.get("allowed_booth_ids") or []) if scope else set()
+
+    q = (
+        db.query(Voter)
+        .join(Booth, Voter.booth_id == Booth.booth_id)
+        .join(Ward, Booth.ward_id == Ward.ward_id)
+        .filter(Voter.latitude.isnot(None), Voter.longitude.isnot(None))
+    )
+    if current.tenantId:
+        q = q.filter(Voter.tenant_id == current.tenantId)
+
+    if scope:
+        filters = []
+        if allowed_booth_ids:
+            filters.append(Booth.booth_id.in_(allowed_booth_ids))
+        if allowed_ward_ids:
+            filters.append(Ward.ward_id.in_(allowed_ward_ids))
+        if filters:
+            q = q.filter(or_(*filters))
+        else:
+            q = q.filter(text("1=0"))
+
+    if wardId:
+        q = q.filter(Ward.ward_id == wardId)
+
+    voters = q.all()
+    if not voters:
+        return api_success("Volunteer locations fetched", [])
+
+    rows: List[Dict[str, Any]] = [
+        {
+            "latitude": voter.latitude,
+            "longitude": voter.longitude,
+            "gender": voter.gender,
+        }
+        for voter in voters
+        if voter.latitude is not None and voter.longitude is not None
+    ]
+    return api_success("Volunteer locations fetched", rows)
 
 
 @app.put(f"{CONTEXT_PATH}/api/user/block")
