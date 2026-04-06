@@ -20,6 +20,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, DateTime, Double, ForeignKey, Integer, String, and_, asc, case, create_engine, desc, func, or_, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
+from app.extract import router as extract_router
+
 
 # ---------------------------
 # Config
@@ -965,6 +967,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(extract_router, prefix=CONTEXT_PATH)
+
 
 @app.middleware("http")
 async def log_all_requests(request: Request, call_next):
@@ -1462,26 +1466,74 @@ def list_volunteers(
             return []
         return [int(v) for v in str(value).split(",") if str(v).strip().isdigit()]
 
-    ward_ids: set[int] = set()
-    booth_ids: set[int] = set()
+    ward_ids_all: set[int] = set()
+    booth_ids_all: set[int] = set()
     for u in users:
-        ward_ids.update(parse_ids(getattr(u, "ward_ids", None)))
-        booth_ids.update(parse_ids(getattr(u, "booth_ids", None)))
+        ward_ids_all.update(parse_ids(getattr(u, "ward_ids", None)))
+        booth_ids_all.update(parse_ids(getattr(u, "booth_ids", None)))
 
     ward_name_map: Dict[int, str] = {}
     booth_name_map: Dict[int, str] = {}
-    if ward_ids:
+
+    if ward_ids_all:
         ward_q = db.query(Ward.ward_id, Ward.ward_name_en)
         if current.tenantId is not None:
             ward_q = ward_q.filter(Ward.tenant_id == current.tenantId)
-        ward_rows = ward_q.filter(Ward.ward_id.in_(list(ward_ids))).all()
+        ward_rows = ward_q.filter(Ward.ward_id.in_(list(ward_ids_all))).all()
         ward_name_map = {row.ward_id: row.ward_name_en or f"Ward {row.ward_id}" for row in ward_rows}
-    if booth_ids:
+        
+        missing_wards = ward_ids_all - set(ward_name_map.keys())
+        if missing_wards:
+            # Fallback to public.wards just like the dropdowns do
+            ward_cols = _get_table_columns(db, "public", "wards")
+            id_col = "ward_id" if "ward_id" in ward_cols else ("ward_no" if "ward_no" in ward_cols else ("id" if "id" in ward_cols else None))
+            name_col = "ward_name_en" if "ward_name_en" in ward_cols else ("name_en" if "name_en" in ward_cols else ("ward_name_local" if "ward_name_local" in ward_cols else None))
+            code_col = "ward_code" if "ward_code" in ward_cols else None
+
+            if id_col and name_col:
+                clause, params = _build_in_clause(id_col, [str(m) for m in missing_wards], "mc")
+                raw_rows = db.execute(
+                    text(f"SELECT {id_col} AS wid, {name_col} AS wname FROM public.wards WHERE {clause}"),
+                    params,
+                ).all()
+                for row in raw_rows:
+                    ward_name_map[int(row.wid)] = row.wname or f"Ward {row.wid}"
+            
+            missing_wards = ward_ids_all - set(ward_name_map.keys())
+            if missing_wards and code_col and name_col:
+                clause, params = _build_in_clause(code_col, [str(m) for m in missing_wards], "wc")
+                raw_rows = db.execute(
+                    text(f"SELECT {code_col} AS wcode, {name_col} AS wname FROM public.wards WHERE {clause}"),
+                    params,
+                ).all()
+                for row in raw_rows:
+                    try:
+                        ward_name_map[int(row.wcode)] = row.wname or f"Ward {row.wcode}"
+                    except Exception:
+                        pass
+
+    if booth_ids_all:
         booth_q = db.query(Booth.booth_id, Booth.polling_station_adr_en)
         if current.tenantId is not None:
             booth_q = booth_q.filter(Booth.tenant_id == current.tenantId)
-        booth_rows = booth_q.filter(Booth.booth_id.in_(list(booth_ids))).all()
+        booth_rows = booth_q.filter(Booth.booth_id.in_(list(booth_ids_all))).all()
         booth_name_map = {row.booth_id: row.polling_station_adr_en or f"Booth {row.booth_id}" for row in booth_rows}
+
+        missing_booths = booth_ids_all - set(booth_name_map.keys())
+        if missing_booths:
+            # Fallback to public.booths
+            booth_cols = _get_table_columns(db, "public", "booths")
+            booth_no_col = "booth_no" if "booth_no" in booth_cols else ("id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None))
+            name_col = "booth_add_en" if "booth_add_en" in booth_cols else ("polling_station_adr_en" if "polling_station_adr_en" in booth_cols else None)
+            
+            if booth_no_col and name_col:
+                clause, params = _build_in_clause(booth_no_col, [str(m) for m in missing_booths], "mb")
+                raw_rows = db.execute(
+                    text(f"SELECT {booth_no_col} AS bno, {name_col} AS bname FROM public.booths WHERE {clause}"),
+                    params,
+                ).all()
+                for row in raw_rows:
+                    booth_name_map[int(row.bno)] = row.bname or f"Booth {row.bno}"
 
     content = []
     for u in users:
@@ -1517,6 +1569,7 @@ def volunteer_analysis(
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD")),
     wardId: Optional[int] = None,
+    mode: Optional[str] = None,
 ):
     scope = _resolve_access_scope_ids(db, current)
 
@@ -1622,6 +1675,8 @@ def volunteer_analysis(
     extra_keys = ["ward_code", "booth_no", "updated_fields"]
     analysis_fields = [{"key": key, "label": _label_from_key(key)} for key in enrichment_keys + extra_keys]
 
+    mode_key = (mode or "agent").lower()
+
     counters: Dict[int, Dict[str, Any]] = {}
     for enrichment in enrichments:
         user_id = enrichment.updated_by
@@ -1651,31 +1706,121 @@ def volunteer_analysis(
             if _enrichment_has_value(enrichment, item["key"]):
                 bucket["counts"][item["key"]] += 1
 
-    user_rows = db.query(User).filter(User.id.in_(list(counters.keys()))).all()
-    user_map = {u.id: u for u in user_rows}
+    if mode_key == "agent":
+        user_rows = db.query(User).filter(User.id.in_(list(counters.keys()))).all()
+        user_map = {u.id: u for u in user_rows}
 
-    results = []
-    for user_id, bucket in counters.items():
-        user = user_map.get(user_id)
-        results.append(
+        results = []
+        for user_id, bucket in counters.items():
+            user = user_map.get(user_id)
+            results.append(
+                {
+                    "userId": user_id,
+                    "agentName": user.first_name if user else (bucket.get("agentName") or f"User {user_id}"),
+                    "phone": user.phone if user else (bucket.get("phone") or ""),
+                    "total": bucket["total"],
+                    "counts": bucket["counts"],
+                    "lastUpdatedAt": bucket.get("lastUpdatedAt").isoformat() if bucket.get("lastUpdatedAt") else None,
+                }
+            )
+        results.sort(key=lambda item: item.get("agentName") or "")
+        return api_success("Volunteer analysis fetched", {"fields": analysis_fields, "rows": results, "mode": mode_key})
+
+    ward_name_map: Dict[str, str] = {}
+    if mode_key == "ward":
+        ward_cols = _get_table_columns(db, "public", "wards")
+        ward_code_col = "ward_code" if "ward_code" in ward_cols else None
+        ward_name_col = (
+            "ward_name_en"
+            if "ward_name_en" in ward_cols
+            else ("name_en" if "name_en" in ward_cols else ("ward_name_local" if "ward_name_local" in ward_cols else None))
+        )
+        if ward_code_col and ward_name_col:
+            ward_rows = db.execute(
+                text(
+                    f"""
+                    SELECT {ward_code_col} AS ward_code, {ward_name_col} AS ward_name
+                    FROM public.wards
+                    """
+                )
+            ).all()
+            ward_name_map = {
+                str(r.ward_code): str(r.ward_name)
+                for r in ward_rows
+                if r.ward_code is not None and r.ward_name is not None
+            }
+
+    group_buckets: Dict[str, Dict[str, Any]] = {}
+    for enrichment in enrichments:
+        if mode_key == "date":
+            if not enrichment.updated_at:
+                continue
+            group_key = enrichment.updated_at.date().isoformat()
+            group_label = enrichment.updated_at.date().isoformat()
+        elif mode_key == "ward":
+            group_key = str(enrichment.ward_code or "")
+            if not group_key:
+                continue
+            group_label = ward_name_map.get(group_key) or f"Ward {group_key}"
+        elif mode_key == "booth":
+            group_key = str(enrichment.booth_no or "")
+            if not group_key:
+                continue
+            group_label = f"Booth {group_key}"
+        else:
+            group_key = "all"
+            group_label = "All"
+
+        bucket = group_buckets.setdefault(
+            group_key,
             {
-                "userId": user_id,
-                "agentName": user.first_name if user else (bucket.get("agentName") or f"User {user_id}"),
-                "phone": user.phone if user else (bucket.get("phone") or ""),
+                "groupKey": group_key,
+                "label": group_label,
+                "counts": {item["key"]: 0 for item in analysis_fields},
+                "total": 0,
+                "agents": set(),
+                "booths": set(),
+                "lastUpdatedAt": None,
+            },
+        )
+        bucket["total"] += 1
+        if enrichment.updated_by:
+            bucket["agents"].add(enrichment.updated_by)
+        if enrichment.booth_no:
+            bucket["booths"].add(str(enrichment.booth_no))
+        if enrichment.updated_at:
+            existing = bucket.get("lastUpdatedAt")
+            if not existing or enrichment.updated_at > existing:
+                bucket["lastUpdatedAt"] = enrichment.updated_at
+        for item in analysis_fields:
+            if _enrichment_has_value(enrichment, item["key"]):
+                bucket["counts"][item["key"]] += 1
+
+    grouped_rows = []
+    for bucket in group_buckets.values():
+        grouped_rows.append(
+            {
+                "groupKey": bucket["groupKey"],
+                "label": bucket["label"],
+                "agentsWorked": len(bucket["agents"]),
+                "boothsCovered": len(bucket["booths"]),
                 "total": bucket["total"],
                 "counts": bucket["counts"],
                 "lastUpdatedAt": bucket.get("lastUpdatedAt").isoformat() if bucket.get("lastUpdatedAt") else None,
             }
         )
 
-    results.sort(key=lambda item: item.get("agentName") or "")
-    return api_success("Volunteer analysis fetched", {"fields": analysis_fields, "rows": results})
+    if mode_key == "date":
+        grouped_rows.sort(key=lambda item: item.get("groupKey") or "")
+    else:
+        grouped_rows.sort(key=lambda item: item.get("label") or "")
+    return api_success("Volunteer analysis fetched", {"fields": analysis_fields, "rows": grouped_rows, "mode": mode_key})
 
 
 @app.get(f"{CONTEXT_PATH}/api/volunteers/analysis/enrichment")
 def volunteer_analysis_enrichment(
     db: Session = Depends(get_db),
-    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN")),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "WARD", "ASSEMBLY")),
     wardId: Optional[int] = None,
     updatedFrom: Optional[str] = None,
     updatedTo: Optional[str] = None,
@@ -1727,6 +1872,27 @@ def volunteer_analysis_enrichment(
         }
 
     enrichments_q = db.query(VoterEnrichment)
+
+    # For non-super-admin users, scope to their allowed ward codes
+    scope = _resolve_access_scope_ids(db, current)
+    if scope:
+        allowed_ward_ids = sorted(scope.get("allowed_ward_ids") or [])
+        if allowed_ward_ids:
+            ward_cols = _get_table_columns(db, "public", "wards")
+            scope_ward_id_col = "id" if "id" in ward_cols else ("ward_id" if "ward_id" in ward_cols else None)
+            scope_ward_code_col = "ward_code" if "ward_code" in ward_cols else None
+            if scope_ward_id_col and scope_ward_code_col:
+                clause, params = _build_in_clause(scope_ward_id_col, allowed_ward_ids, "scope_enrich_ward_id")
+                scope_ward_rows = db.execute(
+                    text(f"SELECT {scope_ward_code_col} AS ward_code FROM public.wards WHERE {clause}"),
+                    params,
+                ).all()
+                allowed_ward_codes = [str(r.ward_code) for r in scope_ward_rows if r.ward_code is not None]
+                if allowed_ward_codes:
+                    enrichments_q = enrichments_q.filter(VoterEnrichment.ward_code.in_(allowed_ward_codes))
+                else:
+                    enrichments_q = enrichments_q.filter(text("1=0"))
+
     if wardId:
         ward_cols = _get_table_columns(db, "public", "wards")
         ward_id_col = "id" if "id" in ward_cols else ("ward_id" if "ward_id" in ward_cols else None)
@@ -1779,7 +1945,13 @@ def volunteer_analysis_enrichment(
         return normalized or None
 
     epics = [_normalize_epic(e.epic) for e in enrichments if _normalize_epic(e.epic)]
-    voter_rows = db.query(Voter).filter(Voter.epic_no.in_(epics)).all() if epics else []
+    voter_rows = (
+        db.query(Voter)
+        .filter(func.upper(func.trim(Voter.epic_no)).in_(epics))
+        .all()
+        if epics
+        else []
+    )
     voter_map = {(_normalize_epic(v.epic_no)): v for v in voter_rows if _normalize_epic(v.epic_no)}
 
     rows: List[Dict[str, Any]] = []
@@ -1799,7 +1971,12 @@ def volunteer_analysis_enrichment(
         ordered["name"] = full_name
         ordered["epicNo"] = payload.get("epicNo")
         ordered["boothNo"] = payload.get("boothNo")
-        ordered["voterSerialNo"] = (voter.sr_no if voter and voter.sr_no is not None else payload.get("newSerialNo"))
+        # Prefer sr_no from Voter table; fall back to enrichment newSerialNo
+        ordered["voterSerialNo"] = (
+            voter.sr_no
+            if voter and voter.sr_no is not None
+            else payload.get("newSerialNo")
+        )
         ordered["lastUpdatedAt"] = enrichment.updated_at.isoformat() if enrichment.updated_at else None
 
         remaining_keys = [
@@ -1825,45 +2002,119 @@ def volunteer_analysis_locations(
     wardId: Optional[int] = None,
 ):
     scope = _resolve_access_scope_ids(db, current)
-    allowed_ward_ids = set(scope.get("allowed_ward_ids") or []) if scope else set()
-    allowed_booth_ids = set(scope.get("allowed_booth_ids") or []) if scope else set()
 
-    q = (
-        db.query(Voter)
-        .join(Booth, Voter.booth_id == Booth.booth_id)
-        .join(Ward, Booth.ward_id == Ward.ward_id)
-        .filter(Voter.latitude.isnot(None), Voter.longitude.isnot(None))
-    )
-    if current.tenantId:
-        q = q.filter(Voter.tenant_id == current.tenantId)
+    allowed_ward_codes: set[str] = set()
+    allowed_booth_nos: set[str] = set()
 
     if scope:
-        filters = []
-        if allowed_booth_ids:
-            filters.append(Booth.booth_id.in_(allowed_booth_ids))
+        allowed_ward_ids = sorted(scope.get("allowed_ward_ids") or [])
+        allowed_booth_ids = sorted(scope.get("allowed_booth_ids") or [])
+
         if allowed_ward_ids:
-            filters.append(Ward.ward_id.in_(allowed_ward_ids))
+            ward_cols = _get_table_columns(db, "public", "wards")
+            ward_id_col = "id" if "id" in ward_cols else ("ward_id" if "ward_id" in ward_cols else None)
+            ward_code_col = "ward_code" if "ward_code" in ward_cols else None
+            if ward_id_col and ward_code_col:
+                clause, params = _build_in_clause(ward_id_col, allowed_ward_ids, "scope_ward_id")
+                rows = db.execute(
+                    text(
+                        f"""
+                        SELECT {ward_code_col} AS ward_code
+                        FROM public.wards
+                        WHERE {clause}
+                        """
+                    ),
+                    params,
+                ).all()
+                allowed_ward_codes.update([str(r.ward_code) for r in rows if r.ward_code is not None])
+
+        if allowed_booth_ids:
+            booth_cols = _get_table_columns(db, "public", "booths")
+            booth_id_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
+            booth_no_col = "booth_no" if "booth_no" in booth_cols else None
+            if booth_id_col and booth_no_col:
+                clause, params = _build_in_clause(booth_id_col, allowed_booth_ids, "scope_booth_id")
+                rows = db.execute(
+                    text(
+                        f"""
+                        SELECT {booth_no_col} AS booth_no
+                        FROM public.booths
+                        WHERE {clause}
+                        """
+                    ),
+                    params,
+                ).all()
+                allowed_booth_nos.update([str(r.booth_no) for r in rows if r.booth_no is not None])
+
+    q = db.query(VoterEnrichment).filter(VoterEnrichment.latitude.isnot(None), VoterEnrichment.longitude.isnot(None))
+    if scope:
+        filters = []
+        if allowed_ward_codes:
+            filters.append(VoterEnrichment.ward_code.in_(allowed_ward_codes))
+        if allowed_booth_nos:
+            filters.append(VoterEnrichment.booth_no.in_(allowed_booth_nos))
         if filters:
             q = q.filter(or_(*filters))
         else:
             q = q.filter(text("1=0"))
 
     if wardId:
-        q = q.filter(Ward.ward_id == wardId)
+        ward_cols = _get_table_columns(db, "public", "wards")
+        ward_id_col = "id" if "id" in ward_cols else ("ward_id" if "ward_id" in ward_cols else None)
+        ward_code_col = "ward_code" if "ward_code" in ward_cols else None
+        if ward_id_col and ward_code_col:
+            row = db.execute(
+                text(
+                    f"""
+                    SELECT {ward_code_col} AS ward_code
+                    FROM public.wards
+                    WHERE {ward_id_col} = :ward_id
+                    LIMIT 1
+                    """
+                ),
+                {"ward_id": wardId},
+            ).first()
+            if row and row.ward_code is not None:
+                q = q.filter(VoterEnrichment.ward_code == str(row.ward_code))
+            else:
+                q = q.filter(text("1=0"))
 
-    voters = q.all()
-    if not voters:
+    enrichments = q.all()
+    if not enrichments:
         return api_success("Volunteer locations fetched", [])
 
-    rows: List[Dict[str, Any]] = [
-        {
-            "latitude": voter.latitude,
-            "longitude": voter.longitude,
-            "gender": voter.gender,
+    epics = [str(e.epic).strip().upper() for e in enrichments if e.epic]
+    voter_gender_map: Dict[str, Optional[str]] = {}
+    if epics:
+        voter_rows = db.query(Voter).filter(Voter.epic_no.in_(epics)).all()
+        voter_gender_map = {
+            str(v.epic_no).strip().upper(): v.gender for v in voter_rows if v.epic_no is not None
         }
-        for voter in voters
-        if voter.latitude is not None and voter.longitude is not None
-    ]
+
+    rows: List[Dict[str, Any]] = []
+    gender_counts = {"male": 0, "female": 0, "other": 0}
+    for enrichment in enrichments:
+        if enrichment.latitude is None or enrichment.longitude is None:
+            continue
+        epic_key = str(enrichment.epic).strip().upper() if enrichment.epic else None
+        gender = enrichment.gender or (voter_gender_map.get(epic_key) if epic_key else None)
+        gender_upper = str(gender or "").upper()
+        if gender_upper.startswith("M"):
+            gender_counts["male"] += 1
+        elif gender_upper.startswith("F"):
+            gender_counts["female"] += 1
+        else:
+            gender_counts["other"] += 1
+        rows.append(
+            {
+                "latitude": enrichment.latitude,
+                "longitude": enrichment.longitude,
+                "gender": gender,
+            }
+        )
+    print(
+        f"[volunteer-map] points={len(rows)} male={gender_counts['male']} female={gender_counts['female']} other={gender_counts['other']}"
+    )
     return api_success("Volunteer locations fetched", rows)
 
 
@@ -2285,6 +2536,56 @@ def get_booths_plural(
             "pollingStationAdrLocal": None,
             "wardId": int(r.ward_id) if r.ward_id is not None else None,
             "tenantId": None,
+            "boothNo": int(r.id) if r.id is not None else None,
+        }
+        for r in rows
+    ]
+
+
+@app.get(f"{CONTEXT_PATH}/api/booths/public")
+def get_public_booths(
+    wardId: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER")),
+):
+    scope = _resolve_access_scope_ids(db, current)
+    booth_cols = _get_table_columns(db, "public", "booths")
+    id_col = "booth_no" if "booth_no" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
+    name_col = "booth_add_en" if "booth_add_en" in booth_cols else ("polling_station_adr_en" if "polling_station_adr_en" in booth_cols else None)
+    ward_ref = "ward_id" if "ward_id" in booth_cols else ("ward_no" if "ward_no" in booth_cols else None)
+    if not id_col or not name_col:
+        return []
+    where = []
+    params: Dict[str, Any] = {}
+    if wardId and ward_ref:
+        where.append(f"{ward_ref} = :ward_id")
+        params["ward_id"] = wardId
+    where_clause = f"WHERE {' AND '.join(where)}" if where else ""
+    rows = db.execute(
+        text(
+            f"""
+            SELECT {id_col} AS booth_no, {name_col} AS booth_name, {ward_ref if ward_ref else 'NULL'} AS ward_id
+            FROM public.booths
+            {where_clause}
+            ORDER BY {id_col}
+            """
+        ),
+        params,
+    ).all()
+    if scope:
+        allowed_booth_ids = scope.get("allowed_booth_ids") or set()
+        allowed_ward_ids = scope.get("allowed_ward_ids") or set()
+        rows = [
+            r
+            for r in rows
+            if (not allowed_booth_ids or int(r.booth_no) in allowed_booth_ids)
+            and (not allowed_ward_ids or (r.ward_id is not None and int(r.ward_id) in allowed_ward_ids))
+        ]
+    return [
+        {
+            "boothNo": int(r.booth_no) if r.booth_no is not None else None,
+            "boothNameEn": r.booth_name,
+            "wardId": int(r.ward_id) if r.ward_id is not None else None,
         }
         for r in rows
     ]
