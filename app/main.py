@@ -12,9 +12,9 @@ from typing import Any, Dict, Iterable, List, Optional
 import boto3
 import jwt
 from botocore.exceptions import NoCredentialsError
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, DateTime, Double, ForeignKey, Integer, String, and_, asc, case, create_engine, desc, func, or_, text
@@ -1245,6 +1245,36 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
         },
     )
 
+import subprocess
+
+@app.get(f"{CONTEXT_PATH}/api/admin/db-dump")
+def admin_db_dump(
+    background_tasks: BackgroundTasks,
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN"))
+):
+    if not DATABASE_URL:
+        raise HTTPException(status_code=500, detail="DATABASE_URL not set")
+    fd, path = tempfile.mkstemp(suffix=".sql")
+    os.close(fd)
+    
+    try:
+        clean_url = DATABASE_URL.replace("postgresql+psycopg2://", "postgresql://")
+        subprocess.run(
+            ["pg_dump", "--dbname", clean_url, "-f", path, "--no-owner", "--no-acl"],
+            check=True
+        )
+    except Exception as e:
+        if os.path.exists(path):
+            os.remove(path)
+        raise HTTPException(status_code=500, detail=f"Database dump failed: {str(e)}")
+        
+    return FileResponse(
+        path=path,
+        media_type="application/sql",
+        filename=f"votabase_dump_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sql",
+        background=BackgroundTask(os.remove, path)
+    )
+
 
 @app.get(f"{CONTEXT_PATH}/api/admin/dashboard")
 def get_dashboard(user: JwtUserDetails = Depends(require_roles("ADMIN"))):
@@ -1824,6 +1854,8 @@ def volunteer_analysis_enrichment(
     wardId: Optional[int] = None,
     updatedFrom: Optional[str] = None,
     updatedTo: Optional[str] = None,
+    page: Optional[int] = None,
+    size: Optional[int] = None,
 ):
     exclude_keys = {
         "firstMiddleNameEn",
@@ -1934,7 +1966,15 @@ def volunteer_analysis_enrichment(
         enrichments_q = enrichments_q.filter(VoterEnrichment.updated_at >= from_dt)
     if to_dt:
         enrichments_q = enrichments_q.filter(VoterEnrichment.updated_at <= to_dt)
-    enrichments = enrichments_q.all()
+    
+    enrichments_q = enrichments_q.order_by(desc(VoterEnrichment.updated_at))
+    if page is not None and size is not None:
+        enrichments = enrichments_q.offset(page * size).limit(size).all()
+        start_idx = (page * size) + 1
+    else:
+        enrichments = enrichments_q.all()
+        start_idx = 1
+        
     if not enrichments:
         return api_success("Volunteer enrichment fetched", [])
 
@@ -1954,17 +1994,49 @@ def volunteer_analysis_enrichment(
     )
     voter_map = {(_normalize_epic(v.epic_no)): v for v in voter_rows if _normalize_epic(v.epic_no)}
 
+    public_voter_map: Dict[str, Dict[str, Any]] = {}
+    if epics:
+        voter_cols = _get_table_columns(db, "public", "voters")
+        epic_col = "epic" if "epic" in voter_cols else ("epic_no" if "epic_no" in voter_cols else None)
+        name_col = "name_en" if "name_en" in voter_cols else ("name" if "name" in voter_cols else None)
+        sl_col = "sl" if "sl" in voter_cols else ("sr_no" if "sr_no" in voter_cols else None)
+        if epic_col and (name_col or sl_col):
+            clause, params = _build_in_clause(f"UPPER(TRIM({epic_col}))", epics, "public_epic")
+            select_cols = [
+                f"{epic_col} AS epic",
+                f"{name_col} AS name_en" if name_col else "NULL AS name_en",
+                f"{sl_col} AS sl" if sl_col else "NULL AS sl",
+            ]
+            public_rows = db.execute(
+                text(
+                    f"""
+                    SELECT {', '.join(select_cols)}
+                    FROM public.voters
+                    WHERE {clause}
+                    """
+                ),
+                params,
+            ).all()
+            public_voter_map = {
+                _normalize_epic(r.epic): {"name_en": r.name_en, "sl": r.sl}
+                for r in public_rows
+                if _normalize_epic(r.epic)
+            }
+
     rows: List[Dict[str, Any]] = []
-    for idx, enrichment in enumerate(enrichments, start=1):
+    for idx, enrichment in enumerate(enrichments, start=start_idx):
         payload = _build_voter_enrichment_payload(enrichment)
         ward_name = ward_name_map.get(str(enrichment.ward_code), None) if enrichment.ward_code is not None else None
         epic_key = _normalize_epic(enrichment.epic) or _normalize_epic(payload.get("epicNo"))
         voter = voter_map.get(epic_key)
+        public_voter = public_voter_map.get(epic_key) if epic_key else None
         name_parts = [
             payload.get("firstMiddleNameEn") or (voter.first_middle_name_en if voter else None),
             payload.get("lastNameEn") or (voter.last_name_en if voter else None),
         ]
         full_name = " ".join([part for part in name_parts if part]).strip() or None
+        if not full_name and public_voter:
+            full_name = normalize_optional_text(public_voter.get("name_en"))
         ordered: Dict[str, Any] = {}
         ordered["serialNumber"] = idx
         ordered["wardName"] = ward_name
@@ -1975,8 +2047,8 @@ def volunteer_analysis_enrichment(
         ordered["voterSerialNo"] = (
             voter.sr_no
             if voter and voter.sr_no is not None
-            else payload.get("newSerialNo")
-        )
+            else (public_voter.get("sl") if public_voter else None)
+        ) or payload.get("newSerialNo")
         ordered["lastUpdatedAt"] = enrichment.updated_at.isoformat() if enrichment.updated_at else None
 
         remaining_keys = [
