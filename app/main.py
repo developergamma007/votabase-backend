@@ -187,6 +187,10 @@ class Booth(Base):
     tenant_id: Mapped[str] = mapped_column(String(20))
     polling_station_adr_en: Mapped[Optional[str]] = mapped_column(String(255))
     polling_station_adr_local: Mapped[Optional[str]] = mapped_column(String(255))
+    booth_no: Mapped[Optional[str]] = mapped_column(String(20))
+    ward_code: Mapped[Optional[str]] = mapped_column(String(20))
+    booth_add_en: Mapped[Optional[str]] = mapped_column(String)
+    booth_add_local: Mapped[Optional[str]] = mapped_column(String)
 
 
 class Association(Base):
@@ -250,8 +254,14 @@ class Family(Base):
 
     familyId: Mapped[int] = mapped_column("family_id", Integer, primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(20))
-    family_name: Mapped[str] = mapped_column(String(30))
+    family_name: Mapped[str] = mapped_column(String(255))
     family_address: Mapped[Optional[str]] = mapped_column(String(555))
+    building_name: Mapped[Optional[str]] = mapped_column(String(255))
+    building_address: Mapped[Optional[str]] = mapped_column(String(555))
+    has_association: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
+    association_name: Mapped[Optional[str]] = mapped_column(String(255))
+    association_head_name: Mapped[Optional[str]] = mapped_column(String(255))
+    association_head_phone: Mapped[Optional[str]] = mapped_column(String(30))
     head_voter_id: Mapped[Optional[int]] = mapped_column(ForeignKey("data.family_members.member_id"))
     phone: Mapped[Optional[str]] = mapped_column(String(15))
     points: Mapped[Optional[int]] = mapped_column(Integer)
@@ -357,6 +367,31 @@ class VoterEnrichment(Base):
     updated_by: Mapped[Optional[int]] = mapped_column(ForeignKey("metastore.users.id"))
     updated_by_name: Mapped[Optional[str]] = mapped_column(String(255))
     updated_by_phone: Mapped[Optional[str]] = mapped_column(String(50))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class MessageTemplate(Base):
+    __tablename__ = "message_templates"
+    __table_args__ = {"schema": "metastore"}
+
+    template_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[Optional[str]] = mapped_column(String(20))
+    ward_id: Mapped[Optional[int]] = mapped_column(Integer)
+    channel: Mapped[str] = mapped_column(String(20), default="WHATSAPP")
+    authority_name: Mapped[Optional[str]] = mapped_column(String(255))
+    election_name: Mapped[Optional[str]] = mapped_column(String(255))
+    assembly_label: Mapped[Optional[str]] = mapped_column(String(255))
+    ward_label: Mapped[Optional[str]] = mapped_column(String(255))
+    candidate_name: Mapped[Optional[str]] = mapped_column(String(255))
+    candidate_party: Mapped[Optional[str]] = mapped_column(String(255))
+    candidate_ward_label: Mapped[Optional[str]] = mapped_column(String(255))
+    vote_date: Mapped[Optional[str]] = mapped_column(String(50))
+    vote_time: Mapped[Optional[str]] = mapped_column(String(50))
+    social_link: Mapped[Optional[str]] = mapped_column(String(255))
+    booth_location_link: Mapped[Optional[str]] = mapped_column(String(255))
+    banner_url: Mapped[Optional[str]] = mapped_column(String(500))
+    enabled: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -608,6 +643,12 @@ class CreateAssociationRequest(BaseModel):
 class CreateFamilyRequest(BaseModel):
     familyName: str
     familyAddress: Optional[str] = None
+    buildingName: Optional[str] = None
+    buildingAddress: Optional[str] = None
+    hasAssociation: Optional[bool] = None
+    associationName: Optional[str] = None
+    associationHeadName: Optional[str] = None
+    associationHeadPhone: Optional[str] = None
     phone: Optional[str] = None
     points: Optional[int] = None
     pointsProvided: Optional[int] = None
@@ -623,6 +664,24 @@ class CreateFamilyRequest(BaseModel):
 
 class UpdateFamilyRequest(CreateFamilyRequest):
     pass
+
+
+class MessageTemplatePayload(BaseModel):
+    wardId: Optional[int] = None
+    channel: str = "WHATSAPP"
+    authorityName: Optional[str] = None
+    electionName: Optional[str] = None
+    assemblyLabel: Optional[str] = None
+    wardLabel: Optional[str] = None
+    candidateName: Optional[str] = None
+    candidateParty: Optional[str] = None
+    candidateWardLabel: Optional[str] = None
+    voteDate: Optional[str] = None
+    voteTime: Optional[str] = None
+    socialLink: Optional[str] = None
+    boothLocationLink: Optional[str] = None
+    bannerUrl: Optional[str] = None
+    enabled: Optional[bool] = None
 
 
 class UserProfileDto(BaseModel):
@@ -1132,6 +1191,7 @@ def startup_seed_super_admin() -> None:
 def startup_ensure_voter_enrichment() -> None:
     VoterEnrichment.__table__.create(bind=engine, checkfirst=True)
     VolunteerUser.__table__.create(bind=engine, checkfirst=True)
+    MessageTemplate.__table__.create(bind=engine, checkfirst=True)
     db = SessionLocal()
     try:
         enrichment_cols = {
@@ -1173,6 +1233,76 @@ def startup_ensure_voter_enrichment() -> None:
             db.execute(text("ALTER TABLE metastore.volunteer_users ADD COLUMN ward_ids text"))
         if "booth_ids" not in existing_cols:
             db.execute(text("ALTER TABLE metastore.volunteer_users ADD COLUMN booth_ids text"))
+
+        template_cols = {
+            row[0]
+            for row in db.execute(
+                text(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'metastore'
+                      AND table_name = 'message_templates'
+                    """
+                )
+            ).all()
+        }
+        if "authority_name" not in template_cols:
+            db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN authority_name varchar(255)"))
+        if "election_name" not in template_cols:
+            db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN election_name varchar(255)"))
+        if "assembly_label" not in template_cols:
+            db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN assembly_label varchar(255)"))
+        if "ward_label" not in template_cols:
+            db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN ward_label varchar(255)"))
+        if "candidate_name" not in template_cols:
+            db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN candidate_name varchar(255)"))
+        if "candidate_party" not in template_cols:
+            db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN candidate_party varchar(255)"))
+        if "candidate_ward_label" not in template_cols:
+            db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN candidate_ward_label varchar(255)"))
+        if "vote_date" not in template_cols:
+            db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN vote_date varchar(50)"))
+        if "vote_time" not in template_cols:
+            db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN vote_time varchar(50)"))
+        if "social_link" not in template_cols:
+            db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN social_link varchar(255)"))
+        if "booth_location_link" not in template_cols:
+            db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN booth_location_link varchar(255)"))
+        if "banner_url" not in template_cols:
+            db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN banner_url varchar(500)"))
+        if "enabled" not in template_cols:
+            db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN enabled boolean DEFAULT FALSE"))
+        if "created_at" not in template_cols:
+            db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN created_at timestamp DEFAULT now()"))
+        if "updated_at" not in template_cols:
+            db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN updated_at timestamp DEFAULT now()"))
+
+        family_cols = {
+            row[0]
+            for row in db.execute(
+                text(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'data'
+                      AND table_name = 'family'
+                    """
+                )
+            ).all()
+        }
+        if "building_name" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN building_name varchar(255)"))
+        if "building_address" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN building_address varchar(555)"))
+        if "has_association" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN has_association boolean DEFAULT FALSE"))
+        if "association_name" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN association_name varchar(255)"))
+        if "association_head_name" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN association_head_name varchar(255)"))
+        if "association_head_phone" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN association_head_phone varchar(30)"))
 
         col = db.execute(
             text(
@@ -3588,6 +3718,12 @@ def _family_to_dto(db: Session, fam: Family) -> Dict[str, Any]:
         "tenantId": fam.tenant_id,
         "familyName": fam.family_name,
         "familyAddress": fam.family_address,
+        "buildingName": fam.building_name,
+        "buildingAddress": fam.building_address,
+        "hasAssociation": fam.has_association,
+        "associationName": fam.association_name,
+        "associationHeadName": fam.association_head_name,
+        "associationHeadPhone": fam.association_head_phone,
         "phone": fam.phone,
         "points": fam.points,
         "pointsProvided": fam.points_provided,
@@ -3602,9 +3738,105 @@ def _family_to_dto(db: Session, fam: Family) -> Dict[str, Any]:
     }
 
 
+def _bootstrap_booth(db: Session, booth_id: int, tenant_id: str):
+    # Check if booth exists in data.booths
+    booth = db.query(Booth).filter(Booth.booth_id == booth_id).first()
+    if booth:
+        return booth
+
+    # Try to find in public.booths
+    res = db.execute(text("SELECT * FROM public.booths WHERE id = :bid"), {"bid": booth_id}).first()
+    if not res:
+        return None
+
+    # Try to find ward info in public.wards
+    ward_info = db.execute(text("SELECT id, assembly_no, ward_name_en, ward_name_local FROM public.wards WHERE ward_code = :wc"), {"wc": res.ward_code}).first()
+    assembly_id = ward_info.assembly_no if ward_info and ward_info.assembly_no else 1
+    ward_id = ward_info.id if ward_info else res.ward_id
+
+    # Assembly
+    assembly = db.query(Assembly).filter(Assembly.assembly_id == assembly_id).first()
+    if not assembly:
+        assembly = Assembly(
+            assembly_id=assembly_id, # Explicit ID
+            tenant_id=tenant_id,
+            assembly_name_en=f"Assembly {assembly_id}",
+            assembly_code=str(assembly_id)
+        )
+        db.add(assembly)
+        db.flush()
+
+    # Ward
+    ward = db.query(Ward).filter(Ward.ward_id == ward_id).first()
+    if not ward:
+        ward = Ward(
+            ward_id=ward_id, # Explicit ID
+            assembly_id=assembly.assembly_id,
+            tenant_id=tenant_id,
+            ward_name_en=ward_info.ward_name_en if ward_info else res.ward_code,
+            ward_name_local=ward_info.ward_name_local if ward_info else None,
+            ward_code=res.ward_code
+        )
+        db.add(ward)
+        db.flush()
+
+    # Create Booth in data schema
+    booth = Booth(
+        booth_id=res.id, # Explicit ID
+        ward_id=ward.ward_id,
+        tenant_id=tenant_id,
+        polling_station_adr_en=getattr(res, 'booth_add_en', ''),
+        polling_station_adr_local=getattr(res, 'booth_add_local', ''),
+        booth_no=res.booth_no,
+        ward_code=res.ward_code
+    )
+    db.add(booth)
+    db.flush()
+    return booth
+
+def _bootstrap_voter(db: Session, epic: str, booth: Booth, tenant_id: str):
+    # Check in data.voters
+    voters = db.query(Voter).filter(Voter.epic_no == epic, Voter.tenant_id == tenant_id).first()
+    if voters:
+        return voters
+
+    # Find in public.voters
+    res = db.execute(text("SELECT * FROM public.voters WHERE epic = :epic"), {"epic": epic}).first()
+    if not res:
+        return None
+
+    # Generate a voter_id since data.voters has no serial
+    next_id = db.execute(text("SELECT COALESCE(MAX(voter_id), 0) + 1 FROM data.voters")).scalar()
+
+    # Create Voter in data schema
+    v = Voter(
+        voter_id=next_id, # Explicit ID
+        tenant_id=tenant_id,
+        booth_id=booth.booth_id,
+        epic_no=res.epic,
+        sr_no=int(res.sl) if res.sl and res.sl.isdigit() else 0,
+        first_middle_name_en=res.name_en,
+        gender=res.gender,
+        age=int(res.age) if res.age and res.age.isdigit() else 0,
+        house_no_en=res.house,
+        mobile=res.mobile
+    )
+    db.add(v)
+    db.flush()
+    return v
+
+
 @app.post(f"{CONTEXT_PATH}/api/family")
-def create_family(payload: CreateFamilyRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN", "USER"))):
-    booth = db.query(Booth).filter(Booth.booth_id == payload.boothId).first()
+def create_family(payload: CreateFamilyRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "USER"))):
+    tenant_id = current.tenantId
+    # If admin/superadmin with no tenant, we need to infer it or use booth tenant
+    # But since bootstrap needs a tenant, we'll try to find one from existing data or use a default "T1"
+    if not tenant_id:
+        # Fallback to a default tenant if none exists in current user
+        # In a real system, you'd pick the relevant tenant for the booth.
+        tenant_id = "T1" 
+
+    booth = _bootstrap_booth(db, payload.boothId, tenant_id)
     if not booth:
         raise ValueError("Invalid booth")
 
@@ -3617,6 +3849,12 @@ def create_family(payload: CreateFamilyRequest, db: Session = Depends(get_db), c
     fam = Family(
         family_name=payload.familyName,
         family_address=payload.familyAddress,
+        building_name=payload.buildingName,
+        building_address=payload.buildingAddress,
+        has_association=payload.hasAssociation,
+        association_name=payload.associationName,
+        association_head_name=payload.associationHeadName,
+        association_head_phone=payload.associationHeadPhone,
         phone=payload.phone,
         points=payload.points,
         points_provided=payload.pointsProvided,
@@ -3624,7 +3862,7 @@ def create_family(payload: CreateFamilyRequest, db: Session = Depends(get_db), c
         longitude=payload.longitude,
         economic_status=payload.economicStatus,
         family_nature=payload.familyNature,
-        tenant_id=current.tenantId,
+        tenant_id=current.tenantId or booth.tenant_id,
         booth_id=booth.booth_id,
         association_id=association.association_id if association else None,
         deleted=False,
@@ -3634,7 +3872,9 @@ def create_family(payload: CreateFamilyRequest, db: Session = Depends(get_db), c
 
     head_member_id = None
     for epic in payload.memberEpicNos:
-        voter = db.query(Voter).filter(Voter.epic_no == epic, Voter.tenant_id == current.tenantId).first()
+        # Ensure voter exists in data schema
+        voter = _bootstrap_voter(db, epic, booth, tenant_id)
+        
         if not voter:
             raise ValueError(f"Voter not found: {epic}")
 
@@ -3654,13 +3894,19 @@ def create_family(payload: CreateFamilyRequest, db: Session = Depends(get_db), c
 
 
 @app.put(f"{CONTEXT_PATH}/api/family/{{familyId}}")
-def update_family(familyId: int, payload: UpdateFamilyRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN", "USER"))):
+def update_family(familyId: int, payload: UpdateFamilyRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "USER"))):
     fam = db.query(Family).filter(Family.familyId == familyId).first()
     if not fam:
         raise ValueError(f"Family not found: {familyId}")
 
     fam.family_name = payload.familyName
     fam.family_address = payload.familyAddress
+    fam.building_name = payload.buildingName
+    fam.building_address = payload.buildingAddress
+    fam.has_association = payload.hasAssociation
+    fam.association_name = payload.associationName
+    fam.association_head_name = payload.associationHeadName
+    fam.association_head_phone = payload.associationHeadPhone
     fam.phone = payload.phone
     fam.points = payload.points
     fam.points_provided = payload.pointsProvided
@@ -3695,7 +3941,7 @@ def update_family(familyId: int, payload: UpdateFamilyRequest, db: Session = Dep
 
     for epic in payload.memberEpicNos:
         if epic not in existing_epic:
-            voter = db.query(Voter).filter(Voter.epic_no == epic, Voter.tenant_id == current.tenantId).first()
+            voter = _bootstrap_voter(db, epic, booth, fam.tenant_id)
             if not voter:
                 raise ValueError(f"Voter not found: {epic}")
             member = FamilyMember(family_id=fam.familyId, voter_id=voter.voter_id, is_head=(epic == payload.headEpicNo))
@@ -3728,7 +3974,7 @@ def list_families(
     search: Optional[str] = None,
     association: Optional[str] = None,
     db: Session = Depends(get_db),
-    current: JwtUserDetails = Depends(require_roles("ADMIN", "USER")),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "USER")),
 ):
     q = db.query(Family).filter(Family.tenant_id == current.tenantId, Family.booth_id == boothId, Family.deleted.is_(False))
 
@@ -3758,6 +4004,146 @@ def list_families(
     total = q.count()
     families = q.offset(page * size).limit(size).all()
     return build_page([_family_to_dto(db, f) for f in families], page, size, total)
+
+
+@app.get(f"{CONTEXT_PATH}/api/family/suggestions")
+def family_suggestions(
+    type: str = Query(..., min_length=1),
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "USER")),
+):
+    field = normalize_optional_text(type).lower()
+    if field == "building":
+        q = db.query(Family.building_name).filter(Family.building_name.isnot(None), Family.deleted.is_(False))
+        if current.tenantId:
+            q = q.filter(Family.tenant_id == current.tenantId)
+        results = q.distinct().limit(100).all()
+        return api_success("Suggestions fetched", [r[0] for r in results if r[0]])
+
+    elif field == "association":
+        # From Families
+        q_fam = db.query(Family.association_name).filter(Family.association_name.isnot(None), Family.deleted.is_(False))
+        if current.tenantId:
+            q_fam = q_fam.filter(Family.tenant_id == current.tenantId)
+        
+        # From Associations table
+        q_assoc = db.query(Association.association_name)
+        if current.tenantId:
+            q_assoc = q_assoc.filter(Association.tenant_id == current.tenantId)
+            
+        final_names = set()
+        for r in q_fam.distinct().all():
+            if r[0]: final_names.add(r[0])
+        for r in q_assoc.distinct().all():
+            if r[0]: final_names.add(r[0])
+            
+        return api_success("Suggestions fetched", sorted(list(final_names))[:100])
+    
+    return api_success("Suggestions fetched", [])
+
+
+def _template_to_dto(tpl: MessageTemplate) -> Dict[str, Any]:
+    return {
+        "templateId": tpl.template_id,
+        "tenantId": tpl.tenant_id,
+        "wardId": tpl.ward_id,
+        "channel": tpl.channel,
+        "authorityName": tpl.authority_name,
+        "electionName": tpl.election_name,
+        "assemblyLabel": tpl.assembly_label,
+        "wardLabel": tpl.ward_label,
+        "candidateName": tpl.candidate_name,
+        "candidateParty": tpl.candidate_party,
+        "candidateWardLabel": tpl.candidate_ward_label,
+        "voteDate": tpl.vote_date,
+        "voteTime": tpl.vote_time,
+        "socialLink": tpl.social_link,
+        "boothLocationLink": tpl.booth_location_link,
+        "bannerUrl": tpl.banner_url,
+        "enabled": bool(tpl.enabled),
+        "updatedAt": tpl.updated_at.isoformat() if tpl.updated_at else None,
+    }
+
+
+@app.get(f"{CONTEXT_PATH}/api/message-template")
+def get_message_template(
+    wardId: Optional[int] = None,
+    channel: str = "WHATSAPP",
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER")),
+):
+    q = db.query(MessageTemplate).filter(MessageTemplate.tenant_id == current.tenantId)
+    if wardId is not None:
+        q = q.filter(MessageTemplate.ward_id == wardId)
+    q = q.filter(MessageTemplate.channel == channel.upper())
+    tpl = q.first()
+    return api_success("Message template fetched", _template_to_dto(tpl) if tpl else None)
+
+
+@app.put(f"{CONTEXT_PATH}/api/message-template")
+def save_message_template(
+    payload: MessageTemplatePayload,
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN")),
+):
+    ward_id = payload.wardId
+    channel = (payload.channel or "WHATSAPP").upper()
+    q = db.query(MessageTemplate).filter(
+        MessageTemplate.tenant_id == current.tenantId,
+        MessageTemplate.ward_id == ward_id,
+        MessageTemplate.channel == channel,
+    )
+    tpl = q.first()
+    if not tpl:
+        tpl = MessageTemplate(tenant_id=current.tenantId, ward_id=ward_id, channel=channel)
+        db.add(tpl)
+    tpl.authority_name = payload.authorityName
+    tpl.election_name = payload.electionName
+    tpl.assembly_label = payload.assemblyLabel
+    tpl.ward_label = payload.wardLabel
+    tpl.candidate_name = payload.candidateName
+    tpl.candidate_party = payload.candidateParty
+    tpl.candidate_ward_label = payload.candidateWardLabel
+    tpl.vote_date = payload.voteDate
+    tpl.vote_time = payload.voteTime
+    tpl.social_link = payload.socialLink
+    tpl.booth_location_link = payload.boothLocationLink
+    if payload.bannerUrl:
+        tpl.banner_url = payload.bannerUrl
+    if payload.enabled is not None:
+        tpl.enabled = payload.enabled
+    tpl.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(tpl)
+    return api_success("Message template saved", _template_to_dto(tpl))
+
+
+@app.post(f"{CONTEXT_PATH}/api/message-template/banner")
+def upload_message_template_banner(
+    wardId: int,
+    channel: str = "WHATSAPP",
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN")),
+):
+    raw = file.file.read()
+    ext = Path(file.filename or "").suffix or ".jpg"
+    key = f"message_banners/{current.tenantId}/{wardId}/{uuid.uuid4().hex}{ext}"
+    url = s3_upload_bytes(raw, file.content_type or "application/octet-stream", key)
+    channel = channel.upper()
+    tpl = (
+        db.query(MessageTemplate)
+        .filter(MessageTemplate.tenant_id == current.tenantId, MessageTemplate.ward_id == wardId, MessageTemplate.channel == channel)
+        .first()
+    )
+    if not tpl:
+        tpl = MessageTemplate(tenant_id=current.tenantId, ward_id=wardId, channel=channel)
+        db.add(tpl)
+    tpl.banner_url = url
+    tpl.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(tpl)
+    return api_success("Banner uploaded", _template_to_dto(tpl))
 
 
 @app.get(f"{CONTEXT_PATH}/api/family/{{id}}")
