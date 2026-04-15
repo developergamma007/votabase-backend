@@ -391,6 +391,7 @@ class MessageTemplate(Base):
     social_link: Mapped[Optional[str]] = mapped_column(String(255))
     booth_location_link: Mapped[Optional[str]] = mapped_column(String(255))
     banner_url: Mapped[Optional[str]] = mapped_column(String(500))
+    show_logo: Mapped[Optional[bool]] = mapped_column(Boolean, default=True)
     enabled: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -681,6 +682,7 @@ class MessageTemplatePayload(BaseModel):
     socialLink: Optional[str] = None
     boothLocationLink: Optional[str] = None
     bannerUrl: Optional[str] = None
+    showLogo: Optional[bool] = None
     enabled: Optional[bool] = None
 
 
@@ -1271,6 +1273,8 @@ def startup_ensure_voter_enrichment() -> None:
             db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN booth_location_link varchar(255)"))
         if "banner_url" not in template_cols:
             db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN banner_url varchar(500)"))
+        if "show_logo" not in template_cols:
+            db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN show_logo boolean DEFAULT TRUE"))
         if "enabled" not in template_cols:
             db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN enabled boolean DEFAULT FALSE"))
         if "created_at" not in template_cols:
@@ -4060,6 +4064,7 @@ def _template_to_dto(tpl: MessageTemplate) -> Dict[str, Any]:
         "socialLink": tpl.social_link,
         "boothLocationLink": tpl.booth_location_link,
         "bannerUrl": tpl.banner_url,
+        "showLogo": bool(tpl.show_logo) if tpl.show_logo is not None else True,
         "enabled": bool(tpl.enabled),
         "updatedAt": tpl.updated_at.isoformat() if tpl.updated_at else None,
     }
@@ -4072,11 +4077,14 @@ def get_message_template(
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER")),
 ):
+    channel = channel.upper()
     q = db.query(MessageTemplate).filter(MessageTemplate.tenant_id == current.tenantId)
-    if wardId is not None:
-        q = q.filter(MessageTemplate.ward_id == wardId)
-    q = q.filter(MessageTemplate.channel == channel.upper())
-    tpl = q.first()
+    if wardId is not None and wardId != "":
+        q = q.filter(MessageTemplate.ward_id == int(wardId))
+    else:
+        q = q.filter(MessageTemplate.ward_id.is_(None))
+    
+    tpl = q.filter(MessageTemplate.channel == channel).first()
     return api_success("Message template fetched", _template_to_dto(tpl) if tpl else None)
 
 
@@ -4110,6 +4118,8 @@ def save_message_template(
     tpl.booth_location_link = payload.boothLocationLink
     if payload.bannerUrl:
         tpl.banner_url = payload.bannerUrl
+    if payload.showLogo is not None:
+        tpl.show_logo = payload.showLogo
     if payload.enabled is not None:
         tpl.enabled = payload.enabled
     tpl.updated_at = datetime.utcnow()
@@ -4120,7 +4130,7 @@ def save_message_template(
 
 @app.post(f"{CONTEXT_PATH}/api/message-template/banner")
 def upload_message_template_banner(
-    wardId: int,
+    wardId: Optional[int] = Query(None),
     channel: str = "WHATSAPP",
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
@@ -4131,13 +4141,15 @@ def upload_message_template_banner(
     key = f"message_banners/{current.tenantId}/{wardId}/{uuid.uuid4().hex}{ext}"
     url = s3_upload_bytes(raw, file.content_type or "application/octet-stream", key)
     channel = channel.upper()
-    tpl = (
-        db.query(MessageTemplate)
-        .filter(MessageTemplate.tenant_id == current.tenantId, MessageTemplate.ward_id == wardId, MessageTemplate.channel == channel)
-        .first()
-    )
+    q = db.query(MessageTemplate).filter(MessageTemplate.tenant_id == current.tenantId, MessageTemplate.channel == channel)
+    if wardId is not None and wardId != "":
+        q = q.filter(MessageTemplate.ward_id == int(wardId))
+    else:
+        q = q.filter(MessageTemplate.ward_id.is_(None))
+    
+    tpl = q.first()
     if not tpl:
-        tpl = MessageTemplate(tenant_id=current.tenantId, ward_id=wardId, channel=channel)
+        tpl = MessageTemplate(tenant_id=current.tenantId, ward_id=wardId if wardId else None, channel=channel)
         db.add(tpl)
     tpl.banner_url = url
     tpl.updated_at = datetime.utcnow()
