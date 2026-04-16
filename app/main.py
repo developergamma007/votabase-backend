@@ -17,8 +17,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field
-from sqlalchemy import Boolean, DateTime, Double, ForeignKey, Integer, String, and_, asc, case, create_engine, desc, func, or_, text
+from sqlalchemy import Boolean, DateTime, Double, ForeignKey, Integer, String, and_, asc, case, create_engine, desc, func, or_, text, not_
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+import subprocess
+import shutil
 
 from app.extract import router as extract_router
 
@@ -285,6 +287,34 @@ class FamilyMember(Base):
     is_head: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class Meeting(Base):
+    __tablename__ = "meetings"
+    __table_args__ = {"schema": "data"}
+
+    meeting_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(20))
+    title: Mapped[str] = mapped_column(String(255))
+    start_time: Mapped[Optional[str]] = mapped_column(String(50))
+    end_time: Mapped[Optional[str]] = mapped_column(String(50))
+    latitude: Mapped[Optional[float]] = mapped_column(Double)
+    longitude: Mapped[Optional[float]] = mapped_column(Double)
+    radius: Mapped[Optional[int]] = mapped_column(Integer)
+    recipients: Mapped[Optional[str]] = mapped_column(String(555))
+    channels: Mapped[Optional[str]] = mapped_column(String(255))
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=func.now())
+
+
+class MeetingAttendance(Base):
+    __tablename__ = "meeting_attendance"
+    __table_args__ = {"schema": "data"}
+
+    attendance_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    meeting_id: Mapped[int] = mapped_column(ForeignKey("data.meetings.meeting_id"))
+    voter_id: Mapped[int] = mapped_column(ForeignKey("data.voters.voter_id"))
+    distance: Mapped[Optional[float]] = mapped_column(Double)
+    attended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=func.now())
+
+
 class VoterSnapshot(Base):
     __tablename__ = "voter_snapshot"
     __table_args__ = {"schema": "snapshot"}
@@ -540,8 +570,7 @@ def _auth_user(request: Request, db: Session) -> JwtUserDetails:
 
     target = user or volunteer
     if target and (target.blocked or target.deleted):
-        reason = "blocked" if target.blocked else "deleted"
-        raise HTTPException(status_code=403, detail=f"User is {reason}")
+        raise HTTPException(status_code=403, detail="Please contact Admin")
 
     return JwtUserDetails(
         phone=payload.get("phone"),
@@ -572,6 +601,16 @@ def require_roles(*roles: str):
 # ---------------------------
 # Schemas
 # ---------------------------
+class MeetingCreateRequest(BaseModel):
+    title: str
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    radius: Optional[int] = None
+    recipients: Optional[str] = None
+    channels: Optional[str] = None
+
 class LoginRequest(BaseModel):
     firstName: str
     phone: str
@@ -800,7 +839,7 @@ def _parse_id_list(raw: Optional[str]) -> List[int]:
 
 def _get_access_scope(db: Session, current: JwtUserDetails) -> Optional[Dict[str, Any]]:
     role = (current.role or "").replace("ROLE_", "")
-    if role in {"SUPER_ADMIN", "ADMIN"}:
+    if role == "SUPER_ADMIN":
         return None
 
     volunteer = (
@@ -1361,8 +1400,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
         assignment_id = user.assignment_id
     elif volunteer:
         if volunteer.blocked or volunteer.deleted:
-            reason = "blocked" if volunteer.blocked else "deleted"
-            raise HTTPException(status_code=403, detail=f"User is {reason}")
+            raise HTTPException(status_code=403, detail="Please contact Admin")
         tenant_id = volunteer.tenant_id
         assignment_type = volunteer.assignment_type
         assignment_id = volunteer.assignment_id
@@ -1379,8 +1417,6 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
         },
     )
 
-import subprocess
-
 @app.get(f"{CONTEXT_PATH}/api/admin/db-dump")
 def admin_db_dump(
     background_tasks: BackgroundTasks,
@@ -1393,8 +1429,16 @@ def admin_db_dump(
     
     try:
         clean_url = DATABASE_URL.replace("postgresql+psycopg2://", "postgresql://")
+        # Try to find pg_dump in common paths if not in PATH
+        pg_dump_path = "pg_dump"
+        if not shutil.which("pg_dump"):
+            for p in ["/opt/homebrew/bin/pg_dump", "/usr/local/bin/pg_dump", "/usr/bin/pg_dump"]:
+                if os.path.exists(p):
+                    pg_dump_path = p
+                    break
+        
         subprocess.run(
-            ["pg_dump", "--dbname", clean_url, "-f", path, "--no-owner", "--no-acl"],
+            [pg_dump_path, "--dbname", clean_url, "-f", path, "--no-owner", "--no-acl"],
             check=True
         )
     except Exception as e:
@@ -1641,7 +1685,7 @@ def list_volunteers(
 
     if ward_ids_all:
         ward_q = db.query(Ward.ward_id, Ward.ward_name_en)
-        if current.tenantId is not None:
+        if current.tenantId is not None and current.role != "SUPER_ADMIN":
             ward_q = ward_q.filter(Ward.tenant_id == current.tenantId)
         ward_rows = ward_q.filter(Ward.ward_id.in_(list(ward_ids_all))).all()
         ward_name_map = {row.ward_id: row.ward_name_en or f"Ward {row.ward_id}" for row in ward_rows}
@@ -1678,7 +1722,7 @@ def list_volunteers(
 
     if booth_ids_all:
         booth_q = db.query(Booth.booth_id, Booth.polling_station_adr_en)
-        if current.tenantId is not None:
+        if current.tenantId is not None and current.role != "SUPER_ADMIN":
             booth_q = booth_q.filter(Booth.tenant_id == current.tenantId)
         booth_rows = booth_q.filter(Booth.booth_id.in_(list(booth_ids_all))).all()
         booth_name_map = {row.booth_id: row.polling_station_adr_en or f"Booth {row.booth_id}" for row in booth_rows}
@@ -1781,6 +1825,8 @@ def volunteer_analysis(
                 allowed_booth_nos.update([str(r.booth_no) for r in rows if r.booth_no is not None])
 
     q = db.query(VoterEnrichment).filter(VoterEnrichment.updated_by.isnot(None))
+    # Filter out admin entries from analysis
+    q = q.filter(not_(VoterEnrichment.updated_by_name.in_(["admin@iswot.in", "admin@iswot.io"])))
     if scope:
         filters = []
         if allowed_ward_codes:
@@ -2037,7 +2083,7 @@ def volunteer_analysis_enrichment(
             str(r.ward_code): str(r.ward_name) for r in ward_rows if r.ward_code is not None and r.ward_name is not None
         }
 
-    enrichments_q = db.query(VoterEnrichment)
+    enrichments_q = db.query(VoterEnrichment).filter(not_(VoterEnrichment.updated_by_name.in_(["admin@iswot.in", "admin@iswot.io"])))
 
     # For non-super-admin users, scope to their allowed ward codes
     scope = _resolve_access_scope_ids(db, current)
@@ -2357,7 +2403,10 @@ def list_users(
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("ADMIN")),
 ):
-    q = db.query(VolunteerUser).filter(VolunteerUser.role == "USER", VolunteerUser.tenant_id == current.tenantId)
+    # For non-super-admins, filter user list by their tenant
+    q = db.query(VolunteerUser).filter(VolunteerUser.role == "USER")
+    if current.tenantId is not None and current.role != "SUPER_ADMIN":
+        q = q.filter(VolunteerUser.tenant_id == current.tenantId)
 
     blocked_filter = parse_optional_bool(blocked)
     deleted_filter = parse_optional_bool(deleted)
@@ -2399,7 +2448,7 @@ def delete_user(payload: UserDeleteRequest, db: Session = Depends(get_db), curre
         raise ValueError("firstName or userEmail is required")
 
     q = db.query(VolunteerUser).filter(VolunteerUser.first_name == target_first_name)
-    if current.tenantId:
+    if current.tenantId is not None and current.role != "SUPER_ADMIN":
         q = q.filter(VolunteerUser.tenant_id == current.tenantId)
     user = q.first()
     if not user:
@@ -2415,7 +2464,7 @@ def delete_user(payload: UserDeleteRequest, db: Session = Depends(get_db), curre
 def bulk_block(payload: UserBulkActionRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD"))):
     usernames = resolve_bulk_usernames(payload)
     q = db.query(VolunteerUser).filter(VolunteerUser.first_name.in_(usernames))
-    if current.tenantId:
+    if current.tenantId is not None and current.role != "SUPER_ADMIN":
         q = q.filter(VolunteerUser.tenant_id == current.tenantId)
     users = q.all()
     if len(users) != len(usernames):
@@ -2432,7 +2481,7 @@ def bulk_block(payload: UserBulkActionRequest, db: Session = Depends(get_db), cu
 def bulk_delete(payload: UserBulkActionRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD"))):
     usernames = resolve_bulk_usernames(payload)
     q = db.query(VolunteerUser).filter(VolunteerUser.first_name.in_(usernames))
-    if current.tenantId:
+    if current.tenantId is not None and current.role != "SUPER_ADMIN":
         q = q.filter(VolunteerUser.tenant_id == current.tenantId)
     users = q.all()
     if len(users) != len(usernames):
@@ -2590,7 +2639,7 @@ def get_assignments(type: str = Query(...), db: Session = Depends(get_db), curre
     t = type.upper()
     if t == "ASSEMBLY":
         q = db.query(Assembly)
-        if current.tenantId is not None:
+        if current.tenantId is not None and current.role != "SUPER_ADMIN":
             q = q.filter(Assembly.tenant_id == current.tenantId)
         if scope and scope.get("allowed_assembly_ids"):
             q = q.filter(Assembly.assembly_id.in_(scope.get("allowed_assembly_ids")))
@@ -2598,7 +2647,7 @@ def get_assignments(type: str = Query(...), db: Session = Depends(get_db), curre
         return [{"id": r.assembly_id, "name": r.assembly_name_en} for r in rows]
     if t == "WARD":
         q = db.query(Ward)
-        if current.tenantId is not None:
+        if current.tenantId is not None and current.role != "SUPER_ADMIN":
             q = q.filter(Ward.tenant_id == current.tenantId)
         if scope and scope.get("allowed_ward_ids"):
             q = q.filter(Ward.ward_id.in_(scope.get("allowed_ward_ids")))
@@ -2606,7 +2655,7 @@ def get_assignments(type: str = Query(...), db: Session = Depends(get_db), curre
         return [{"id": r.ward_id, "name": r.ward_name_en} for r in rows]
     if t == "BOOTH":
         q = db.query(Booth)
-        if current.tenantId is not None:
+        if current.tenantId is not None and current.role != "SUPER_ADMIN":
             q = q.filter(Booth.tenant_id == current.tenantId)
         if scope and scope.get("allowed_booth_ids"):
             q = q.filter(Booth.booth_id.in_(scope.get("allowed_booth_ids")))
@@ -2674,7 +2723,9 @@ def get_booths_plural(
         .join(Ward, Booth.ward_id == Ward.ward_id)
         .join(Assembly, Ward.assembly_id == Assembly.assembly_id)
     )
-    if current.tenantId is not None:
+    if wardId:
+        q = q.filter(Booth.ward_id == wardId)
+    if current.tenantId is not None and current.role != "SUPER_ADMIN":
         q = q.filter(Booth.tenant_id == current.tenantId)
     if scope:
         allowed_booth_ids = {v for v in (scope.get("allowed_booth_ids") or set()) if v is not None}
@@ -2690,15 +2741,17 @@ def get_booths_plural(
             return []
         q = q.filter(Ward.ward_id == wardId)
 
-    booths = q.order_by(Booth.booth_id.asc()).all()
-    if booths:
+    booths = q.order_by(Booth.booth_no.asc()).all()
+    # For super admins, we also want to optionally see the public list if data is sparse
+    if booths and (current.role != "SUPER_ADMIN" or not wardId):
         return [
             {
                 "boothId": b.booth_id,
+                "boothNo": b.booth_no,
+                "boothNameEn": b.polling_station_adr_en,
                 "pollingStationAdrEn": b.polling_station_adr_en,
-                "pollingStationAdrLocal": b.polling_station_adr_local,
                 "wardId": b.ward_id,
-                "tenantId": b.tenant_id,
+                "id": b.booth_id,
             }
             for b in booths
         ]
@@ -2729,16 +2782,25 @@ def get_booths_plural(
     if scope:
         allowed_booth_ids = scope.get("allowed_booth_ids") or set()
         allowed_ward_ids = scope.get("allowed_ward_ids") or set()
+        allowed_assembly_ids = scope.get("allowed_assembly_ids") or set()
+        
+        # In fallback, r.ward_id and r.id (booth_no/id) are our best links.
+        # We need to allow if it matches an allowed booth, OR an allowed ward.
+        # Note: assembly level access is handled via ward_id expansion in scope.
         rows = [
             r
             for r in rows
             if (not allowed_booth_ids or int(r.id) in allowed_booth_ids)
             and (not allowed_ward_ids or (r.ward_id is not None and int(r.ward_id) in allowed_ward_ids))
         ]
+        # If we have allowed assemblies but no wards were found in ORM, 
+        # we might need to be more permissive here, but usually scope expansion handles it.
     return [
         {
-            "boothId": int(r.id),
+            "boothId": int(r.ward_id) * 10000 + int(r.id) if r.ward_id is not None else int(r.id),
             "pollingStationAdrEn": r.name,
+            "pollingStation_adr_en": r.name,
+            "boothNameEn": r.name,
             "pollingStationAdrLocal": None,
             "wardId": int(r.ward_id) if r.ward_id is not None else None,
             "tenantId": None,
@@ -2807,22 +2869,27 @@ def get_wards(
     if scope and not (scope.get("allowed_assembly_ids") or scope.get("allowed_ward_ids") or scope.get("allowed_booth_ids")):
         return []
     q = db.query(Ward)
-    if current.tenantId is not None:
-        q = q.filter(Ward.tenant_id == current.tenantId)
     if assemblyId:
         q = q.filter(Ward.assembly_id == assemblyId)
+    if current.tenantId is not None and current.role != "SUPER_ADMIN":
+        q = q.filter(Ward.tenant_id == current.tenantId)
     if scope:
         allowed_ward_ids = {v for v in (scope.get("allowed_ward_ids") or set()) if v is not None}
         if allowed_ward_ids:
             q = q.filter(Ward.ward_id.in_(allowed_ward_ids))
+    
     wards = q.order_by(Ward.ward_id.asc()).all()
-    if wards:
+    # If no wards in data schema, OR we are Super Admin (who should see EVERYTHING), 
+    # check public schema for the full master list.
+    if wards and (current.role != "SUPER_ADMIN" or not assemblyId or len(wards) > 50):
         return [
             {
                 "wardId": w.ward_id,
                 "wardNameEn": w.ward_name_en,
+                "wardNameLocal": w.ward_name_local,
+                "wardCode": w.ward_code,
                 "assemblyId": w.assembly_id,
-                "tenantId": w.tenant_id,
+                "id": w.ward_id,
             }
             for w in wards
         ]
@@ -2852,8 +2919,14 @@ def get_wards(
     ).all()
     if scope:
         allowed_ward_ids = scope.get("allowed_ward_ids") or set()
-        if allowed_ward_ids:
-            rows = [r for r in rows if int(r.id) in allowed_ward_ids]
+        allowed_assembly_ids = scope.get("allowed_assembly_ids") or set()
+        
+        if allowed_ward_ids or allowed_assembly_ids:
+            rows = [
+                r for r in rows 
+                if (not allowed_ward_ids or int(r.id) in allowed_ward_ids)
+                or (not allowed_assembly_ids or (r.assembly_id is not None and int(r.assembly_id) in allowed_assembly_ids))
+            ]
         else:
             rows = []
     return [
@@ -2873,7 +2946,9 @@ def get_assemblies_plural(
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("ADMIN", "USER")),
 ):
-    q = db.query(Assembly).filter(Assembly.tenant_id == current.tenantId)
+    q = db.query(Assembly)
+    if current.tenantId is not None and current.role != "SUPER_ADMIN":
+        q = q.filter(Assembly.tenant_id == current.tenantId)
     if assemblyCode:
         q = q.filter(Assembly.assembly_code == assemblyCode)
 
@@ -3972,7 +4047,7 @@ def update_family(familyId: int, payload: UpdateFamilyRequest, db: Session = Dep
 
 @app.get(f"{CONTEXT_PATH}/api/family")
 def list_families(
-    boothId: int,
+    boothId: Optional[int] = None,
     page: int = 0,
     size: int = 10,
     search: Optional[str] = None,
@@ -3980,7 +4055,11 @@ def list_families(
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "USER")),
 ):
-    q = db.query(Family).filter(Family.tenant_id == current.tenantId, Family.booth_id == boothId, Family.deleted.is_(False))
+    q = db.query(Family).filter(Family.deleted.is_(False))
+    if current.tenantId:
+        q = q.filter(Family.tenant_id == current.tenantId)
+    if boothId:
+        q = q.filter(Family.booth_id == boothId)
 
     association_filter = parse_optional_bool(association)
     if association_filter is not None:
@@ -4088,6 +4167,24 @@ def get_message_template(
     return api_success("Message template fetched", _template_to_dto(tpl) if tpl else None)
 
 
+@app.get(f"{CONTEXT_PATH}/api/message-template/activated-wards")
+def get_activated_wards(
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN")),
+):
+    templates = db.query(MessageTemplate).filter(
+        MessageTemplate.tenant_id == current.tenantId, 
+        MessageTemplate.enabled == True
+    ).all()
+    out = []
+    for t in templates:
+        out.append({
+            "wardId": t.ward_id,
+            "channel": t.channel,
+        })
+    return api_success("Activated wards fetched", out)
+
+
 @app.put(f"{CONTEXT_PATH}/api/message-template")
 def save_message_template(
     payload: MessageTemplatePayload,
@@ -4179,120 +4276,172 @@ def delete_family(id: int, db: Session = Depends(get_db), current: JwtUserDetail
     return api_success("Family deleted", {})
 
 
+@app.post(f"{CONTEXT_PATH}/api/meetings")
+def create_meeting(payload: MeetingCreateRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN"))):
+    meeting = Meeting(
+        tenant_id=current.tenantId,
+        title=payload.title,
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        radius=payload.radius,
+        recipients=payload.recipients,
+        channels=payload.channels,
+    )
+    db.add(meeting)
+    db.commit()
+    return api_success("Meeting created", {"id": meeting.meeting_id})
+
+
+@app.get(f"{CONTEXT_PATH}/api/meetings")
+def list_meetings(db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN"))):
+    q = db.query(Meeting)
+    if current.tenantId:
+        q = q.filter(Meeting.tenant_id == current.tenantId)
+    meetings = q.all()
+    out = []
+    for m in meetings:
+        out.append({
+            "id": m.meeting_id,
+            "title": m.title,
+            "dateTime": m.start_time,
+            "description": f"End: {m.end_time}" if m.end_time else "",
+            "latitude": m.latitude or 0.0,
+            "longitude": m.longitude or 0.0,
+            "radius": m.radius or 0,
+            "recipients": m.recipients,
+            "channels": m.channels,
+        })
+    return out
+
+
+@app.post(f"{CONTEXT_PATH}/api/meetings/{{id}}/attendance")
+def record_meeting_attendance(id: int, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN"))):
+    meeting = db.query(Meeting).filter(Meeting.meeting_id == id).first()
+    if not meeting or not meeting.latitude or not meeting.longitude or not meeting.radius:
+        raise ValueError("Meeting not found or lacks location/radius")
+    
+    r_deg = meeting.radius / 111000.0
+    
+    q = db.query(Voter).filter(
+        Voter.tenant_id == meeting.tenant_id,
+        Voter.latitude.isnot(None),
+        Voter.longitude.isnot(None)
+    )
+    voters = q.all()
+    count = 0
+    import math
+    for v in voters:
+        if v.latitude and v.longitude:
+            dist_deg = math.sqrt((v.latitude - meeting.latitude)**2 + (v.longitude - meeting.longitude)**2)
+            if dist_deg <= r_deg:
+                att = db.query(MeetingAttendance).filter(MeetingAttendance.meeting_id == meeting.meeting_id, MeetingAttendance.voter_id == v.voter_id).first()
+                if not att:
+                    att = MeetingAttendance(
+                        meeting_id=meeting.meeting_id,
+                        voter_id=v.voter_id,
+                        distance=dist_deg * 111000,
+                    )
+                    db.add(att)
+                    count += 1
+    db.commit()
+    return api_success("Attendance recorded", {"added": count})
+
+
+@app.get(f"{CONTEXT_PATH}/api/meetings/{{id}}/attendance")
+def list_meeting_attendance(id: int, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN"))):
+    attendances = db.query(MeetingAttendance, Voter).join(Voter, MeetingAttendance.voter_id == Voter.voter_id).filter(MeetingAttendance.meeting_id == id).all()
+    out = []
+    for att, v in attendances:
+        out.append({
+            "id": v.voter_id,
+            "name": f"{v.first_middle_name_en or ''} {v.last_name_en or ''}".strip(),
+            "epic": v.epic_no,
+            "phone": v.mobile,
+            "distance": att.distance,
+            "attendedAt": att.attended_at.isoformat() if att.attended_at else None,
+        })
+    return out
+
+
 @app.get(f"{CONTEXT_PATH}/api/volunteers/dropdown")
 def volunteer_dropdown(level: str, parentId: Optional[int] = None, db: Session = Depends(get_db), current: JwtUserDetails = Depends(get_current_user)):
     level = level.upper()
     out = []
 
     if level == "ASSEMBLY":
-        rows = (
-            db.query(Assembly.assembly_id, Assembly.assembly_name_en)
-            .order_by(Assembly.assembly_name_en)
-            .all()
-        )
-        if current.tenantId is not None:
-            rows = (
-                db.query(Assembly.assembly_id, Assembly.assembly_name_en)
-                .filter(Assembly.tenant_id == current.tenantId)
-                .order_by(Assembly.assembly_name_en)
-                .all()
-            )
-        if not rows:
+        query = db.query(Assembly.id if hasattr(Assembly, "id") else Assembly.assembly_id, Assembly.assembly_name_en)
+        if current.tenantId is not None and current.role != "SUPER_ADMIN":
+            query = query.filter(Assembly.tenant_id == current.tenantId)
+        rows = query.all()
+        
+        # Super Admins should always see the full list of assemblies with correct names from public schema
+        if not rows or current.role == "SUPER_ADMIN":
             assembly_cols = _ensure_public_assembly_code(db)
             id_col = "id" if "id" in assembly_cols else ("assembly_id" if "assembly_id" in assembly_cols else ("assembly_no" if "assembly_no" in assembly_cols else None))
             name_col = "assembly_name_en" if "assembly_name_en" in assembly_cols else ("name_en" if "name_en" in assembly_cols else ("assembly_name_local" if "assembly_name_local" in assembly_cols else ("name_kannada" if "name_kannada" in assembly_cols else None)))
             code_expr = "assembly_code" if "assembly_code" in assembly_cols else "NULL"
             if id_col and name_col:
-                rows = db.execute(
-                    text(
-                        f"""
-                        SELECT {id_col} AS id, {name_col} AS name, {code_expr} AS code
-                        FROM public.assembly
-                        ORDER BY {name_col}
-                        """
-                    )
+                public_rows = db.execute(
+                    text(f"SELECT {id_col} AS id, {name_col} AS name, {code_expr} AS code FROM public.assembly ORDER BY {name_col}")
                 ).all()
-                for row in rows:
-                    out.append({"id": int(row.id), "code": str(row.code or row.id), "name": row.name})
-                return out
+                # If public has more rows OR we are super admin (to get better names like KR Pura), use public
+                if not rows or len(public_rows) >= len(rows) or current.role == "SUPER_ADMIN":
+                    for row in public_rows:
+                        out.append({"id": int(row.id), "code": String(row.code or row.id), "name": row.name})
+                    return api_success("Assemblies fetched", out)
         for row in rows:
-            out.append({"id": row[0], "code": str(row[0]), "name": row[1]})
+            out.append({"id": row[0], "code": String(row[0]), "name": row[1]})
+        return api_success("Assemblies fetched", out)
     elif level == "WARD":
         if parentId is None:
             raise ValueError("assemblyId is required for WARD")
-        rows = (
-            db.query(Ward.ward_id, Ward.ward_name_en)
-            .filter(Ward.assembly_id == parentId)
-            .order_by(Ward.ward_name_en)
-            .all()
-        )
-        if current.tenantId is not None:
-            rows = (
-                db.query(Ward.ward_id, Ward.ward_name_en)
-                .filter(Ward.assembly_id == parentId, Ward.tenant_id == current.tenantId)
-                .order_by(Ward.ward_name_en)
-                .all()
-            )
-        if not rows:
+        query = db.query(Ward.ward_id, Ward.ward_name_en).filter(Ward.assembly_id == parentId)
+        if current.tenantId is not None and current.role != "SUPER_ADMIN":
+            query = query.filter(Ward.tenant_id == current.tenantId)
+        rows = query.order_by(Ward.ward_name_en).all()
+
+        if not rows or current.role == "SUPER_ADMIN":
             ward_cols = _get_table_columns(db, "public", "wards")
             id_col = "ward_id" if "ward_id" in ward_cols else ("ward_no" if "ward_no" in ward_cols else ("id" if "id" in ward_cols else None))
             name_col = "ward_name_en" if "ward_name_en" in ward_cols else ("name_en" if "name_en" in ward_cols else ("ward_name_local" if "ward_name_local" in ward_cols else ("name_kannada" if "name_kannada" in ward_cols else None)))
             assembly_ref = "assembly_id" if "assembly_id" in ward_cols else ("assembly_no" if "assembly_no" in ward_cols else None)
             if id_col and name_col:
                 where = f"WHERE {assembly_ref} = :assembly_id" if assembly_ref else ""
-                rows = db.execute(
-                    text(
-                        f"""
-                        SELECT {id_col} AS id, {name_col} AS name
-                        FROM public.wards
-                        {where}
-                        ORDER BY {name_col}
-                        """
-                    ),
+                public_rows = db.execute(
+                    text(f"SELECT {id_col} AS id, {name_col} AS name FROM public.wards {where} ORDER BY {name_col}"),
                     {"assembly_id": parentId},
                 ).all()
-                for row in rows:
-                    out.append({"id": int(row.id), "code": str(row.id), "name": row.name})
-                return out
+                if not rows or len(public_rows) > len(rows):
+                    for row in public_rows:
+                        out.append({"id": int(row.id), "code": str(row.id), "name": row.name})
+                    return out
         for row in rows:
             out.append({"id": row[0], "code": str(row[0]), "name": row[1]})
     elif level == "BOOTH":
         if parentId is None:
             raise ValueError("wardId is required for BOOTH")
-        rows = (
-            db.query(Booth.booth_id, Booth.polling_station_adr_en)
-            .filter(Booth.ward_id == parentId)
-            .order_by(Booth.polling_station_adr_en)
-            .all()
-        )
-        if current.tenantId is not None:
-            rows = (
-                db.query(Booth.booth_id, Booth.polling_station_adr_en)
-                .filter(Booth.ward_id == parentId, Booth.tenant_id == current.tenantId)
-                .order_by(Booth.polling_station_adr_en)
-                .all()
-            )
-        if not rows:
+        query = db.query(Booth.booth_id, Booth.polling_station_adr_en).filter(Booth.ward_id == parentId)
+        if current.tenantId is not None and current.role != "SUPER_ADMIN":
+            query = query.filter(Booth.tenant_id == current.tenantId)
+        rows = query.order_by(Booth.polling_station_adr_en).all()
+
+        if not rows or current.role == "SUPER_ADMIN":
             booth_cols = _get_table_columns(db, "public", "booths")
             id_col = "booth_id" if "booth_id" in booth_cols else ("booth_no" if "booth_no" in booth_cols else ("id" if "id" in booth_cols else None))
             name_col = "polling_station_adr_en" if "polling_station_adr_en" in booth_cols else ("booth_add_en" if "booth_add_en" in booth_cols else ("name_en" if "name_en" in booth_cols else None))
             ward_ref = "ward_id" if "ward_id" in booth_cols else ("ward_no" if "ward_no" in booth_cols else None)
             if id_col and name_col:
                 where = f"WHERE {ward_ref} = :ward_id" if ward_ref else ""
-                rows = db.execute(
-                    text(
-                        f"""
-                        SELECT {id_col} AS id, {name_col} AS name
-                        FROM public.booths
-                        {where}
-                        ORDER BY {name_col}
-                        """
-                    ),
+                public_rows = db.execute(
+                    text(f"SELECT {id_col} AS id, {name_col} AS name FROM public.booths {where} ORDER BY {name_col}"),
                     {"ward_id": parentId},
                 ).all()
-                for row in rows:
-                    out.append({"id": int(row.id), "code": str(row.id), "name": row.name})
-                return out
+                if not rows or len(public_rows) > len(rows):
+                    for row in public_rows:
+                        out.append({"id": int(row.id), "code": str(row.id), "name": row.name})
+                    return out
         for row in rows:
             out.append({"id": row[0], "code": str(row[0]), "name": row[1]})
     else:
