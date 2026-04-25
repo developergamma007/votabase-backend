@@ -15,7 +15,9 @@ from botocore.exceptions import NoCredentialsError
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, BackgroundTasks
 from starlette.background import BackgroundTask
 from fastapi.middleware.cors import CORSMiddleware
+from pathlib import Path
 from fastapi.responses import JSONResponse, FileResponse
+import base64
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, DateTime, Double, ForeignKey, Integer, String, and_, asc, case, create_engine, desc, func, or_, text, not_
@@ -423,7 +425,7 @@ class MessageTemplate(Base):
     vote_time: Mapped[Optional[str]] = mapped_column(String(50))
     social_link: Mapped[Optional[str]] = mapped_column(String(255))
     booth_location_link: Mapped[Optional[str]] = mapped_column(String(255))
-    banner_url: Mapped[Optional[str]] = mapped_column(String(500))
+    banner_url: Mapped[Optional[str]] = mapped_column(String)
     show_logo: Mapped[Optional[bool]] = mapped_column(Boolean, default=True)
     enabled: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -1004,9 +1006,13 @@ def s3_presigned_url(key: str, minutes: int, fallback_url: Optional[str] = None)
 
 
 def s3_upload_bytes(content: bytes, content_type: str, key: str) -> str:
-    client = _get_s3_client()
-    client.put_object(Bucket=AWS_BUCKET, Key=key, Body=content, ContentType=content_type)
-    return f"https://{AWS_BUCKET}.s3.amazonaws.com/{key}"
+    # Use Base64 storage instead of S3 as requested
+    try:
+        b64 = base64.b64encode(content).decode("utf-8")
+        return f"data:{content_type};base64,{b64}"
+    except Exception as e:
+        print(f"Base64 conversion failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Image processing failed: {str(e)}")
 
 
 def normalize_assembly_code(value: Any) -> str:
@@ -1314,7 +1320,9 @@ def startup_ensure_voter_enrichment() -> None:
         if "booth_location_link" not in template_cols:
             db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN booth_location_link varchar(255)"))
         if "banner_url" not in template_cols:
-            db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN banner_url varchar(500)"))
+            db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN banner_url text"))
+        else:
+            db.execute(text("ALTER TABLE metastore.message_templates ALTER COLUMN banner_url TYPE text"))
         if "show_logo" not in template_cols:
             db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN show_logo boolean DEFAULT TRUE"))
         if "enabled" not in template_cols:
@@ -1323,6 +1331,9 @@ def startup_ensure_voter_enrichment() -> None:
             db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN created_at timestamp DEFAULT now()"))
         if "updated_at" not in template_cols:
             db.execute(text("ALTER TABLE metastore.message_templates ADD COLUMN updated_at timestamp DEFAULT now()"))
+
+        # Transition profile pic column for Base64 support
+        db.execute(text("ALTER TABLE metastore.users ALTER COLUMN profile_pic_url TYPE text"))
 
         family_cols = {
             row[0]
@@ -1419,8 +1430,41 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
             "token": token,
             "role": effective.role,
             "tenantId": tenant_id,
+            "assignmentType": assignment_type,
+            "assignmentId": assignment_id,
+            "assemblyIds": _parse_id_list(getattr(effective, "assembly_ids", "")) if hasattr(effective, "assembly_ids") else [],
+            "wardIds": _parse_id_list(getattr(effective, "ward_ids", "")) if hasattr(effective, "ward_ids") else [],
+            "boothIds": _parse_id_list(getattr(effective, "booth_ids", "")) if hasattr(effective, "booth_ids") else [],
         },
     )
+
+@app.get(f"{CONTEXT_PATH}/api/me")
+def get_me(db: Session = Depends(get_db), current: JwtUserDetails = Depends(get_current_user)):
+    volunteer = (
+        db.query(VolunteerUser)
+        .filter(VolunteerUser.first_name == current.firstName, VolunteerUser.phone == current.phone)
+        .first() if current.phone else None
+    )
+    user = (
+        db.query(User)
+        .filter(User.first_name == current.firstName, User.phone == current.phone)
+        .first() if current.phone else None
+    )
+    effective = user or volunteer
+    return api_success(
+        "User profile fetched",
+        {
+            "userName": current.firstName,
+            "role": current.role,
+            "tenantId": current.tenantId,
+            "assignmentType": current.assignmentType,
+            "assignmentId": current.assignmentId,
+            "assemblyIds": _parse_id_list(getattr(effective, "assembly_ids", "")) if hasattr(effective, "assembly_ids") else [],
+            "wardIds": _parse_id_list(getattr(effective, "ward_ids", "")) if hasattr(effective, "ward_ids") else [],
+            "boothIds": _parse_id_list(getattr(effective, "booth_ids", "")) if hasattr(effective, "booth_ids") else [],
+        },
+    )
+
 
 @app.get(f"{CONTEXT_PATH}/api/admin/db-dump")
 def admin_db_dump(
@@ -1689,64 +1733,91 @@ def list_volunteers(
     booth_name_map: Dict[int, str] = {}
 
     if ward_ids_all:
-        ward_q = db.query(Ward.ward_id, Ward.ward_name_en)
-        if current.tenantId is not None and current.role != "SUPER_ADMIN":
-            ward_q = ward_q.filter(Ward.tenant_id == current.tenantId)
-        ward_rows = ward_q.filter(Ward.ward_id.in_(list(ward_ids_all))).all()
-        ward_name_map = {row.ward_id: row.ward_name_en or f"Ward {row.ward_id}" for row in ward_rows}
-        
-        missing_wards = ward_ids_all - set(ward_name_map.keys())
-        if missing_wards:
-            # Fallback to public.wards just like the dropdowns do
-            ward_cols = _get_table_columns(db, "public", "wards")
-            id_col = "ward_id" if "ward_id" in ward_cols else ("ward_no" if "ward_no" in ward_cols else ("id" if "id" in ward_cols else None))
-            name_col = "ward_name_en" if "ward_name_en" in ward_cols else ("name_en" if "name_en" in ward_cols else ("ward_name_local" if "ward_name_local" in ward_cols else None))
-            code_col = "ward_code" if "ward_code" in ward_cols else None
+        # Fallback to public.wards just like the dropdowns do
+        ward_cols = _get_table_columns(db, "public", "wards")
+        id_col = "ward_id" if "ward_id" in ward_cols else ("ward_no" if "ward_no" in ward_cols else ("id" if "id" in ward_cols else None))
+        name_col = "ward_name_en" if "ward_name_en" in ward_cols else ("name_en" if "name_en" in ward_cols else ("ward_name_local" if "ward_name_local" in ward_cols else None))
+        code_col = "ward_code" if "ward_code" in ward_cols else None
 
-            if id_col and name_col:
-                clause, params = _build_in_clause(id_col, [str(m) for m in missing_wards], "mc")
-                raw_rows = db.execute(
-                    text(f"SELECT {id_col} AS wid, {name_col} AS wname FROM public.wards WHERE {clause}"),
-                    params,
-                ).all()
-                for row in raw_rows:
-                    ward_name_map[int(row.wid)] = row.wname or f"Ward {row.wid}"
-            
-            missing_wards = ward_ids_all - set(ward_name_map.keys())
-            if missing_wards and code_col and name_col:
-                clause, params = _build_in_clause(code_col, [str(m) for m in missing_wards], "wc")
-                raw_rows = db.execute(
-                    text(f"SELECT {code_col} AS wcode, {name_col} AS wname FROM public.wards WHERE {clause}"),
-                    params,
-                ).all()
-                for row in raw_rows:
-                    try:
-                        ward_name_map[int(row.wcode)] = row.wname or f"Ward {row.wcode}"
-                    except Exception:
-                        pass
+        if id_col and name_col:
+            clause, params = _build_in_clause(id_col, [str(m) for m in ward_ids_all], "mc")
+            raw_rows = db.execute(
+                text(f"SELECT {id_col} AS wid, {name_col} AS wname FROM public.wards WHERE {clause}"),
+                params,
+            ).all()
+            for row in raw_rows:
+                if row.wname: ward_name_map[int(row.wid)] = row.wname
+        
+        remaining_wards = ward_ids_all - set(ward_name_map.keys())
+        if remaining_wards and code_col and name_col:
+            clause, params = _build_in_clause(code_col, [str(m) for m in remaining_wards], "wc")
+            raw_rows = db.execute(
+                text(f"SELECT {code_col} AS wcode, {name_col} AS wname FROM public.wards WHERE {clause}"),
+                params,
+            ).all()
+            for row in raw_rows:
+                try:
+                    if row.wname: ward_name_map[int(row.wcode)] = row.wname
+                except Exception:
+                    pass
+        
+        still_missing_wards = ward_ids_all - set(ward_name_map.keys())
+        if still_missing_wards:
+            ward_q = db.query(Ward.ward_id, Ward.ward_name_en)
+            if current.tenantId is not None and current.role != "SUPER_ADMIN":
+                ward_q = ward_q.filter(Ward.tenant_id == current.tenantId)
+            ward_rows = ward_q.filter(Ward.ward_id.in_(list(still_missing_wards))).all()
+            for r in ward_rows:
+                if r.ward_name_en: ward_name_map[r.ward_id] = r.ward_name_en
 
     if booth_ids_all:
-        booth_q = db.query(Booth.booth_id, Booth.polling_station_adr_en)
-        if current.tenantId is not None and current.role != "SUPER_ADMIN":
-            booth_q = booth_q.filter(Booth.tenant_id == current.tenantId)
-        booth_rows = booth_q.filter(Booth.booth_id.in_(list(booth_ids_all))).all()
-        booth_name_map = {row.booth_id: row.polling_station_adr_en or f"Booth {row.booth_id}" for row in booth_rows}
-
-        missing_booths = booth_ids_all - set(booth_name_map.keys())
-        if missing_booths:
-            # Fallback to public.booths
-            booth_cols = _get_table_columns(db, "public", "booths")
-            booth_no_col = "booth_no" if "booth_no" in booth_cols else ("id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None))
-            name_col = "booth_add_en" if "booth_add_en" in booth_cols else ("polling_station_adr_en" if "polling_station_adr_en" in booth_cols else None)
+        booth_cols = _get_table_columns(db, "public", "booths")
+        id_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
+        booth_no_col = "booth_no" if "booth_no" in booth_cols else ("id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None))
+        ward_ref = "ward_id" if "ward_id" in booth_cols else ("ward_no" if "ward_no" in booth_cols else None)
+        name_col = "booth_add_en" if "booth_add_en" in booth_cols else ("polling_station_adr_en" if "polling_station_adr_en" in booth_cols else None)
+        
+        if name_col:
+            # 1. Try direct ID match
+            if id_col:
+                clause, params = _build_in_clause(id_col, [str(m) for m in booth_ids_all], "pid")
+                rows = db.execute(text(f"SELECT {id_col} AS bid, {name_col} AS bname FROM public.booths WHERE {clause}"), params).all()
+                for r in rows:
+                    if r.bname: booth_name_map[int(r.bid)] = r.bname
             
-            if booth_no_col and name_col:
-                clause, params = _build_in_clause(booth_no_col, [str(m) for m in missing_booths], "mb")
-                raw_rows = db.execute(
-                    text(f"SELECT {booth_no_col} AS bno, {name_col} AS bname FROM public.booths WHERE {clause}"),
-                    params,
-                ).all()
-                for row in raw_rows:
-                    booth_name_map[int(row.bno)] = row.bname or f"Booth {row.bno}"
+            # 2. Try composite match (ward_id * 10000 + booth_no)
+            remaining_booths = booth_ids_all - set(booth_name_map.keys())
+            if remaining_booths and ward_ref and booth_no_col:
+                potential_composites = [m for m in remaining_booths if m > 1000]
+                if potential_composites:
+                    potential_ward_ids = list(set([m // 10000 for m in potential_composites]))
+                    if potential_ward_ids:
+                        clause, params = _build_in_clause(ward_ref, [str(w) for w in potential_ward_ids], "pwid")
+                        rows = db.execute(text(f"SELECT {ward_ref} AS wid, {booth_no_col} AS bno, {name_col} AS bname FROM public.booths WHERE {clause}"), params).all()
+                        for r in rows:
+                            if r.wid is not None and r.bno is not None:
+                                cid = int(r.wid) * 10000 + int(r.bno)
+                                if cid in remaining_booths:
+                                    prefix = f"{r.bno} - " if r.bno and r.bname and not str(r.bname).startswith(str(r.bno)) else ""
+                                    booth_name_map[cid] = prefix + (r.bname or f"Booth {r.bno}")
+
+            # 3. Try fallback booth_no match for any still remaining
+            remaining_booths = booth_ids_all - set(booth_name_map.keys())
+            if remaining_booths and booth_no_col:
+                clause, params = _build_in_clause(booth_no_col, [str(m) for m in remaining_booths], "pno")
+                rows = db.execute(text(f"SELECT {booth_no_col} AS bno, {name_col} AS bname FROM public.booths WHERE {clause}"), params).all()
+                for r in rows:
+                    if r.bname: booth_name_map[int(r.bno)] = r.bname
+
+        # 4. Final fallback to data schema Booth table
+        still_missing_booths = booth_ids_all - set(booth_name_map.keys())
+        if still_missing_booths:
+            booth_q = db.query(Booth.booth_id, Booth.polling_station_adr_en)
+            if current.tenantId is not None and current.role != "SUPER_ADMIN":
+                booth_q = booth_q.filter(Booth.tenant_id == current.tenantId)
+            booth_rows = booth_q.filter(Booth.booth_id.in_(list(still_missing_booths))).all()
+            for r in booth_rows:
+                if r.polling_station_adr_en: booth_name_map[r.booth_id] = r.polling_station_adr_en
 
     content = []
     for u in users:
@@ -2823,6 +2894,7 @@ def get_public_booths(
 ):
     scope = _resolve_access_scope_ids(db, current)
     booth_cols = _get_table_columns(db, "public", "booths")
+    real_id_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
     id_col = "booth_no" if "booth_no" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
     name_col = "booth_add_en" if "booth_add_en" in booth_cols else ("polling_station_adr_en" if "polling_station_adr_en" in booth_cols else None)
     ward_ref = "ward_id" if "ward_id" in booth_cols else ("ward_no" if "ward_no" in booth_cols else None)
@@ -2837,7 +2909,7 @@ def get_public_booths(
     rows = db.execute(
         text(
             f"""
-            SELECT {id_col} AS booth_no, {name_col} AS booth_name, {ward_ref if ward_ref else 'NULL'} AS ward_id
+            SELECT {real_id_col if real_id_col else id_col} as id, {id_col} AS booth_no, {name_col} AS booth_name, {ward_ref if ward_ref else 'NULL'} AS ward_id
             FROM public.booths
             {where_clause}
             ORDER BY {id_col}
@@ -2851,11 +2923,12 @@ def get_public_booths(
         rows = [
             r
             for r in rows
-            if (not allowed_booth_ids or int(r.booth_no) in allowed_booth_ids)
+            if (not allowed_booth_ids or int(r.id) in allowed_booth_ids or int(r.booth_no) in allowed_booth_ids)
             and (not allowed_ward_ids or (r.ward_id is not None and int(r.ward_id) in allowed_ward_ids))
         ]
     return [
         {
+            "id": r.id,
             "boothNo": int(r.booth_no) if r.booth_no is not None else None,
             "boothNameEn": r.booth_name,
             "wardId": int(r.ward_id) if r.ward_id is not None else None,
@@ -3673,6 +3746,9 @@ def get_voters_by_booth(
                 "natureOfVoter": None,
                 "latitude": None,
                 "longitude": None,
+                "wardId": booth_row.ward_id,
+                "wardNameEn": ward_name_en,
+                "wardNameLocal": ward_name_local,
             }
         )
     _merge_voter_payloads_with_enrichment(db, voters)
@@ -3784,22 +3860,27 @@ def create_association(payload: CreateAssociationRequest, db: Session = Depends(
 
 
 def _family_to_dto(db: Session, fam: Family) -> Dict[str, Any]:
-    members = db.query(FamilyMember, Voter).join(Voter, FamilyMember.voter_id == Voter.voter_id).filter(FamilyMember.family_id == fam.familyId).all()
     head_name = ""
     head_epic = ""
-    for member, voter in members:
-        full_name = f"{voter.first_middle_name_en or ''} {voter.last_name_en or ''}".strip()
-        if member.is_head:
-            head_name = full_name
-            head_epic = voter.epic_no
-        m_dto.append(
-            {
-                "memberId": member.member_id,
-                "head": bool(member.is_head),
-                "epicNo": voter.epic_no,
-                "voterName": full_name,
-            }
-        )
+    m_dto = []
+    
+    try:
+        members_data = db.query(FamilyMember, Voter).join(Voter, FamilyMember.voter_id == Voter.voter_id).filter(FamilyMember.family_id == fam.familyId).all()
+        for member, voter in members_data:
+            full_name = f"{voter.first_middle_name_en or ''} {voter.last_name_en or ''}".strip()
+            if member.is_head:
+                head_name = full_name
+                head_epic = voter.epic_no
+            m_dto.append(
+                {
+                    "memberId": member.member_id,
+                    "head": bool(member.is_head),
+                    "epicNo": voter.epic_no,
+                    "voterName": full_name,
+                }
+            )
+    except Exception as e:
+        print(f"Error in _family_to_dto members: {e}")
 
     return {
         "familyId": fam.familyId,
@@ -4163,35 +4244,77 @@ def _template_to_dto(tpl: MessageTemplate) -> Dict[str, Any]:
 
 @app.get(f"{CONTEXT_PATH}/api/message-template")
 def get_message_template(
-    wardId: Optional[int] = None,
+    wardId: Optional[str] = None,
     channel: str = "WHATSAPP",
+    epicNo: Optional[str] = None,
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER")),
 ):
     channel = channel.upper()
-    q = db.query(MessageTemplate).filter(MessageTemplate.tenant_id == current.tenantId)
-    if wardId is not None and wardId != "":
-        q = q.filter(MessageTemplate.ward_id == int(wardId))
+    resolved_ward_id = wardId
+    
+    # If epicNo provided, try to resolve wardId from voter data
+    if epicNo and (not resolved_ward_id or resolved_ward_id == "null" or resolved_ward_id == ""):
+        try:
+            voter_cols = _get_table_columns(db, "public", "voters")
+            booth_cols = _get_table_columns(db, "public", "booths")
+            
+            epic_col = "epic_no" if "epic_no" in voter_cols else ("voter_id" if "voter_id" in voter_cols else None)
+            booth_no_col = "booth_no" if "booth_no" in voter_cols else None
+            
+            if epic_col and booth_no_col:
+                voter_row = db.execute(text(f"SELECT {booth_no_col} as booth_no FROM public.voters WHERE {epic_col} = :epic"), {"epic": epicNo}).first()
+                if voter_row:
+                    b_no = voter_row.booth_no
+                    b_ward_id_col = "ward_id" if "ward_id" in booth_cols else None
+                    if b_ward_id_col:
+                        # CRITICAL: Scope by tenant_id to avoid matching booth 1 from a different assembly
+                        booth_row = db.execute(text(f"SELECT {b_ward_id_col} as ward_id FROM public.booths WHERE booth_no = :bno AND tenant_id = :tid"), {"bno": b_no, "tid": current.tenantId}).first()
+                        if booth_row:
+                            resolved_ward_id = str(booth_row.ward_id)
+        except Exception as e:
+            print(f"Ward resolution error for EPIC {epicNo}: {e}")
+
+    q = db.query(MessageTemplate).filter(
+        MessageTemplate.tenant_id == current.tenantId,
+        MessageTemplate.channel == channel
+    )
+    if resolved_ward_id and resolved_ward_id != "" and resolved_ward_id != "null":
+        try:
+            q = q.filter(MessageTemplate.ward_id == int(resolved_ward_id))
+        except (ValueError, TypeError):
+             q = q.filter(MessageTemplate.ward_id.is_(None))
     else:
         q = q.filter(MessageTemplate.ward_id.is_(None))
     
-    tpl = q.filter(MessageTemplate.channel == channel).first()
+    tpl = q.first()
     return api_success("Message template fetched", _template_to_dto(tpl) if tpl else None)
 
 
 @app.get(f"{CONTEXT_PATH}/api/message-template/activated-wards")
 def get_activated_wards(
     db: Session = Depends(get_db),
-    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN")),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER")),
 ):
     templates = db.query(MessageTemplate).filter(
         MessageTemplate.tenant_id == current.tenantId, 
         MessageTemplate.enabled == True
     ).all()
+    
+    # Pre-fetch ward details for labeling
+    ward_ids = [t.ward_id for t in templates if t.ward_id is not None]
+    wards_map = {}
+    if ward_ids:
+        wards = db.query(Ward).filter(Ward.ward_id.in_(ward_ids)).all()
+        wards_map = {w.ward_id: w for w in wards}
+
     out = []
     for t in templates:
+        w_obj = wards_map.get(t.ward_id) if t.ward_id else None
         out.append({
             "wardId": t.ward_id,
+            "wardLabel": t.ward_label or (w_obj.ward_name_en if w_obj else None),
+            "wardNameEn": w_obj.ward_name_en if w_obj else None,
             "channel": t.channel,
         })
     return api_success("Activated wards fetched", out)
@@ -4252,7 +4375,10 @@ def upload_message_template_banner(
     channel = channel.upper()
     q = db.query(MessageTemplate).filter(MessageTemplate.tenant_id == current.tenantId, MessageTemplate.channel == channel)
     if wardId is not None and wardId != "":
-        q = q.filter(MessageTemplate.ward_id == int(wardId))
+        try:
+            q = q.filter(MessageTemplate.ward_id == int(wardId))
+        except (ValueError, TypeError):
+            pass
     else:
         q = q.filter(MessageTemplate.ward_id.is_(None))
     
@@ -4265,6 +4391,87 @@ def upload_message_template_banner(
     db.commit()
     db.refresh(tpl)
     return api_success("Banner uploaded", _template_to_dto(tpl))
+
+
+@app.get(f"{CONTEXT_PATH}/api/voter-activation/verify")
+def verify_voter_activation(
+    epicNo: str,
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER")),
+):
+    """
+    Check if a specific voter (by EPIC) has messaging enabled based on their resolved ward
+    and the current activation status of that ward.  Uses ORM so it hits the correct
+    'data' schema — the same source of truth as the Promotions tab.
+    """
+    # Normalize EPIC (Upper case + Strip)
+    normalized_epic = epicNo.strip().upper()
+    
+    # Step 1: resolve the voter's ward_id using ORM (data.voters → data.booths → data.wards)
+    resolved_ward_id: Optional[int] = None
+
+    voter_obj = db.query(Voter).filter(Voter.epic_no == normalized_epic).first()
+    if voter_obj and voter_obj.booth_id:
+        booth_obj = db.query(Booth).filter(Booth.booth_id == voter_obj.booth_id).first()
+        if booth_obj:
+            resolved_ward_id = booth_obj.ward_id
+
+    # Step 2: check activation for each channel against metastore.message_templates
+    def is_active(channel: str) -> bool:
+        # a) Global template (ward_id IS NULL)
+        global_tpl = db.query(MessageTemplate).filter(
+            MessageTemplate.tenant_id == current.tenantId,
+            MessageTemplate.channel == channel,
+            MessageTemplate.ward_id.is_(None),
+        ).first()
+        if global_tpl and global_tpl.enabled:
+            return True
+
+        # b) Ward-specific template
+        if resolved_ward_id is not None:
+            ward_tpl = db.query(MessageTemplate).filter(
+                MessageTemplate.tenant_id == current.tenantId,
+                MessageTemplate.channel == channel,
+                MessageTemplate.ward_id == resolved_ward_id,
+            ).first()
+            if ward_tpl and ward_tpl.enabled:
+                return True
+
+        return False
+
+    return api_success("Voter activation status", {
+        "epicNo": epicNo,
+        "wardId": resolved_ward_id,
+        "whatsapp": is_active("WHATSAPP"),
+        "sms": is_active("SMS"),
+        "print": is_active("PRINT"),
+    })
+
+
+@app.post(f"{CONTEXT_PATH}/api/message-template/deactivate-all")
+def deactivate_all_templates(
+    channel: str = "WHATSAPP",
+    tenantId: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN")),
+):
+    channel = channel.upper()
+    target_tenant = tenantId or current.tenantId
+    if not target_tenant and current.role != "SUPER_ADMIN":
+         raise HTTPException(status_code=400, detail="Tenant ID is required")
+         
+    try:
+        q = db.query(MessageTemplate).filter(MessageTemplate.channel == channel)
+        if target_tenant:
+            q = q.filter(MessageTemplate.tenant_id == target_tenant)
+            
+        rows = q.update({MessageTemplate.enabled: False}, synchronize_session=False)
+        db.commit()
+        return api_success(f"Deactivated {channel} for {rows} wards.")
+    except Exception as e:
+        db.rollback()
+        print(f"Deactivate all error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get(f"{CONTEXT_PATH}/api/family/{{id}}")
