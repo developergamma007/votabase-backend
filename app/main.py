@@ -3863,7 +3863,6 @@ def _family_to_dto(db: Session, fam: Family) -> Dict[str, Any]:
     head_name = ""
     head_epic = ""
     m_dto = []
-    
     try:
         members_data = db.query(FamilyMember, Voter).join(Voter, FamilyMember.voter_id == Voter.voter_id).filter(FamilyMember.family_id == fam.familyId).all()
         for member, voter in members_data:
