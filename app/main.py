@@ -13,6 +13,7 @@ import boto3
 import jwt
 from botocore.exceptions import NoCredentialsError
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, BackgroundTasks
+from starlette.background import BackgroundTask
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from openpyxl import load_workbook
@@ -292,7 +293,7 @@ class Meeting(Base):
     __table_args__ = {"schema": "data"}
 
     meeting_id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    tenant_id: Mapped[str] = mapped_column(String(20))
+    tenant_id: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     title: Mapped[str] = mapped_column(String(255))
     start_time: Mapped[Optional[str]] = mapped_column(String(50))
     end_time: Mapped[Optional[str]] = mapped_column(String(50))
@@ -310,7 +311,9 @@ class MeetingAttendance(Base):
 
     attendance_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     meeting_id: Mapped[int] = mapped_column(ForeignKey("data.meetings.meeting_id"))
-    voter_id: Mapped[int] = mapped_column(ForeignKey("data.voters.voter_id"))
+    voter_id: Mapped[Optional[int]] = mapped_column(ForeignKey("data.voters.voter_id"), nullable=True)
+    volunteer_name: Mapped[Optional[str]] = mapped_column(String(255))
+    volunteer_phone: Mapped[Optional[str]] = mapped_column(String(50))
     distance: Mapped[Optional[float]] = mapped_column(Double)
     attended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=func.now())
 
@@ -1389,11 +1392,13 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     tenant_id = None
     assignment_type = None
     assignment_id = 0
-    if user and user.role != "SUPER_ADMIN":
-        if not user.tenant:
+    if user:
+        if user.tenant:
+            tenant_id = user.tenant.tenant_id
+        if user.role != "SUPER_ADMIN" and not tenant_id:
             raise InvalidCredentialsException("Tenant information missing for user")
-        tenant_id = user.tenant.tenant_id
-        if user.role != "ADMIN":
+
+        if user.role != "ADMIN" and user.role != "SUPER_ADMIN":
             if user.assignment_type is None or user.assignment_id == -1:
                 raise InvalidCredentialsException("Assignment information missing for user")
         assignment_type = user.assignment_type
@@ -3780,9 +3785,13 @@ def create_association(payload: CreateAssociationRequest, db: Session = Depends(
 
 def _family_to_dto(db: Session, fam: Family) -> Dict[str, Any]:
     members = db.query(FamilyMember, Voter).join(Voter, FamilyMember.voter_id == Voter.voter_id).filter(FamilyMember.family_id == fam.familyId).all()
-    m_dto = []
+    head_name = ""
+    head_epic = ""
     for member, voter in members:
         full_name = f"{voter.first_middle_name_en or ''} {voter.last_name_en or ''}".strip()
+        if member.is_head:
+            head_name = full_name
+            head_epic = voter.epic_no
         m_dto.append(
             {
                 "memberId": member.member_id,
@@ -3811,6 +3820,9 @@ def _family_to_dto(db: Session, fam: Family) -> Dict[str, Any]:
         "boothId": fam.booth_id,
         "associationId": fam.association_id,
         "headMemberId": fam.head_voter_id,
+        "headName": head_name,
+        "headEpicNo": head_epic,
+        "memberCount": len(m_dto),
         "members": m_dto,
         "economicStatus": fam.economic_status,
         "familyNature": fam.family_nature,
@@ -4277,9 +4289,18 @@ def delete_family(id: int, db: Session = Depends(get_db), current: JwtUserDetail
 
 
 @app.post(f"{CONTEXT_PATH}/api/meetings")
-def create_meeting(payload: MeetingCreateRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN"))):
+def create_meeting(payload: MeetingCreateRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN"))):
+    t_id = current.tenantId
+    if not t_id:
+        # Fallback for global admins: try to find the first tenant
+        first_tenant = db.query(Tenant).first()
+        if first_tenant:
+            t_id = first_tenant.tenant_id
+        else:
+            t_id = "000001" # Very safe fallback
+
     meeting = Meeting(
-        tenant_id=current.tenantId,
+        tenant_id=t_id,
         title=payload.title,
         start_time=payload.start_time,
         end_time=payload.end_time,
@@ -4295,7 +4316,7 @@ def create_meeting(payload: MeetingCreateRequest, db: Session = Depends(get_db),
 
 
 @app.get(f"{CONTEXT_PATH}/api/meetings")
-def list_meetings(db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN"))):
+def list_meetings(db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "WARD", "BOOTH", "USER"))):
     q = db.query(Meeting)
     if current.tenantId:
         q = q.filter(Meeting.tenant_id == current.tenantId)
@@ -4317,7 +4338,7 @@ def list_meetings(db: Session = Depends(get_db), current: JwtUserDetails = Depen
 
 
 @app.post(f"{CONTEXT_PATH}/api/meetings/{{id}}/attendance")
-def record_meeting_attendance(id: int, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN"))):
+def record_meeting_attendance(id: int, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "WARD", "BOOTH"))):
     meeting = db.query(Meeting).filter(Meeting.meeting_id == id).first()
     if not meeting or not meeting.latitude or not meeting.longitude or not meeting.radius:
         raise ValueError("Meeting not found or lacks location/radius")
@@ -4349,18 +4370,49 @@ def record_meeting_attendance(id: int, db: Session = Depends(get_db), current: J
     return api_success("Attendance recorded", {"added": count})
 
 
+@app.post(f"{CONTEXT_PATH}/api/meetings/{{id}}/attend-self")
+def attend_meeting_self(id: int, db: Session = Depends(get_db), current: JwtUserDetails = Depends(get_current_user)):
+    existing = db.query(MeetingAttendance).filter(
+        MeetingAttendance.meeting_id == id,
+        MeetingAttendance.volunteer_phone == current.phone
+    ).first()
+    if existing:
+        return api_success("Already attended", {})
+    
+    att = MeetingAttendance(
+        meeting_id=id,
+        volunteer_name=current.firstName,
+        volunteer_phone=current.phone,
+        attended_at=func.now()
+    )
+    db.add(att)
+    db.commit()
+    return api_success("Self attendance recorded", {})
+
+
 @app.get(f"{CONTEXT_PATH}/api/meetings/{{id}}/attendance")
 def list_meeting_attendance(id: int, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN"))):
-    attendances = db.query(MeetingAttendance, Voter).join(Voter, MeetingAttendance.voter_id == Voter.voter_id).filter(MeetingAttendance.meeting_id == id).all()
+    attendances = db.query(MeetingAttendance).filter(MeetingAttendance.meeting_id == id).all()
     out = []
-    for att, v in attendances:
+    for att in attendances:
+        v_name = att.volunteer_name
+        v_phone = att.volunteer_phone
+        v_epic = "-"
+        
+        if att.voter_id:
+            v = db.query(Voter).filter(Voter.voter_id == att.voter_id).first()
+            if v:
+                v_name = f"{v.first_middle_name_en or ''} {v.last_name_en or ''}".strip()
+                v_phone = v.mobile
+                v_epic = v.epic_no
+
         out.append({
-            "id": v.voter_id,
-            "name": f"{v.first_middle_name_en or ''} {v.last_name_en or ''}".strip(),
-            "epic": v.epic_no,
-            "phone": v.mobile,
+            "id": att.attendance_id,
+            "name": v_name,
+            "epic": v_epic,
+            "phone": v_phone,
             "distance": att.distance,
-            "attendedAt": att.attended_at.isoformat() if att.attended_at else None,
+            "at": att.attended_at.isoformat() if att.attended_at else ""
         })
     return out
 
