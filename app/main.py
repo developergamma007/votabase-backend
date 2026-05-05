@@ -922,19 +922,43 @@ def _resolve_access_scope_ids(db: Session, current: JwtUserDetails) -> Optional[
             ).all()
             allowed_booth_ids = {row.booth_id for row in rows if row.booth_id is not None}
 
-    if allowed_assembly_ids:
-        ward_rows = db.query(Ward.ward_id).filter(Ward.assembly_id.in_(allowed_assembly_ids)).all()
-        allowed_ward_ids.update([row[0] for row in ward_rows])
+    # Hierarchical expansion using public schema to avoid sparse data from 'data' schema
+    ward_cols = _get_table_columns(db, "public", "wards")
+    booth_cols = _get_table_columns(db, "public", "booths")
 
-    if allowed_booth_ids:
-        ward_rows = db.query(Booth.ward_id).filter(Booth.booth_id.in_(allowed_booth_ids)).all()
-        allowed_ward_ids.update([row[0] for row in ward_rows if row[0] is not None])
+    w_id_col = "id" if "id" in ward_cols else ("ward_id" if "ward_id" in ward_cols else None)
+    w_asm_id_col = "assembly_id" if "assembly_id" in ward_cols else ("assembly_no" if "assembly_no" in ward_cols else None)
+    
+    b_id_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
+    b_ward_id_col = "ward_id" if "ward_id" in booth_cols else None
 
-    if allowed_ward_ids:
-        booth_rows = db.query(Booth.booth_id).filter(Booth.ward_id.in_(allowed_ward_ids)).all()
-        allowed_booth_ids.update([row[0] for row in booth_rows])
-        assembly_rows = db.query(Ward.assembly_id).filter(Ward.ward_id.in_(allowed_ward_ids)).all()
-        allowed_assembly_ids.update([row[0] for row in assembly_rows if row[0] is not None])
+    # Expansion: Assembly -> Wards
+    if allowed_assembly_ids and w_id_col and w_asm_id_col:
+        aids = sorted([int(v) for v in allowed_assembly_ids if v is not None])
+        if aids:
+            res = db.execute(text(f"SELECT {w_id_col} FROM public.wards WHERE {w_asm_id_col} IN :aids"), {"aids": tuple(aids)}).all()
+            allowed_ward_ids.update([r[0] for r in res if r[0] is not None])
+
+    # Expansion: Booths -> Wards (Upward)
+    if allowed_booth_ids and b_id_col and b_ward_id_col:
+        bids = sorted([int(v) for v in allowed_booth_ids if v is not None])
+        if bids:
+            res = db.execute(text(f"SELECT {b_ward_id_col} FROM public.booths WHERE {b_id_col} IN :bids"), {"bids": tuple(bids)}).all()
+            allowed_ward_ids.update([r[0] for r in res if r[0] is not None])
+
+    # Expansion: Wards -> Booths (Downward)
+    if allowed_ward_ids and b_id_col and b_ward_id_col:
+        wids = sorted([int(v) for v in allowed_ward_ids if v is not None])
+        if wids:
+            res = db.execute(text(f"SELECT {b_id_col} FROM public.booths WHERE {b_ward_id_col} IN :wids"), {"wids": tuple(wids)}).all()
+            allowed_booth_ids.update([r[0] for r in res if r[0] is not None])
+
+    # Expansion: Wards -> Assemblies (Upward)
+    if allowed_ward_ids and w_id_col and w_asm_id_col:
+        wids = sorted([int(v) for v in allowed_ward_ids if v is not None])
+        if wids:
+            res = db.execute(text(f"SELECT {w_asm_id_col} FROM public.wards WHERE {w_id_col} IN :wids"), {"wids": tuple(wids)}).all()
+            allowed_assembly_ids.update([r[0] for r in res if r[0] is not None])
 
     allowed_assembly_ids = {v for v in allowed_assembly_ids if v is not None}
     allowed_ward_ids = {v for v in allowed_ward_ids if v is not None}
