@@ -447,6 +447,15 @@ def get_db():
 # ---------------------------
 # API response helpers
 # ---------------------------
+def _normalize_assembly_code(code: Optional[Any]) -> Optional[str]:
+    if not code:
+        return None
+    c = str(code).strip()
+    if c.isdigit() and len(c) < 12:
+        return c.zfill(12)
+    return c
+
+
 def api_success(message: str, result: Any) -> Dict[str, Any]:
     return {"success": True, "message": message, "data": {"result": result}}
 
@@ -864,7 +873,7 @@ def _get_access_scope(db: Session, current: JwtUserDetails) -> Optional[Dict[str
     if not (assembly_ids or ward_ids or booth_ids):
         fallback_ids = _parse_id_list(str(current.assignmentId or ""))
         if assignment_type == "ASSEMBLY":
-            assembly_ids = fallback_ids
+            assembly_ids = [_normalize_assembly_code(aid) for aid in fallback_ids]
         elif assignment_type == "WARD":
             ward_ids = fallback_ids
         elif assignment_type == "BOOTH":
@@ -877,6 +886,12 @@ def _get_access_scope(db: Session, current: JwtUserDetails) -> Optional[Dict[str
         "booth_ids": booth_ids,
         "role": role,
     }
+
+
+def _build_public_tenant_filter(current: JwtUserDetails) -> tuple[str, Dict[str, Any]]:
+    if current.role == "SUPER_ADMIN":
+        return "", {}
+    return " AND (tenant_id = :tid OR tenant_id IS NULL OR tenant_id = '')", {"tid": current.tenantId}
 
 
 def _resolve_access_scope_ids(db: Session, current: JwtUserDetails) -> Optional[Dict[str, Any]]:
@@ -909,13 +924,15 @@ def _resolve_access_scope_ids(db: Session, current: JwtUserDetails) -> Optional[
                 params.update(params_no)
             if not where_parts:
                 where_parts.append("1=0")
-            where_clause = f"WHERE {' OR '.join(where_parts)}"
+            t_clause, t_params = _build_public_tenant_filter(current)
+            params.update(t_params)
+            where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
             rows = db.execute(
                 text(
                     f"""
                     SELECT {booth_pk_col} AS booth_id, {booth_no_col if booth_no_col else booth_pk_col} AS booth_no
                     FROM public.booths
-                    {where_clause}
+                    {where_clause} {t_clause}
                     """
                 ),
                 params,
@@ -1040,7 +1057,11 @@ def s3_upload_bytes(content: bytes, content_type: str, key: str) -> str:
 
 
 def normalize_assembly_code(value: Any) -> str:
-    s = str(value)
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
     if len(s) == 12:
         return s
     return f"{int(s):012d}"
@@ -1610,9 +1631,12 @@ def create_volunteer(
         else:
             raise HTTPException(status_code=400, detail="tenantId is required for SUPER_ADMIN")
 
-    exists = db.query(VolunteerUser).filter(VolunteerUser.first_name == payload.firstName, VolunteerUser.phone == phone).first()
+    exists = db.query(VolunteerUser).filter(VolunteerUser.phone == phone).first()
     if exists:
-        raise ResourceAlreadyExistsException("volunteer", "userName", payload.firstName)
+        return JSONResponse(
+            status_code=409,
+            content=api_error("Volunteer already exists", {"phone": phone})
+        )
 
     assembly_ids = payload.assemblyIds or []
     ward_ids = payload.wardIds or []
@@ -1689,14 +1713,44 @@ def list_volunteers(
     blocked: Optional[str] = None,
     deleted: Optional[str] = None,
     workingLevel: Optional[str] = None,
+    assemblyCode: Optional[str] = None,
     sortBy: str = "firstName",
     direction: str = "asc",
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD")),
 ):
     q = db.query(VolunteerUser).filter(VolunteerUser.role.in_(["USER", "ASSEMBLY", "WARD", "BOOTH"]))
+    
+    # Resolve tenant from assemblyCode if provided
+    resolved_tenant_id = None
+    if assemblyCode:
+        normalized_code = _normalize_assembly_code(assemblyCode)
+        assembly_row = db.execute(
+            text("SELECT tenant_id FROM public.assembly WHERE assembly_code = :c OR CAST(assembly_no AS TEXT) = :n LIMIT 1"),
+            {"c": normalized_code, "n": str(int(normalized_code)) if normalized_code and normalized_code.isdigit() else normalized_code}
+        ).first()
+        if assembly_row:
+            resolved_tenant_id = assembly_row.tenant_id
+
     if current.role != "SUPER_ADMIN" and current.tenantId:
         q = q.filter(VolunteerUser.tenant_id == current.tenantId)
+    elif resolved_tenant_id:
+        # For SUPER_ADMIN or users without tenant, filter by resolved tenant OR allow legacy NULLs
+        q = q.filter((VolunteerUser.tenant_id == resolved_tenant_id) | (VolunteerUser.tenant_id.is_(None)) | (VolunteerUser.tenant_id == ""))
+
+    if assemblyCode:
+        normalized_code = _normalize_assembly_code(assemblyCode)
+        unpadded = str(int(normalized_code)) if normalized_code.isdigit() else normalized_code
+        # Further restrict to ensure even if tenant_id is NULL, they belong to this assembly
+        # Check both assignment_id and assembly_ids CSV string
+        q = q.filter(
+            (VolunteerUser.tenant_id == resolved_tenant_id) | 
+            (VolunteerUser.assembly_ids.like(f"%{normalized_code}%")) |
+            (VolunteerUser.assembly_ids.like(f"%{unpadded}%")) |
+            (VolunteerUser.assignment_id == normalized_code) |
+            (VolunteerUser.assignment_id == unpadded)
+        )
+
     if current.role == "WARD":
         scope = _resolve_access_scope_ids(db, current)
         allowed_ward_ids = sorted(scope.get("allowed_ward_ids") or []) if scope else []
@@ -1804,7 +1858,7 @@ def list_volunteers(
         if name_col:
             # 1. Try direct ID match
             if id_col:
-                clause, params = _build_in_clause(id_col, [str(m) for m in booth_ids_all], "pid")
+                clause, params = _build_in_clause(id_col, [str(m) for m in booth_ids_all], "bc")
                 rows = db.execute(text(f"SELECT {id_col} AS bid, {name_col} AS bname FROM public.booths WHERE {clause}"), params).all()
                 for r in rows:
                     if r.bname: booth_name_map[int(r.bid)] = r.bname
@@ -1816,7 +1870,7 @@ def list_volunteers(
                 if potential_composites:
                     potential_ward_ids = list(set([m // 10000 for m in potential_composites]))
                     if potential_ward_ids:
-                        clause, params = _build_in_clause(ward_ref, [str(w) for w in potential_ward_ids], "pwid")
+                        clause, params = _build_in_clause(ward_ref, [str(m) for m in potential_ward_ids], "wc_b")
                         rows = db.execute(text(f"SELECT {ward_ref} AS wid, {booth_no_col} AS bno, {name_col} AS bname FROM public.booths WHERE {clause}"), params).all()
                         for r in rows:
                             if r.wid is not None and r.bno is not None:
@@ -1828,7 +1882,7 @@ def list_volunteers(
             # 3. Try fallback booth_no match for any still remaining
             remaining_booths = booth_ids_all - set(booth_name_map.keys())
             if remaining_booths and booth_no_col:
-                clause, params = _build_in_clause(booth_no_col, [str(m) for m in remaining_booths], "pno")
+                clause, params = _build_in_clause(booth_no_col, [str(m) for m in remaining_booths], "bno_f")
                 rows = db.execute(text(f"SELECT {booth_no_col} AS bno, {name_col} AS bname FROM public.booths WHERE {clause}"), params).all()
                 for r in rows:
                     if r.bname: booth_name_map[int(r.bno)] = r.bname
@@ -2046,13 +2100,16 @@ def volunteer_analysis(
             else ("name_en" if "name_en" in ward_cols else ("ward_name_local" if "ward_name_local" in ward_cols else None))
         )
         if ward_code_col and ward_name_col:
+            t_clause, t_params = _build_public_tenant_filter(current)
             ward_rows = db.execute(
                 text(
                     f"""
                     SELECT {ward_code_col} AS ward_code, {ward_name_col} AS ward_name
                     FROM public.wards
+                    WHERE 1=1 {t_clause}
                     """
-                )
+                ),
+                t_params
             ).all()
             ward_name_map = {
                 str(r.ward_code): str(r.ward_name)
@@ -2171,13 +2228,16 @@ def volunteer_analysis_enrichment(
         else ("name_en" if "name_en" in ward_cols else ("ward_name_local" if "ward_name_local" in ward_cols else None))
     )
     if ward_code_col and ward_name_col:
+        t_clause, t_params = _build_public_tenant_filter(current)
         ward_rows = db.execute(
             text(
                 f"""
                 SELECT {ward_code_col} AS ward_code, {ward_name_col} AS ward_name
                 FROM public.wards
+                WHERE 1=1 {t_clause}
                 """
-            )
+            ),
+            t_params
         ).all()
         ward_name_map = {
             str(r.ward_code): str(r.ward_name) for r in ward_rows if r.ward_code is not None and r.ward_name is not None
@@ -2195,9 +2255,10 @@ def volunteer_analysis_enrichment(
             scope_ward_code_col = "ward_code" if "ward_code" in ward_cols else None
             if scope_ward_id_col and scope_ward_code_col:
                 clause, params = _build_in_clause(scope_ward_id_col, allowed_ward_ids, "scope_enrich_ward_id")
+                t_clause, t_params = _build_public_tenant_filter(current)
                 scope_ward_rows = db.execute(
-                    text(f"SELECT {scope_ward_code_col} AS ward_code FROM public.wards WHERE {clause}"),
-                    params,
+                    text(f"SELECT {scope_ward_code_col} AS ward_code FROM public.wards WHERE {clause} {t_clause}"),
+                    {**params, **t_params},
                 ).all()
                 allowed_ward_codes = [str(r.ward_code) for r in scope_ward_rows if r.ward_code is not None]
                 if allowed_ward_codes:
@@ -2287,15 +2348,16 @@ def volunteer_analysis_enrichment(
                 f"{name_col} AS name_en" if name_col else "NULL AS name_en",
                 f"{sl_col} AS sl" if sl_col else "NULL AS sl",
             ]
+            t_clause, t_params = _build_public_tenant_filter(current)
             public_rows = db.execute(
                 text(
                     f"""
                     SELECT {', '.join(select_cols)}
                     FROM public.voters
-                    WHERE {clause}
+                    WHERE {clause} {t_clause}
                     """
                 ),
-                params,
+                {**params, **t_params},
             ).all()
             public_voter_map = {
                 _normalize_epic(r.epic): {"name_en": r.name_en, "sl": r.sl}
@@ -2815,6 +2877,7 @@ def get_booths_plural(
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER")),
 ):
+    assemblyCode = _normalize_assembly_code(assemblyCode)
     scope = _resolve_access_scope_ids(db, current)
     if scope and not (scope.get("allowed_assembly_ids") or scope.get("allowed_ward_ids") or scope.get("allowed_booth_ids")):
         return []
@@ -2913,8 +2976,9 @@ def get_booths_plural(
 @app.get(f"{CONTEXT_PATH}/api/booths/public")
 def get_public_booths(
     wardId: Optional[int] = None,
+    assemblyId: Optional[str] = None,
     db: Session = Depends(get_db),
-    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER")),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER", "ASSEMBLY", "WARD")),
 ):
     scope = _resolve_access_scope_ids(db, current)
     booth_cols = _get_table_columns(db, "public", "booths")
@@ -2922,10 +2986,17 @@ def get_public_booths(
     id_col = "booth_no" if "booth_no" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
     name_col = "booth_add_en" if "booth_add_en" in booth_cols else ("polling_station_adr_en" if "polling_station_adr_en" in booth_cols else None)
     ward_ref = "ward_id" if "ward_id" in booth_cols else ("ward_no" if "ward_no" in booth_cols else None)
+    assembly_ref = "assembly_id" if "assembly_id" in booth_cols else ("assembly_no" if "assembly_no" in booth_cols else None)
     if not id_col or not name_col:
         return []
     where = []
     params: Dict[str, Any] = {}
+    if assemblyId:
+        normalized = normalize_assembly_code(assemblyId)
+        unpadded = str(int(normalized)) if normalized and normalized.isdigit() else normalized
+        where.append(f"({assembly_ref} = :assembly_id OR CAST({assembly_ref} AS TEXT) = :assembly_unpadded)")
+        params["assembly_id"] = normalized
+        params["assembly_unpadded"] = unpadded
     if wardId and ward_ref:
         where.append(f"{ward_ref} = :ward_id")
         params["ward_id"] = wardId
@@ -2963,12 +3034,15 @@ def get_public_booths(
 
 @app.get(f"{CONTEXT_PATH}/api/wards")
 def get_wards(
-    assemblyId: Optional[int] = None,
+    assemblyId: Optional[str] = None,
     db: Session = Depends(get_db),
-    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER")),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER", "ASSEMBLY", "WARD")),
 ):
+    assemblyId = _normalize_assembly_code(assemblyId)
     scope = _resolve_access_scope_ids(db, current)
+    print(f"[GET_WARDS] assemblyId={assemblyId}, role={current.role}, scope={scope}")
     if scope and not (scope.get("allowed_assembly_ids") or scope.get("allowed_ward_ids") or scope.get("allowed_booth_ids")):
+        print("[GET_WARDS] Empty scope, returning []")
         return []
     q = db.query(Ward)
     if assemblyId:
@@ -3005,8 +3079,18 @@ def get_wards(
     where = []
     params: Dict[str, Any] = {}
     if assemblyId and assembly_ref:
-        where.append(f"{assembly_ref} = :assembly_id")
-        params["assembly_id"] = assemblyId
+        normalized = _normalize_assembly_code(assemblyId)
+        unpadded = str(int(normalized)) if normalized and normalized.isdigit() else normalized
+        where.append(f"({assembly_ref} = :assembly_id OR CAST({assembly_ref} AS TEXT) = :assembly_unpadded)")
+        params["assembly_id"] = normalized
+        params["assembly_unpadded"] = unpadded
+    if current.role != "SUPER_ADMIN" and "tenant_id" in ward_cols:
+        if current.tenantId:
+            where.append("(tenant_id = :tid OR tenant_id IS NULL)")
+            params["tid"] = current.tenantId
+        else:
+            # If user has no tenant, they can see everything in public schema for that assembly
+            pass
     where_clause = f"WHERE {' AND '.join(where)}" if where else ""
     rows = db.execute(
         text(
@@ -3023,14 +3107,16 @@ def get_wards(
         allowed_ward_ids = scope.get("allowed_ward_ids") or set()
         allowed_assembly_ids = scope.get("allowed_assembly_ids") or set()
         
+        raw_count = len(rows)
         if allowed_ward_ids or allowed_assembly_ids:
             rows = [
                 r for r in rows 
-                if (not allowed_ward_ids or int(r.id) in allowed_ward_ids)
+                if (not allowed_ward_ids or (r.id is not None and int(r.id) in allowed_ward_ids))
                 or (not allowed_assembly_ids or (r.assembly_id is not None and int(r.assembly_id) in allowed_assembly_ids))
             ]
         else:
             rows = []
+        print(f"[GET_WARDS] Filtered rows from {raw_count} to {len(rows)}")
     return [
         {
             "wardId": int(r.id),
@@ -3317,14 +3403,16 @@ def search_voters(
         assembly_code_expr = "assembly_code" if "assembly_code" in assembly_cols else (
             f"LPAD(CAST({assembly_no_col} AS TEXT), 12, '0')" if assembly_no_col else "NULL"
         )
+        # For the assembly lookup itself, we don't strictly filter by tenant_id here
+        # because the user's assignment scope (allowed_assembly_ids) will restrict them below.
         assembly_row = db.execute(
             text(
                 f"""
                 SELECT {assembly_pk_col if assembly_pk_col else 'NULL'} AS assembly_pk,
                        {assembly_no_col if assembly_no_col else 'NULL'} AS assembly_no
                 FROM public.assembly
-                WHERE {assembly_code_expr} = :assembly_code
-                   OR CAST({assembly_no_col if assembly_no_col else assembly_code_expr} AS TEXT) = :assembly_no_text
+                WHERE ({assembly_code_expr} = :assembly_code
+                   OR CAST({assembly_no_col if assembly_no_col else assembly_code_expr} AS TEXT) = :assembly_no_text)
                 LIMIT 1
                 """
             ),
@@ -3342,6 +3430,7 @@ def search_voters(
 
     ward_by_id: Dict[int, Dict[str, Any]] = {}
     if ward_id_col:
+        assembly_ref_ward = "assembly_id" if "assembly_id" in ward_cols else ("assembly_no" if "assembly_no" in ward_cols else None)
         ward_rows = db.execute(
             text(
                 f"""
@@ -3351,8 +3440,13 @@ def search_voters(
                     {ward_name_en_col if ward_name_en_col else 'NULL'} AS ward_name_en,
                     {ward_name_local_col if ward_name_local_col else 'NULL'} AS ward_name_local
                 FROM public.wards
+                WHERE ({assembly_ref_ward} = :assembly_id OR CAST({assembly_ref_ward} AS TEXT) = :assembly_no_text)
                 """
-            )
+            ),
+            {
+                "assembly_id": normalize_assembly_code(assemblyCode),
+                "assembly_no_text": str(int(normalize_assembly_code(assemblyCode))),
+            }
         ).all()
         for r in ward_rows:
             if scope and scope.get("allowed_ward_ids") and int(r.ward_id) not in scope.get("allowed_ward_ids"):
@@ -3380,17 +3474,24 @@ def search_voters(
         }
         return empty_payload
 
+    # Booths don't have direct assembly_id, we must join with wards
+    assembly_ref_ward = "assembly_id" if "assembly_id" in ward_cols else ("assembly_no" if "assembly_no" in ward_cols else None)
     booth_sql = f"""
         SELECT
-            {booth_id_col} AS booth_id,
-            {booth_no_col} AS booth_no,
-            {booth_ward_code_col if booth_ward_code_col else 'NULL'} AS ward_code,
-            {booth_ward_id_col if booth_ward_id_col else 'NULL'} AS ward_id,
-            {booth_name_en_col if booth_name_en_col else 'NULL'} AS booth_name_en,
-            {booth_name_local_col if booth_name_local_col else 'NULL'} AS booth_name_local
-        FROM public.booths
+            b.{booth_id_col} AS booth_id,
+            b.{booth_no_col} AS booth_no,
+            b.{booth_ward_code_col if booth_ward_code_col else 'NULL'} AS ward_code,
+            b.{booth_ward_id_col if booth_ward_id_col else 'NULL'} AS ward_id,
+            b.{booth_name_en_col if booth_name_en_col else 'NULL'} AS booth_name_en,
+            b.{booth_name_local_col if booth_name_local_col else 'NULL'} AS booth_name_local
+        FROM public.booths b
+        JOIN public.wards w ON b.{booth_ward_id_col} = w.{ward_id_col}
+        WHERE (w.{assembly_ref_ward} = :assembly_id OR CAST(w.{assembly_ref_ward} AS TEXT) = :assembly_no_text)
     """
-    booth_rows = db.execute(text(booth_sql)).all()
+    booth_rows = db.execute(text(booth_sql), {
+        "assembly_id": normalize_assembly_code(assemblyCode),
+        "assembly_no_text": str(int(normalize_assembly_code(assemblyCode))),
+    }).all()
     booth_by_key: Dict[tuple, Dict[str, Any]] = {}
     booths_by_no: Dict[str, List[Dict[str, Any]]] = {}
     for b in booth_rows:
@@ -3438,18 +3539,26 @@ def search_voters(
 
     where_parts = ["1=1"]
     params: Dict[str, Any] = {"limit": max(1, min(size, 2000)), "offset": max(page, 0) * max(1, min(size, 2000))}
+    
+    if current.role != "SUPER_ADMIN" and "tenant_id" in voter_cols:
+        if current.tenantId:
+            where_parts.append("(tenant_id = :tid OR tenant_id IS NULL OR tenant_id = '')")
+            params["tid"] = current.tenantId
+        else:
+            # For users with no tenant, we rely on the assembly-scoped ward/booth filters
+            pass
 
-    if scope:
-        allowed_ward_codes = sorted({str(v.get("wardCode")) for v in ward_by_id.values() if v.get("wardCode")})
-        allowed_booth_nos = sorted({row.get("boothNo") for row in booth_by_key.values() if row.get("boothNo")})
-        if allowed_ward_codes and voter_ward_code_col:
-            clause, clause_params = _build_in_clause(f"CAST({voter_ward_code_col} AS TEXT)", allowed_ward_codes, "scope_ward_code")
-            where_parts.append(clause)
-            params.update(clause_params)
-        if allowed_booth_nos:
-            clause, clause_params = _build_in_clause(f"CAST({voter_booth_no_col} AS TEXT)", allowed_booth_nos, "scope_booth_no")
-            where_parts.append(clause)
-            params.update(clause_params)
+    allowed_ward_codes = sorted({str(v.get("wardCode")) for v in ward_by_id.values() if v.get("wardCode")})
+    allowed_booth_nos = sorted({row.get("boothNo") for row in booth_by_key.values() if row.get("boothNo")})
+    
+    if allowed_ward_codes and voter_ward_code_col:
+        clause, clause_params = _build_in_clause(f"CAST({voter_ward_code_col} AS TEXT)", allowed_ward_codes, "scope_ward_code")
+        where_parts.append(clause)
+        params.update(clause_params)
+    if allowed_booth_nos:
+        clause, clause_params = _build_in_clause(f"CAST({voter_booth_no_col} AS TEXT)", allowed_booth_nos, "scope_booth_no")
+        where_parts.append(clause)
+        params.update(clause_params)
 
     if ward_code_filter and voter_ward_code_col:
         where_parts.append(f"{voter_ward_code_col} = :ward_code")
@@ -3801,14 +3910,16 @@ def get_snapshot(
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "USER", "ADMIN")),
 ):
+    assemblyCode = _normalize_assembly_code(assemblyCode)
     try:
         scope = _resolve_access_scope_ids(db, current)
         if scope and not (scope.get("allowed_assembly_ids") or scope.get("allowed_ward_ids") or scope.get("allowed_booth_ids")):
             raise HTTPException(status_code=403, detail="No access scope defined for this user")
         try:
             public_snapshot = _build_public_snapshot(
-                assemblyCode,
-                db,
+                assembly_code=assemblyCode,
+                db=db,
+                current=current,
                 include_voters=includeVoters,
                 allowed_assembly_ids=scope.get("allowed_assembly_ids") if scope else None,
                 allowed_ward_ids=scope.get("allowed_ward_ids") if scope else None,
@@ -3819,7 +3930,8 @@ def get_snapshot(
             payload = api_success("Snapshot fetched successfully", snapshot_url)
             payload["snapshotMode"] = "link"
             return JSONResponse(content=payload, headers={"X-Snapshot-Mode": "link"})
-        except Exception:
+        except Exception as e:
+            print("[PUBLIC_SNAPSHOT_FAILED]", str(e))
             local_snapshot = _build_snapshot_from_data(db, assemblyCode, includeVoters, current)
             payload = api_success("Snapshot fetched successfully", local_snapshot)
             payload["snapshotMode"] = "direct"
@@ -3827,7 +3939,9 @@ def get_snapshot(
     except HTTPException as ex:
         return JSONResponse(status_code=ex.status_code, content=api_error("Snapshot failed", str(ex.detail)))
     except ValueError as ex:
-        return JSONResponse(status_code=404, content=api_error("No snapshot found", str(ex)))
+        detail = str(ex)
+        print("[SNAPSHOT_404]", detail)
+        return JSONResponse(status_code=404, content=api_error("No snapshot found", detail))
     except Exception as ex:
         print("[SNAPSHOT_ERROR]", ex)
         print(traceback.format_exc())
@@ -3940,12 +4054,12 @@ def _bootstrap_booth(db: Session, booth_id: int, tenant_id: str):
         return booth
 
     # Try to find in public.booths
-    res = db.execute(text("SELECT * FROM public.booths WHERE id = :bid"), {"bid": booth_id}).first()
+    res = db.execute(text("SELECT * FROM public.booths WHERE id = :bid AND (tenant_id = :tid OR tenant_id IS NULL)"), {"bid": booth_id, "tid": tenant_id}).first()
     if not res:
         return None
 
     # Try to find ward info in public.wards
-    ward_info = db.execute(text("SELECT id, assembly_no, ward_name_en, ward_name_local FROM public.wards WHERE ward_code = :wc"), {"wc": res.ward_code}).first()
+    ward_info = db.execute(text("SELECT id, assembly_no, ward_name_en, ward_name_local FROM public.wards WHERE ward_code = :wc AND (tenant_id = :tid OR tenant_id IS NULL)"), {"wc": res.ward_code, "tid": tenant_id}).first()
     assembly_id = ward_info.assembly_no if ward_info and ward_info.assembly_no else 1
     ward_id = ward_info.id if ward_info else res.ward_id
 
@@ -3996,7 +4110,7 @@ def _bootstrap_voter(db: Session, epic: str, booth: Booth, tenant_id: str):
         return voters
 
     # Find in public.voters
-    res = db.execute(text("SELECT * FROM public.voters WHERE epic = :epic"), {"epic": epic}).first()
+    res = db.execute(text("SELECT * FROM public.voters WHERE epic = :epic AND (tenant_id = :tid OR tenant_id IS NULL)"), {"epic": epic, "tid": tenant_id}).first()
     if not res:
         return None
 
@@ -4665,8 +4779,10 @@ def volunteer_dropdown(level: str, parentId: Optional[int] = None, db: Session =
             name_col = "assembly_name_en" if "assembly_name_en" in assembly_cols else ("name_en" if "name_en" in assembly_cols else ("assembly_name_local" if "assembly_name_local" in assembly_cols else ("name_kannada" if "name_kannada" in assembly_cols else None)))
             code_expr = "assembly_code" if "assembly_code" in assembly_cols else "NULL"
             if id_col and name_col:
+                t_clause, t_params = _build_public_tenant_filter(current)
                 public_rows = db.execute(
-                    text(f"SELECT {id_col} AS id, {name_col} AS name, {code_expr} AS code FROM public.assembly ORDER BY {name_col}")
+                    text(f"SELECT {id_col} AS id, {name_col} AS name, {code_expr} AS code FROM public.assembly WHERE 1=1 {t_clause} ORDER BY {name_col}"),
+                    t_params,
                 ).all()
                 # If public has more rows OR we are super admin (to get better names like KR Pura), use public
                 if not rows or len(public_rows) >= len(rows) or current.role == "SUPER_ADMIN":
@@ -4690,10 +4806,11 @@ def volunteer_dropdown(level: str, parentId: Optional[int] = None, db: Session =
             name_col = "ward_name_en" if "ward_name_en" in ward_cols else ("name_en" if "name_en" in ward_cols else ("ward_name_local" if "ward_name_local" in ward_cols else ("name_kannada" if "name_kannada" in ward_cols else None)))
             assembly_ref = "assembly_id" if "assembly_id" in ward_cols else ("assembly_no" if "assembly_no" in ward_cols else None)
             if id_col and name_col:
-                where = f"WHERE {assembly_ref} = :assembly_id" if assembly_ref else ""
+                t_clause, t_params = _build_public_tenant_filter(current)
+                where = f"WHERE {assembly_ref} = :assembly_id {t_clause}" if assembly_ref else (f"WHERE 1=1 {t_clause}")
                 public_rows = db.execute(
                     text(f"SELECT {id_col} AS id, {name_col} AS name FROM public.wards {where} ORDER BY {name_col}"),
-                    {"assembly_id": parentId},
+                    {"assembly_id": parentId, **t_params},
                 ).all()
                 if not rows or len(public_rows) > len(rows):
                     for row in public_rows:
@@ -4715,10 +4832,11 @@ def volunteer_dropdown(level: str, parentId: Optional[int] = None, db: Session =
             name_col = "polling_station_adr_en" if "polling_station_adr_en" in booth_cols else ("booth_add_en" if "booth_add_en" in booth_cols else ("name_en" if "name_en" in booth_cols else None))
             ward_ref = "ward_id" if "ward_id" in booth_cols else ("ward_no" if "ward_no" in booth_cols else None)
             if id_col and name_col:
-                where = f"WHERE {ward_ref} = :ward_id" if ward_ref else ""
+                t_clause, t_params = _build_public_tenant_filter(current)
+                where = f"WHERE {ward_ref} = :ward_id {t_clause}" if ward_ref else (f"WHERE 1=1 {t_clause}")
                 public_rows = db.execute(
                     text(f"SELECT {id_col} AS id, {name_col} AS name FROM public.booths {where} ORDER BY {name_col}"),
-                    {"ward_id": parentId},
+                    {"ward_id": parentId, **t_params},
                 ).all()
                 if not rows or len(public_rows) > len(rows):
                     for row in public_rows:
@@ -4839,19 +4957,30 @@ def _build_voter_map(v: Voter) -> Dict[str, Any]:
         "longitude": v.longitude,
     }
 
+_schema_cache: Dict[str, set[str]] = {}
 
 def _get_table_columns(db: Session, schema: str, table: str) -> set[str]:
-    rows = db.execute(
-        text(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = :schema AND table_name = :table
-            """
-        ),
-        {"schema": schema, "table": table},
-    ).all()
-    return {r[0] for r in rows}
+    key = f"{schema}.{table}"
+    if key in _schema_cache and _schema_cache[key]:
+        return _schema_cache[key]
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = :schema AND table_name = :table
+                """
+            ),
+            {"schema": schema, "table": table},
+        ).all()
+        cols = {r[0] for r in rows}
+        if cols:
+            _schema_cache[key] = cols
+        return cols
+    except Exception as e:
+        print(f"[SCHEMA_ERROR] Failed to fetch columns for {key}: {e}")
+        return set()
 
 
 def _get_public_voter_column_map(voter_cols: set[str]) -> Dict[str, str]:
@@ -5093,6 +5222,7 @@ def _ensure_public_assembly_code(db: Session) -> set[str]:
 def _build_public_snapshot(
     assembly_code: str,
     db: Session,
+    current: JwtUserDetails,
     include_voters: bool = True,
     allowed_assembly_ids: Optional[set[int]] = None,
     allowed_ward_ids: Optional[set[int]] = None,
@@ -5115,6 +5245,8 @@ def _build_public_snapshot(
         f"LPAD(CAST({assembly_no_col} AS TEXT), 12, '0')" if assembly_no_col else "NULL"
     )
 
+    # Lookup the assembly row in the public schema
+    # We don't filter by tenant here because we use the assembly assignment (scope) to grant access later.
     assembly_row = db.execute(
         text(
             f"""
@@ -5125,18 +5257,28 @@ def _build_public_snapshot(
                 {assembly_name_en_col if assembly_name_en_col else 'NULL'} AS assembly_name_en,
                 {assembly_name_local_col if assembly_name_local_col else 'NULL'} AS assembly_name_local
             FROM public.assembly
-            WHERE {assembly_code_expr} = :assembly_code
-               OR CAST({assembly_no_col if assembly_no_col else assembly_code_expr} AS TEXT) = :assembly_no_text
+            WHERE ({assembly_code_expr} = :assembly_code
+               OR CAST({assembly_no_col if assembly_no_col else assembly_code_expr} AS TEXT) = :assembly_no_text)
             LIMIT 1
             """
         ),
         {
             "assembly_code": requested_assembly_code,
-            "assembly_no_text": str(int(requested_assembly_code)),
+            "assembly_no_text": str(int(requested_assembly_code)) if requested_assembly_code and requested_assembly_code.isdigit() else requested_assembly_code,
         },
     ).first()
+
+    # Fallback if assembly row is missing but we have wards for it
     if not assembly_row:
-        raise ValueError(f"Assembly not found in public.assembly for assemblyCode: {assembly_code}")
+        # Create a synthetic assembly row from the requested code
+        class SyntheticRow:
+            def __init__(self, code):
+                self.assembly_code = code
+                self.assembly_pk = int(code) if code and code.isdigit() else None
+                self.assembly_no = self.assembly_pk
+                self.assembly_name_en = f"Assembly {code}"
+                self.assembly_name_local = None
+        assembly_row = SyntheticRow(requested_assembly_code)
     if allowed_assembly_ids:
         assembly_pk = assembly_row.assembly_pk if assembly_row.assembly_pk is not None else assembly_row.assembly_no
         if assembly_pk not in allowed_assembly_ids and assembly_row.assembly_no not in allowed_assembly_ids:
@@ -5148,39 +5290,8 @@ def _build_public_snapshot(
     booth_ward_code_col = "ward_code" if "ward_code" in booth_cols else None
     booth_name_en_col = "booth_add_en" if "booth_add_en" in booth_cols else ("polling_station_adr_en" if "polling_station_adr_en" in booth_cols else None)
     booth_name_local_col = "booth_add_local" if "booth_add_local" in booth_cols else ("polling_station_adr_local" if "polling_station_adr_local" in booth_cols else None)
-
-    if not booth_id_col or not booth_ward_id_col:
-        raise ValueError("public.booths missing required columns")
-
-    booth_filters: List[str] = []
-    booth_params: Dict[str, Any] = {}
-    if allowed_booth_ids:
-        clause, params = _build_in_clause(booth_id_col, sorted(allowed_booth_ids), "scope_booth")
-        booth_filters.append(clause)
-        booth_params.update(params)
-    if allowed_ward_ids:
-        clause, params = _build_in_clause(booth_ward_id_col, sorted(allowed_ward_ids), "scope_ward")
-        booth_filters.append(clause)
-        booth_params.update(params)
-    booth_where = f"WHERE {' AND '.join(booth_filters)}" if booth_filters else ""
-    booth_rows = db.execute(
-        text(
-            f"""
-            SELECT
-                {booth_id_col} AS booth_id,
-                {booth_ward_id_col} AS ward_id,
-                {booth_no_col} AS booth_no,
-                {booth_ward_code_col if booth_ward_code_col else 'NULL'} AS ward_code,
-                {booth_name_en_col if booth_name_en_col else 'NULL'} AS booth_name_en,
-                {booth_name_local_col if booth_name_local_col else 'NULL'} AS booth_name_local
-            FROM public.booths
-            {booth_where}
-            ORDER BY {booth_ward_id_col}, {booth_no_col}
-            """
-        ),
-        booth_params,
-    ).all()
-
+    
+    # Ward columns needed for booth filtering
     ward_id_col = "id" if "id" in ward_cols else ("ward_id" if "ward_id" in ward_cols else None)
     ward_code_col = "ward_code" if "ward_code" in ward_cols else ("ward_no" if "ward_no" in ward_cols else None)
     ward_name_en_col = "ward_name_en" if "ward_name_en" in ward_cols else ("name_en" if "name_en" in ward_cols else None)
@@ -5188,6 +5299,61 @@ def _build_public_snapshot(
     ward_assembly_id_col = "assembly_id" if "assembly_id" in ward_cols else None
     ward_assembly_no_col = "assembly_no" if "assembly_no" in ward_cols else None
     ward_assembly_code_col = "assembly_code" if "assembly_code" in ward_cols else None
+
+    booth_rows = []
+    if booth_id_col and booth_ward_id_col:
+        booth_filters: List[str] = []
+        booth_params: Dict[str, Any] = {}
+        
+        # Crucial: Filter booths by the requested assembly to avoid massive data transfer
+        if ward_id_col and (ward_assembly_id_col or ward_assembly_no_col or ward_assembly_code_col):
+            # We join with wards to restrict to the requested assembly
+            booth_filters.append(f"{booth_ward_id_col} IN (SELECT {ward_id_col} FROM public.wards WHERE " + 
+                                (f"{ward_assembly_id_col} = :assembly_pk" if ward_assembly_id_col and assembly_row.assembly_pk else
+                                 (f"{ward_assembly_no_col} = :assembly_no" if ward_assembly_no_col and assembly_row.assembly_no else
+                                  f"{ward_assembly_code_col} = :assembly_code")) + ")")
+            if ward_assembly_id_col and assembly_row.assembly_pk:
+                booth_params["assembly_pk"] = assembly_row.assembly_pk
+            elif ward_assembly_no_col and assembly_row.assembly_no:
+                booth_params["assembly_no"] = assembly_row.assembly_no
+            else:
+                booth_params["assembly_code"] = assembly_row.assembly_code or requested_assembly_code
+
+        if allowed_booth_ids:
+            clause, params = _build_in_clause(booth_id_col, sorted(allowed_booth_ids), "scope_booth")
+            booth_filters.append(clause)
+            booth_params.update(params)
+        if allowed_ward_ids:
+            clause, params = _build_in_clause(booth_ward_id_col, sorted(allowed_ward_ids), "scope_ward")
+            booth_filters.append(clause)
+            booth_params.update(params)
+        
+        if current.role != "SUPER_ADMIN" and "tenant_id" in booth_cols:
+            if current.tenantId:
+                booth_filters.append("(tenant_id = :tid OR tenant_id IS NULL)")
+                booth_params["tid"] = current.tenantId
+            else:
+                pass
+
+        booth_where = f"WHERE {' AND '.join(booth_filters)}" if booth_filters else ""
+        booth_rows = db.execute(
+            text(
+                f"""
+                SELECT
+                    {booth_id_col} AS booth_id,
+                    {booth_ward_id_col} AS ward_id,
+                    {booth_no_col} AS booth_no,
+                    {booth_ward_code_col if booth_ward_code_col else 'NULL'} AS ward_code,
+                    {booth_name_en_col if booth_name_en_col else 'NULL'} AS booth_name_en,
+                    {booth_name_local_col if booth_name_local_col else 'NULL'} AS booth_name_local
+                FROM public.booths
+                {booth_where}
+                ORDER BY {booth_ward_id_col}, {booth_no_col}
+                """
+            ),
+            booth_params,
+        ).all()
+
 
     ward_map: Dict[Any, Dict[str, Any]] = {}
     if ward_id_col:
@@ -5206,6 +5372,14 @@ def _build_public_snapshot(
             clause, params = _build_in_clause(ward_id_col, sorted(allowed_ward_ids), "scope_ward")
             ward_filters.append(clause)
             ward_params.update(params)
+
+        if current.role != "SUPER_ADMIN" and "tenant_id" in ward_cols:
+            if current.tenantId:
+                ward_filters.append("(tenant_id = :tid OR tenant_id IS NULL)")
+                ward_params["tid"] = current.tenantId
+            else:
+                # If user has no tenant, they can see everything in the requested assembly
+                pass
 
         ward_where = f"WHERE {' AND '.join(ward_filters)}" if ward_filters else ""
 
@@ -5284,6 +5458,13 @@ def _build_public_snapshot(
             }
         }
 
+    if current.role != "SUPER_ADMIN" and "tenant_id" in voter_cols:
+        if current.tenantId:
+            voter_where_parts.append("(tenant_id = :tid OR tenant_id IS NULL)")
+            voter_where_params["tid"] = current.tenantId
+        else:
+            pass
+
     voter_where_sql = " WHERE " + " AND ".join(voter_where_parts)
 
     if include_voters:
@@ -5310,83 +5491,44 @@ def _build_public_snapshot(
 
         for v in voter_rows:
             key = (str(v.ward_code) if v.ward_code is not None else None, str(v.booth_no))
-            voters_by_key.setdefault(key, []).append(
-                {
-                    "voterId": int(v.voter_id),
-                    "srNo": v.sr_no,
-                    "epicNo": v.epic_no,
-                    "firstMiddleNameEn": v.name_en,
-                    "lastNameEn": "",
-                    "firstMiddleNameLocal": v.name_local,
-                    "lastNameLocal": "",
-                    "houseNoEn": str(v.house_no_en) if v.house_no_en is not None else None,
-                    "houseNoLocal": None,
-                    "gender": v.gender,
-                    "age": None,
-                    "dob": None,
-                    "mobile": None,
-                    "addressEn": None,
-                    "addressLocal": None,
-                    "status": None,
-                    "community": None,
-                    "caste": None,
-                    "residenceType": None,
-                    "civicIssue": None,
-                    "motherTongue": None,
-                    "team": None,
-                    "ownership": None,
-                    "education": None,
-                    "natureOfVoter": None,
-                    "latitude": None,
-                    "longitude": None,
-                }
-            )
-        for key, rows in voters_by_key.items():
-            _merge_voter_payloads_with_enrichment(db, rows)
-            male = sum(1 for r in rows if (r.get("gender") or "").upper().startswith("M"))
-            female = sum(1 for r in rows if (r.get("gender") or "").upper().startswith("F"))
-            counts_by_key[key] = {"total": len(rows), "male": male, "female": female}
+            voters_by_key.setdefault(key, []).append({
+                "voterId": v.voter_id,
+                "sl": v.sr_no,
+                "epicNo": v.epic_no,
+                "firstMiddleNameEn": v.name_en,
+                "firstMiddleNameLocal": v.name_local,
+                "houseNoEn": v.house_no_en,
+                "gender": v.gender,
+            })
+            stats = counts_by_key.setdefault(key, {"total": 0, "male": 0, "female": 0})
+            stats["total"] += 1
+            g = (v.gender or "").upper()
+            if g.startswith("M"): stats["male"] += 1
+            elif g.startswith("F"): stats["female"] += 1
     else:
-        if voter_gender_col:
-            counts_rows = db.execute(
-                text(
-                    f"""
-                    SELECT
+        # Fetch stats only using aggregate query
+        stats_rows = db.execute(
+            text(
+                f"""
+                SELECT
                     {voter_ward_code_col if voter_ward_code_col else 'NULL'} AS ward_code,
                     {voter_booth_no_col} AS booth_no,
-                    COUNT(*)::int AS total_count,
-                    SUM(CASE WHEN UPPER(COALESCE({voter_gender_col}, '')) LIKE 'M%' THEN 1 ELSE 0 END)::int AS male_count,
-                    SUM(CASE WHEN UPPER(COALESCE({voter_gender_col}, '')) LIKE 'F%' THEN 1 ELSE 0 END)::int AS female_count
-                    FROM public.voters
-                    {voter_where_sql}
-                    GROUP BY {voter_ward_code_col if voter_ward_code_col else 'NULL'}, {voter_booth_no_col}
-                    """
-                ),
-                voter_where_params,
-            ).all()
-        else:
-            counts_rows = db.execute(
-                text(
-                    f"""
-                    SELECT
-                    {voter_ward_code_col if voter_ward_code_col else 'NULL'} AS ward_code,
-                    {voter_booth_no_col} AS booth_no,
-                    COUNT(*)::int AS total_count,
-                    0::int AS male_count,
-                    0::int AS female_count
-                    FROM public.voters
-                    {voter_where_sql}
-                    GROUP BY {voter_ward_code_col if voter_ward_code_col else 'NULL'}, {voter_booth_no_col}
-                    """
-                ),
-                voter_where_params,
-            ).all()
-        for row in counts_rows:
-            key = (str(row.ward_code) if row.ward_code is not None else None, str(row.booth_no))
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN UPPER({voter_gender_col if voter_gender_col else "'M'"}) LIKE 'M%' THEN 1 ELSE 0 END) AS male,
+                    SUM(CASE WHEN UPPER({voter_gender_col if voter_gender_col else "'F'"}) LIKE 'F%' THEN 1 ELSE 0 END) AS female
+                FROM public.voters
+                {voter_where_sql}
+                GROUP BY {voter_ward_code_col if voter_ward_code_col else 'NULL'}, {voter_booth_no_col}
+                """
+            ),
+            voter_where_params,
+        ).all()
+        for s in stats_rows:
+            key = (str(s.ward_code) if s.ward_code is not None else None, str(s.booth_no))
             counts_by_key[key] = {
-                "total": int(row.total_count or 0),
-                "male": int(row.male_count or 0),
-                "female": int(row.female_count or 0),
+                "total": int(s.total or 0),
+                "male": int(s.male or 0),
+                "female": int(s.female or 0),
             }
 
     for b in booth_rows:
@@ -5769,24 +5911,28 @@ def upload_excel(file: UploadFile = File(...), db: Session = Depends(get_db), cu
             db.flush()
 
         # Wards
-        for row in ws_ward.iter_rows(min_row=2, values_only=True):
+        for i, row in enumerate(ws_ward.iter_rows(min_row=2, values_only=True)):
             ward_code = row[h_ward.get("WARD_CODE", -1)]
             if ward_code is None or str(ward_code).strip() == "":
                 continue
-            exists = db.query(Ward).filter(Ward.ward_code == str(ward_code), Ward.tenant_id == current.tenantId).first()
-            if exists:
-                continue
-
+            
             assembly_no_row = row[h_ward.get("ASSEMBLY_NO", -1)]
             if assembly_no_row is None:
                 raise ValueError(f"Assembly number missing for ward: {ward_code}")
+            
+            cur_asm_no = int(assembly_no_row)
+            w_id = (cur_asm_no * 1000) + (i + 1)
+            
+            exists = db.query(Ward).filter(Ward.ward_id == w_id).first()
+            if exists:
+                continue
 
-            assembly_ref = db.query(Assembly).filter(Assembly.assembly_id == int(assembly_no_row)).first()
+            assembly_ref = db.query(Assembly).filter(Assembly.assembly_id == cur_asm_no).first()
             if not assembly_ref:
                 assembly_ref = Assembly(
-                    assembly_id=int(assembly_no_row),
-                    assembly_code=normalize_assembly_code(int(assembly_no_row)),
-                    assembly_name_en=f"Assembly {int(assembly_no_row)}",
+                    assembly_id=cur_asm_no,
+                    assembly_code=normalize_assembly_code(cur_asm_no),
+                    assembly_name_en=f"Assembly {cur_asm_no}",
                     tenant_id=current.tenantId,
                 )
                 db.add(assembly_ref)
@@ -5794,6 +5940,7 @@ def upload_excel(file: UploadFile = File(...), db: Session = Depends(get_db), cu
 
             db.add(
                 Ward(
+                    ward_id=w_id,
                     ward_code=str(ward_code),
                     ward_name_en=row[h_ward.get("WARD_NAME_EN", -1)] or f"Ward {ward_code}",
                     ward_name_local=row[h_ward.get("WARD_NAME_LOCAL", -1)],
@@ -5815,11 +5962,13 @@ def upload_excel(file: UploadFile = File(...), db: Session = Depends(get_db), cu
             if not ward:
                 raise ValueError(f"Ward not found for booth {booth_no} (wardCode={ward_code})")
 
-            booth = db.query(Booth).filter(Booth.booth_id == int(booth_no)).first()
+            b_id = (ward.ward_id * 1000) + int(booth_no)
+            booth = db.query(Booth).filter(Booth.booth_id == b_id).first()
             if not booth:
                 db.add(
                     Booth(
-                        booth_id=int(booth_no),
+                        booth_id=b_id,
+                        booth_no=str(booth_no),
                         ward_id=ward.ward_id,
                         polling_station_adr_en=row[h_booth.get("BOOTH_ADD_EN", -1)],
                         polling_station_adr_local=row[h_booth.get("BOOTH_ADD_LOCAL", -1)],
@@ -5894,6 +6043,173 @@ def upload_excel(file: UploadFile = File(...), db: Session = Depends(get_db), cu
     except Exception as ex:
         db.rollback()
         return JSONResponse(status_code=500, content=api_error("Excel upload failed", str(ex)))
+
+
+@app.post(f"{CONTEXT_PATH}/api/admin/master-roll/upload")
+def upload_master_roll(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN"))
+):
+    try:
+        wb = load_workbook(file.file, data_only=True)
+
+        def sheet(name: str):
+            for sn in wb.sheetnames:
+                if sn.upper() == name.upper(): return wb[sn]
+            raise ValueError(f"Missing required sheet: {name}")
+
+        def headers(ws) -> Dict[str, int]:
+            first_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+            return {str(v).strip().upper(): i for i, v in enumerate(first_row) if v is not None}
+
+        ws_assembly = sheet("ASSEMBLY")
+        ws_ward = sheet("WARD")
+        ws_booth = sheet("BOOTH")
+        ws_data = sheet("DATA")
+
+        h_assembly = headers(ws_assembly)
+        h_ward = headers(ws_ward)
+        h_booth = headers(ws_booth)
+        h_data = headers(ws_data)
+
+        # 1. Identify Assembly & Compute Tenant ID
+        arow = next(ws_assembly.iter_rows(min_row=2, max_row=2, values_only=True), None)
+        if not arow: raise ValueError("Sheet ASSEMBLY is empty")
+        
+        def get_val(r, h, k):
+            idx = h.get(k.upper())
+            if idx is None or idx < 0: return None
+            return r[idx]
+
+        asm_no_val = get_val(arow, h_assembly, "ASSEMBLY_NO") or get_val(arow, h_assembly, "ASSEMBLY_ID")
+        if asm_no_val is None: raise ValueError("Sheet ASSEMBLY missing ASSEMBLY_NO")
+        
+        assembly_no = int(asm_no_val)
+        assembly_code = normalize_assembly_code(assembly_no)
+        # Format: voter-000000000151
+        tenant_id = f"voter-{assembly_code}"
+        
+        asm_name_en = get_val(arow, h_assembly, "ASSEMBLY_NAME_EN")
+        asm_name_local = get_val(arow, h_assembly, "ASSEMBLY_NAME_LOCAL")
+
+        # Upsert into public.assembly (using assembly_no as PK)
+        db.execute(text("""
+            INSERT INTO public.assembly (assembly_no, assembly_name_en, assembly_name_local, assembly_code, tenant_id)
+            VALUES (:no, :en, :local, :code, :tid)
+            ON CONFLICT (assembly_no) DO UPDATE SET
+                assembly_name_en = EXCLUDED.assembly_name_en,
+                assembly_name_local = EXCLUDED.assembly_name_local,
+                tenant_id = EXCLUDED.tenant_id
+        """), {"no": assembly_no, "en": asm_name_en, "local": asm_name_local, "code": assembly_code, "tid": tenant_id})
+
+        # 2. Wards
+        ward_map = {} # ward_code -> synthesized_id
+        for i, row in enumerate(ws_ward.iter_rows(min_row=2, values_only=True)):
+            w_code = get_val(row, h_ward, "WARD_CODE") or get_val(row, h_ward, "WARD_COD")
+            w_no_raw = get_val(row, h_ward, "WARD_NO") or get_val(row, h_ward, "WARD_ID") or get_val(row, h_ward, "ID")
+            if w_code is None: continue
+            
+            # Deterministic synthesis that fits in 32-bit signed INT (max 2.1B)
+            # Strategy: assembly_no * 1000 + ward_index
+            w_id = (assembly_no * 1000) + (i + 1)
+            ward_map[str(w_code)] = w_id
+            
+            w_name_en = get_val(row, h_ward, "WARD_NAME_EN") or get_val(row, h_ward, "WARD_NAME")
+            w_name_local = get_val(row, h_ward, "WARD_NAME_LOCAL") or get_val(row, h_ward, "WARD_NAME_L")
+
+            db.execute(text("""
+                INSERT INTO public.wards (id, ward_code, ward_name_en, ward_name_local, assembly_no, tenant_id)
+                VALUES (:id, :code, :en, :local, :ano, :tid)
+                ON CONFLICT (id) DO UPDATE SET
+                    ward_name_en = EXCLUDED.ward_name_en,
+                    ward_name_local = EXCLUDED.ward_name_local,
+                    tenant_id = EXCLUDED.tenant_id
+            """), {
+                "id": w_id, "code": str(w_code), 
+                "en": w_name_en, "local": w_name_local,
+                "ano": assembly_no, "tid": tenant_id
+            })
+
+        # 3. Booths
+        for row in ws_booth.iter_rows(min_row=2, values_only=True):
+            b_no_raw = get_val(row, h_booth, "BOOTH_NO") or get_val(row, h_booth, "BOOTH_N")
+            w_code = get_val(row, h_booth, "WARD_CODE") or get_val(row, h_booth, "WARD_COD")
+            if b_no_raw is None or w_code is None: continue
+            
+            b_no = int(b_no_raw)
+            w_id = ward_map.get(str(w_code))
+            if not w_id:
+                # Fallback to DB fetch if not in current sheet
+                w_row = db.execute(text("SELECT id FROM public.wards WHERE ward_code = :wc AND assembly_no = :ano"), {"wc": str(w_code), "ano": assembly_no}).first()
+                if w_row: w_id = int(w_row.id)
+            
+            if not w_id: continue # Still no ward found
+
+            # Strategy: ward_id * 1000 + booth_no
+            # Example: 170999 * 1000 + 999 = 170,999,999 (well within 2.1B)
+            b_id = (w_id * 1000) + b_no
+
+            db.execute(text("""
+                INSERT INTO public.booths (id, booth_no, ward_code, ward_id, booth_add_en, booth_add_local, tenant_id)
+                VALUES (:id, :no, :wc, :wid, :en, :local, :tid)
+                ON CONFLICT (id) DO UPDATE SET
+                    booth_add_en = EXCLUDED.booth_add_en,
+                    booth_add_local = EXCLUDED.booth_add_local,
+                    tenant_id = EXCLUDED.tenant_id
+            """), {
+                "id": b_id, "no": b_no, "wc": str(w_code),
+                "wid": w_id,
+                "en": get_val(row, h_booth, "BOOTH_ADD_EN") or get_val(row, h_booth, "POLLING_STATION_ADR_EN") or get_val(row, h_booth, "BOOTH_NAME_EN"),
+                "local": get_val(row, h_booth, "BOOTH_ADD_LOCAL") or get_val(row, h_booth, "POLLING_STATION_ADR_LOCAL") or get_val(row, h_booth, "BOOTH_NAME_LOCAL"),
+                "tid": tenant_id
+            })
+
+        # 4. Voters
+        voter_count = 0
+        def get_val(r, h, k):
+            idx = h.get(k.upper())
+            if idx is None or idx < 0: return None
+            return r[idx]
+
+        for row in ws_data.iter_rows(min_row=2, values_only=True):
+            epic = get_val(row, h_data, "EPIC")
+            if not epic: continue
+            
+            # Map headers to model fields based on actual schema
+            params = {
+                "epic": str(epic),
+                "sl": str(get_val(row, h_data, "SL") or ""),
+                "name_en": get_val(row, h_data, "NAME_EN"),
+                "name_k": get_val(row, h_data, "NAME_KANNADA") or get_val(row, h_data, "NAME_LOCAL"),
+                "rel_e": get_val(row, h_data, "REL_ENG"),
+                "rel_k": get_val(row, h_data, "REL_KANNADA") or get_val(row, h_data, "REL_LOCAL"),
+                "rel_t": get_val(row, h_data, "REL_TYPE"),
+                "gender": get_val(row, h_data, "GENDER"),
+                "age": str(get_val(row, h_data, "AGE") or ""),
+                "house": str(get_val(row, h_data, "HOUSE") or ""),
+                "bno": int(get_val(row, h_data, "BOOTH_NO") or get_val(row, h_data, "BOOTH_N") or 0),
+                "wcode": str(get_val(row, h_data, "WARD_CODE") or get_val(row, h_data, "WARD_COD") or ""),
+                "mobile": str(get_val(row, h_data, "MOBILE")) if get_val(row, h_data, "MOBILE") else None,
+                "tid": tenant_id
+            }
+
+            db.execute(text("""
+                INSERT INTO public.voters (epic, sl, name_en, name_kannada, rel_eng, rel_kannada, rel_type, gender, age, house, booth_no, ward_code, mobile, tenant_id)
+                VALUES (:epic, :sl, :name_en, :name_k, :rel_e, :rel_k, :rel_t, :gender, :age, :house, :bno, :wcode, :mobile, :tid)
+                ON CONFLICT (epic) DO UPDATE SET
+                    name_en = EXCLUDED.name_en,
+                    mobile = COALESCE(voters.mobile, EXCLUDED.mobile),
+                    tenant_id = EXCLUDED.tenant_id
+            """), params)
+            voter_count += 1
+
+        db.commit()
+        return api_success(f"Master roll uploaded for tenant {tenant_id}", {"tenant_id": tenant_id, "voters": voter_count})
+    except Exception as ex:
+        db.rollback()
+        print(f"[IMPORT_ERROR] {traceback.format_exc()}")
+        return JSONResponse(status_code=500, content=api_error("Master roll upload failed", f"{type(ex).__name__}: {str(ex)}"))
 
 
 @app.get("/health")
