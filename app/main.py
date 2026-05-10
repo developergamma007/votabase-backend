@@ -403,7 +403,18 @@ class VoterEnrichment(Base):
     updated_by_name: Mapped[Optional[str]] = mapped_column(String(255))
     updated_by_phone: Mapped[Optional[str]] = mapped_column(String(50))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class PollDayConfig(Base):
+    __tablename__ = "poll_day_config"
+    __table_args__ = {"schema": "public"}
+
+    config_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    assembly_id: Mapped[Optional[int]] = mapped_column(Integer)
+    ward_id: Mapped[Optional[int]] = mapped_column(Integer)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
 
 
 class MessageTemplate(Base):
@@ -2498,11 +2509,22 @@ def volunteer_analysis_locations(
         return api_success("Volunteer locations fetched", [])
 
     epics = [str(e.epic).strip().upper() for e in enrichments if e.epic]
-    voter_gender_map: Dict[str, Optional[str]] = {}
+    # 1. Fetch from public.voters (Master list)
+    public_voter_map = {}
+    if epics:
+        clause, params = _build_in_clause("epic", epics, "pub_epic")
+        rows_pub = db.execute(
+            text(f"SELECT epic, name_en, rel_eng, gender, mobile FROM public.voters WHERE {clause}"),
+            params
+        ).all()
+        public_voter_map = {str(r.epic).strip().upper(): r for r in rows_pub if r.epic}
+
+    # 2. Fetch from data.voters (Tenant specific)
+    tenant_voter_map: Dict[str, Voter] = {}
     if epics:
         voter_rows = db.query(Voter).filter(Voter.epic_no.in_(epics)).all()
-        voter_gender_map = {
-            str(v.epic_no).strip().upper(): v.gender for v in voter_rows if v.epic_no is not None
+        tenant_voter_map = {
+            str(v.epic_no).strip().upper(): v for v in voter_rows if v.epic_no is not None
         }
 
     rows: List[Dict[str, Any]] = []
@@ -2511,7 +2533,10 @@ def volunteer_analysis_locations(
         if enrichment.latitude is None or enrichment.longitude is None:
             continue
         epic_key = str(enrichment.epic).strip().upper() if enrichment.epic else None
-        gender = enrichment.gender or (voter_gender_map.get(epic_key) if epic_key else None)
+        v_ten = tenant_voter_map.get(epic_key)
+        v_pub = public_voter_map.get(epic_key)
+        
+        gender = enrichment.gender or (v_ten.gender if v_ten else None) or (v_pub.gender if v_pub else None)
         gender_upper = str(gender or "").upper()
         if gender_upper.startswith("M"):
             gender_counts["male"] += 1
@@ -2519,11 +2544,34 @@ def volunteer_analysis_locations(
             gender_counts["female"] += 1
         else:
             gender_counts["other"] += 1
+
+        name_parts = [
+            enrichment.first_middle_name_en or (v_ten.first_middle_name_en if v_ten else None),
+            enrichment.last_name_en or (v_ten.last_name_en if v_ten else None),
+        ]
+        full_name = " ".join([part for part in name_parts if part]).strip()
+        if not full_name and v_pub:
+            full_name = v_pub.name_en
+        if not full_name:
+            full_name = "Unknown"
+
+        rel_parts = [
+            enrichment.relation_first_middle_name_en or (v_ten.relation_first_middle_name_en if v_ten else None),
+            enrichment.relation_last_name_en or (v_ten.relation_last_name_en if v_ten else None),
+        ]
+        relation_name = " ".join([part for part in rel_parts if part]).strip()
+        if not relation_name and v_pub:
+            relation_name = v_pub.rel_eng
+
         rows.append(
             {
                 "latitude": enrichment.latitude,
                 "longitude": enrichment.longitude,
                 "gender": gender,
+                "name": full_name,
+                "epic": enrichment.epic,
+                "relationName": relation_name,
+                "mobile": enrichment.mobile or (v_ten.mobile if v_ten else None) or (v_pub.mobile if v_pub else None),
             }
         )
     print(
@@ -3710,6 +3758,50 @@ def search_voters(
     return payload
 
 
+@app.get(f"{CONTEXT_PATH}/api/poll-day/config")
+def get_poll_day_config(assemblyId: Optional[str] = None, wardId: Optional[str] = None, db: Session = Depends(get_db)):
+    # Convert to int if provided
+    aid = int(assemblyId) if assemblyId and str(assemblyId).isdigit() else None
+    wid = int(wardId) if wardId and str(wardId).isdigit() else None
+    
+    # Check exact match for the specific level requested
+    exact_config = db.query(PollDayConfig).filter(
+        PollDayConfig.assembly_id == aid, 
+        PollDayConfig.ward_id == wid, 
+        PollDayConfig.enabled == True
+    ).first()
+    
+    # Determine if functionality should be 'active' for this context (global or specific)
+    is_active = exact_config is not None
+    if not is_active and (aid is not None or wid is not None):
+        global_config = db.query(PollDayConfig).filter(
+            PollDayConfig.assembly_id == None, 
+            PollDayConfig.ward_id == None, 
+            PollDayConfig.enabled == True
+        ).first()
+        if global_config:
+            is_active = True
+            
+    return {"enabled": exact_config is not None, "isActive": is_active}
+
+@app.post(f"{CONTEXT_PATH}/api/poll-day/config")
+def set_poll_day_config(payload: Dict, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN"))):
+    assembly_id = payload.get("assemblyId") 
+    ward_id = payload.get("wardId")         
+    enabled = payload.get("enabled", False)
+    
+    aid = int(assembly_id) if assembly_id and str(assembly_id).isdigit() else None
+    wid = int(ward_id) if ward_id and str(ward_id).isdigit() else None
+    
+    config = db.query(PollDayConfig).filter(PollDayConfig.assembly_id == aid, PollDayConfig.ward_id == wid).first()
+    if not config:
+        config = PollDayConfig(assembly_id=aid, ward_id=wid, enabled=enabled)
+        db.add(config)
+    else:
+        config.enabled = enabled
+    db.commit()
+    return api_success("Poll day config updated", {"enabled": enabled})
+
 @app.get(f"{CONTEXT_PATH}/api/voters/by-booth")
 def get_voters_by_booth(
     boothId: int,
@@ -4687,35 +4779,44 @@ def record_meeting_attendance(id: int, db: Session = Depends(get_db), current: J
     if not meeting or not meeting.latitude or not meeting.longitude or not meeting.radius:
         raise ValueError("Meeting not found or lacks location/radius")
     
-    r_deg = meeting.radius / 111000.0
+    # Approximate degree conversion for radius
+    # 1 degree lat is ~111km. 1 degree lon is ~111km * cos(lat)
+    import math
+    lat_deg = meeting.radius / 111320.0
+    lon_deg = meeting.radius / (111320.0 * math.cos(math.radians(meeting.latitude)))
     
     q = db.query(Voter).filter(
         Voter.tenant_id == meeting.tenant_id,
-        Voter.latitude.isnot(None),
-        Voter.longitude.isnot(None)
+        Voter.latitude.between(meeting.latitude - lat_deg, meeting.latitude + lat_deg),
+        Voter.longitude.between(meeting.longitude - lon_deg, meeting.longitude + lon_deg)
     )
+    
     voters = q.all()
     count = 0
-    import math
     for v in voters:
-        if v.latitude and v.longitude:
-            dist_deg = math.sqrt((v.latitude - meeting.latitude)**2 + (v.longitude - meeting.longitude)**2)
-            if dist_deg <= r_deg:
-                att = db.query(MeetingAttendance).filter(MeetingAttendance.meeting_id == meeting.meeting_id, MeetingAttendance.voter_id == v.voter_id).first()
-                if not att:
-                    att = MeetingAttendance(
-                        meeting_id=meeting.meeting_id,
-                        voter_id=v.voter_id,
-                        distance=dist_deg * 111000,
-                    )
-                    db.add(att)
-                    count += 1
+        # Fine-grained distance check
+        dist_deg = math.sqrt((v.latitude - meeting.latitude)**2 + (v.longitude - meeting.longitude)**2)
+        # Using a simple average for degree to meter conversion here for speed
+        if dist_deg * 111000 <= meeting.radius:
+            att = db.query(MeetingAttendance).filter(MeetingAttendance.meeting_id == meeting.meeting_id, MeetingAttendance.voter_id == v.voter_id).first()
+            if not att:
+                att = MeetingAttendance(
+                    meeting_id=meeting.meeting_id,
+                    voter_id=v.voter_id,
+                    distance=dist_deg * 111000,
+                )
+                db.add(att)
+                count += 1
     db.commit()
     return api_success("Attendance recorded", {"added": count})
 
 
 @app.post(f"{CONTEXT_PATH}/api/meetings/{{id}}/attend-self")
-def attend_meeting_self(id: int, db: Session = Depends(get_db), current: JwtUserDetails = Depends(get_current_user)):
+def attend_meeting_self(id: int, lat: Optional[float] = None, lng: Optional[float] = None, db: Session = Depends(get_db), current: JwtUserDetails = Depends(get_current_user)):
+    meeting = db.query(Meeting).filter(Meeting.meeting_id == id).first()
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+
     existing = db.query(MeetingAttendance).filter(
         MeetingAttendance.meeting_id == id,
         MeetingAttendance.volunteer_phone == current.phone
@@ -4723,10 +4824,22 @@ def attend_meeting_self(id: int, db: Session = Depends(get_db), current: JwtUser
     if existing:
         return api_success("Already attended", {})
     
+    # Try to link to a voter record by phone (fuzzy match last 10 digits)
+    v_phone_tail = current.phone[-10:] if current.phone and len(current.phone) >= 10 else current.phone
+    voter = db.query(Voter).filter(Voter.mobile.like(f"%{v_phone_tail}")).first()
+    
+    distance = None
+    if lat is not None and lng is not None and meeting.latitude is not None and meeting.longitude is not None:
+        import math
+        dist_deg = math.sqrt((lat - meeting.latitude)**2 + (lng - meeting.longitude)**2)
+        distance = dist_deg * 111000
+
     att = MeetingAttendance(
         meeting_id=id,
+        voter_id=voter.voter_id if voter else None,
         volunteer_name=current.firstName,
         volunteer_phone=current.phone,
+        distance=distance,
         attended_at=func.now()
     )
     db.add(att)
@@ -4743,11 +4856,19 @@ def list_meeting_attendance(id: int, db: Session = Depends(get_db), current: Jwt
         v_phone = att.volunteer_phone
         v_epic = "-"
         
+        # Priority 1: Linked voter_id
         if att.voter_id:
             v = db.query(Voter).filter(Voter.voter_id == att.voter_id).first()
             if v:
                 v_name = f"{v.first_middle_name_en or ''} {v.last_name_en or ''}".strip()
                 v_phone = v.mobile
+                v_epic = v.epic_no
+        # Priority 2: Lookup by volunteer_phone if EPIC is still missing
+        elif v_phone:
+            v_phone_tail = v_phone[-10:] if len(v_phone) >= 10 else v_phone
+            v = db.query(Voter).filter(Voter.mobile.like(f"%{v_phone_tail}")).first()
+            if v:
+                if not v_name: v_name = f"{v.first_middle_name_en or ''} {v.last_name_en or ''}".strip()
                 v_epic = v.epic_no
 
         out.append({
