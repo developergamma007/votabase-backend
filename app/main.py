@@ -277,6 +277,12 @@ class Family(Base):
     association_id: Mapped[Optional[int]] = mapped_column(ForeignKey("data.association.association_id"))
     economic_status: Mapped[Optional[str]] = mapped_column(String(50))
     family_nature: Mapped[Optional[str]] = mapped_column(String(50))
+    road_name: Mapped[Optional[str]] = mapped_column(String(255))
+    building_number: Mapped[Optional[str]] = mapped_column(String(100))
+    flat_number: Mapped[Optional[str]] = mapped_column(String(100))
+    family_number: Mapped[Optional[str]] = mapped_column(String(100))
+    tag_leader: Mapped[Optional[str]] = mapped_column(String(255))
+    family_availability: Mapped[Optional[str]] = mapped_column(String(50))
     deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
@@ -708,7 +714,13 @@ class CreateAssociationRequest(BaseModel):
 class CreateFamilyRequest(BaseModel):
     familyName: str
     familyAddress: Optional[str] = None
+    roadName: Optional[str] = None
+    buildingNumber: Optional[str] = None
     buildingName: Optional[str] = None
+    flatNumber: Optional[str] = None
+    familyNumber: Optional[str] = None
+    tagLeader: Optional[str] = None
+    familyAvailability: Optional[str] = None
     buildingAddress: Optional[str] = None
     hasAssociation: Optional[bool] = None
     associationName: Optional[str] = None
@@ -1416,6 +1428,18 @@ def startup_ensure_voter_enrichment() -> None:
             db.execute(text("ALTER TABLE data.family ADD COLUMN association_head_name varchar(255)"))
         if "association_head_phone" not in family_cols:
             db.execute(text("ALTER TABLE data.family ADD COLUMN association_head_phone varchar(30)"))
+        if "road_name" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN road_name varchar(255)"))
+        if "building_number" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN building_number varchar(100)"))
+        if "flat_number" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN flat_number varchar(100)"))
+        if "family_number" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN family_number varchar(100)"))
+        if "tag_leader" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN tag_leader varchar(255)"))
+        if "family_availability" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN family_availability varchar(50)"))
 
         col = db.execute(
             text(
@@ -2968,11 +2992,14 @@ def get_booths_plural(
         ]
 
     booth_cols = _get_table_columns(db, "public", "booths")
-    id_col = "booth_id" if "booth_id" in booth_cols else ("booth_no" if "booth_no" in booth_cols else ("id" if "id" in booth_cols else None))
+    pk_col = "booth_id" if "booth_id" in booth_cols else ("id" if "id" in booth_cols else None)
+    no_col = "booth_no" if "booth_no" in booth_cols else None
     name_col = "polling_station_adr_en" if "polling_station_adr_en" in booth_cols else ("booth_add_en" if "booth_add_en" in booth_cols else ("name_en" if "name_en" in booth_cols else None))
     ward_ref = "ward_id" if "ward_id" in booth_cols else ("ward_no" if "ward_no" in booth_cols else None)
-    if not id_col or not name_col:
+    if not (pk_col or no_col) or not name_col:
         return []
+    select_pk = f"{pk_col} AS booth_pk" if pk_col else "NULL AS booth_pk"
+    select_no = f"{no_col} AS booth_no" if no_col else "NULL AS booth_no"
     where = []
     params: Dict[str, Any] = {}
     if wardId and ward_ref:
@@ -2982,7 +3009,7 @@ def get_booths_plural(
     rows = db.execute(
         text(
             f"""
-            SELECT {id_col} AS id, {name_col} AS name, {ward_ref if ward_ref else 'NULL'} AS ward_id
+            SELECT {select_pk}, {select_no}, {name_col} AS name, {ward_ref if ward_ref else 'NULL'} AS ward_id
             FROM public.booths
             {where_clause}
             ORDER BY {name_col}
@@ -3001,24 +3028,36 @@ def get_booths_plural(
         rows = [
             r
             for r in rows
-            if (not allowed_booth_ids or int(r.id) in allowed_booth_ids)
+            if (not allowed_booth_ids or int(getattr(r, "booth_pk", None) or getattr(r, "booth_no", None) or 0) in allowed_booth_ids)
             and (not allowed_ward_ids or (r.ward_id is not None and int(r.ward_id) in allowed_ward_ids))
         ]
-        # If we have allowed assemblies but no wards were found in ORM, 
-        # we might need to be more permissive here, but usually scope expansion handles it.
-    return [
-        {
-            "boothId": int(r.ward_id) * 10000 + int(r.id) if r.ward_id is not None else int(r.id),
-            "pollingStationAdrEn": r.name,
-            "pollingStation_adr_en": r.name,
-            "boothNameEn": r.name,
-            "pollingStationAdrLocal": None,
-            "wardId": int(r.ward_id) if r.ward_id is not None else None,
-            "tenantId": None,
-            "boothNo": int(r.id) if r.id is not None else None,
-        }
-        for r in rows
-    ]
+    result = []
+    for r in rows:
+        booth_pk = getattr(r, "booth_pk", None)
+        booth_no = getattr(r, "booth_no", None)
+        ward_id_val = int(r.ward_id) if r.ward_id is not None else None
+        if booth_pk is not None:
+            resolved_id = int(booth_pk)
+        elif ward_id_val is not None and booth_no is not None:
+            try:
+                resolved_id = ward_id_val * 10000 + int(booth_no)
+            except (TypeError, ValueError):
+                resolved_id = ward_id_val
+        else:
+            resolved_id = int(booth_no) if booth_no is not None else 0
+        result.append(
+            {
+                "boothId": resolved_id,
+                "pollingStationAdrEn": r.name,
+                "pollingStation_adr_en": r.name,
+                "boothNameEn": r.name,
+                "pollingStationAdrLocal": None,
+                "wardId": ward_id_val,
+                "tenantId": None,
+                "boothNo": int(booth_no) if booth_no is not None and str(booth_no).isdigit() else booth_no,
+            }
+        )
+    return result
 
 
 @app.get(f"{CONTEXT_PATH}/api/booths/public")
@@ -3805,6 +3844,8 @@ def set_poll_day_config(payload: Dict, db: Session = Depends(get_db), current: J
 @app.get(f"{CONTEXT_PATH}/api/voters/by-booth")
 def get_voters_by_booth(
     boothId: int,
+    wardId: Optional[int] = None,
+    boothNo: Optional[int] = None,
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "USER", "ADMIN")),
 ):
@@ -3825,9 +3866,7 @@ def get_voters_by_booth(
     if not booth_id_col or not booth_no_col:
         return JSONResponse(status_code=404, content=api_error("Booth not found", "public.booths missing required columns"))
 
-    booth_row = db.execute(
-        text(
-            f"""
+    booth_select = f"""
             SELECT
                 {booth_id_col} AS booth_id,
                 {booth_no_col} AS booth_no,
@@ -3836,12 +3875,53 @@ def get_voters_by_booth(
                 {booth_name_en_col if booth_name_en_col else 'NULL'} AS booth_name_en,
                 {booth_name_local_col if booth_name_local_col else 'NULL'} AS booth_name_local
             FROM public.booths
-            WHERE {booth_id_col} = :booth_id
-            LIMIT 1
             """
-        ),
+    booth_row = db.execute(
+        text(f"{booth_select} WHERE {booth_id_col} = :booth_id LIMIT 1"),
         {"booth_id": boothId},
     ).first()
+    def _lookup_by_ward_and_no(target_ward: int, target_no: int):
+        if not (booth_ward_id_col and booth_no_col):
+            return None
+        return db.execute(
+            text(
+                f"""
+                {booth_select}
+                WHERE {booth_ward_id_col} = :ward_id
+                  AND (
+                    CAST({booth_no_col} AS TEXT) = :booth_no_txt
+                    OR CAST({booth_no_col} AS INT) = :booth_no_int
+                  )
+                LIMIT 1
+                """
+            ),
+            {
+                "ward_id": target_ward,
+                "booth_no_txt": str(target_no),
+                "booth_no_int": target_no,
+            },
+        ).first()
+
+    # Fallback: explicit ward + booth number (mobile snapshot / booth list)
+    if not booth_row and wardId is not None and boothNo is not None:
+        booth_row = _lookup_by_ward_and_no(int(wardId), int(boothNo))
+    # Fallback: composite boothId from GET /booths (wardId * 10000 + boothNo)
+    if not booth_row and boothId >= 10000:
+        composite_ward = int(boothId) // 10000
+        composite_no = int(boothId) % 10000
+        booth_row = _lookup_by_ward_and_no(composite_ward, composite_no)
+    # Fallback: data.booths ORM primary key
+    if not booth_row:
+        orm_booth = db.query(Booth).filter(Booth.booth_id == boothId).first()
+        if orm_booth:
+            booth_row = type("BoothRow", (), {
+                "booth_id": orm_booth.booth_id,
+                "booth_no": orm_booth.booth_no,
+                "ward_code": orm_booth.ward_code,
+                "ward_id": orm_booth.ward_id,
+                "booth_name_en": orm_booth.polling_station_adr_en or orm_booth.booth_add_en,
+                "booth_name_local": orm_booth.polling_station_adr_local or orm_booth.booth_add_local,
+            })()
     if not booth_row:
         return JSONResponse(status_code=404, content=api_error("Booth not found", f"Invalid boothId: {boothId}"))
     if scope:
@@ -4100,16 +4180,25 @@ def _family_to_dto(db: Session, fam: Family) -> Dict[str, Any]:
             if member.is_head:
                 head_name = full_name
                 head_epic = voter.epic_no
+            relation_name = f"{voter.relation_first_middle_name_en or ''} {voter.relation_last_name_en or ''}".strip()
             m_dto.append(
                 {
                     "memberId": member.member_id,
                     "head": bool(member.is_head),
                     "epicNo": voter.epic_no,
                     "voterName": full_name,
+                    "relationName": relation_name or voter.relation_type or "",
                 }
             )
     except Exception as e:
         print(f"Error in _family_to_dto members: {e}")
+
+    ward_id = None
+    try:
+        booth = db.query(Booth).filter(Booth.booth_id == fam.booth_id).first()
+        ward_id = booth.ward_id if booth else None
+    except Exception:
+        ward_id = None
 
     return {
         "familyId": fam.familyId,
@@ -4128,6 +4217,7 @@ def _family_to_dto(db: Session, fam: Family) -> Dict[str, Any]:
         "latitude": fam.latitude,
         "longitude": fam.longitude,
         "boothId": fam.booth_id,
+        "wardId": ward_id,
         "associationId": fam.association_id,
         "headMemberId": fam.head_voter_id,
         "headName": head_name,
@@ -4136,6 +4226,12 @@ def _family_to_dto(db: Session, fam: Family) -> Dict[str, Any]:
         "members": m_dto,
         "economicStatus": fam.economic_status,
         "familyNature": fam.family_nature,
+        "roadName": fam.road_name,
+        "buildingNumber": fam.building_number,
+        "flatNumber": fam.flat_number,
+        "familyNumber": fam.family_number,
+        "tagLeader": fam.tag_leader,
+        "familyAvailability": fam.family_availability,
     }
 
 
@@ -4250,7 +4346,13 @@ def create_family(payload: CreateFamilyRequest, db: Session = Depends(get_db), c
     fam = Family(
         family_name=payload.familyName,
         family_address=payload.familyAddress,
+        road_name=payload.roadName,
+        building_number=payload.buildingNumber,
         building_name=payload.buildingName,
+        flat_number=payload.flatNumber,
+        family_number=payload.familyNumber,
+        tag_leader=payload.tagLeader,
+        family_availability=payload.familyAvailability,
         building_address=payload.buildingAddress,
         has_association=payload.hasAssociation,
         association_name=payload.associationName,
@@ -4302,7 +4404,13 @@ def update_family(familyId: int, payload: UpdateFamilyRequest, db: Session = Dep
 
     fam.family_name = payload.familyName
     fam.family_address = payload.familyAddress
+    fam.road_name = payload.roadName
+    fam.building_number = payload.buildingNumber
     fam.building_name = payload.buildingName
+    fam.flat_number = payload.flatNumber
+    fam.family_number = payload.familyNumber
+    fam.tag_leader = payload.tagLeader
+    fam.family_availability = payload.familyAvailability
     fam.building_address = payload.buildingAddress
     fam.has_association = payload.hasAssociation
     fam.association_name = payload.associationName
@@ -4443,6 +4551,20 @@ def family_suggestions(
             if r[0]: final_names.add(r[0])
             
         return api_success("Suggestions fetched", sorted(list(final_names))[:100])
+
+    elif field == "road":
+        q = db.query(Family.road_name).filter(Family.road_name.isnot(None), Family.deleted.is_(False))
+        if current.tenantId:
+            q = q.filter(Family.tenant_id == current.tenantId)
+        results = q.distinct().limit(100).all()
+        return api_success("Suggestions fetched", [r[0] for r in results if r[0]])
+
+    elif field == "leader":
+        q = db.query(Family.tag_leader).filter(Family.tag_leader.isnot(None), Family.deleted.is_(False))
+        if current.tenantId:
+            q = q.filter(Family.tenant_id == current.tenantId)
+        results = q.distinct().limit(100).all()
+        return api_success("Suggestions fetched", [r[0] for r in results if r[0]])
     
     return api_success("Suggestions fetched", [])
 
@@ -4522,13 +4644,22 @@ def get_message_template(
 
 @app.get(f"{CONTEXT_PATH}/api/message-template/activated-wards")
 def get_activated_wards(
+    assemblyId: Optional[int] = Query(None),
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER")),
 ):
-    templates = db.query(MessageTemplate).filter(
+    q = db.query(MessageTemplate).filter(
         MessageTemplate.tenant_id == current.tenantId, 
         MessageTemplate.enabled == True
-    ).all()
+    )
+    
+    if assemblyId:
+        # Include Global (ward_id is NULL) OR Wards belonging to this assembly
+        q = q.outerjoin(Ward, MessageTemplate.ward_id == Ward.ward_id).filter(
+            or_(MessageTemplate.ward_id.is_(None), Ward.assembly_id == assemblyId)
+        )
+
+    templates = q.all()
     
     # Pre-fetch ward details for labeling
     ward_ids = [t.ward_id for t in templates if t.ward_id is not None]
