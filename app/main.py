@@ -284,6 +284,14 @@ class Family(Base):
     tag_leader: Mapped[Optional[str]] = mapped_column(String(255))
     family_availability: Mapped[Optional[str]] = mapped_column(String(50))
     deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_by: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_by_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_by_phone: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    updated_by: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    updated_by_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    updated_by_phone: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
 
 class FamilyMember(Base):
@@ -1440,6 +1448,22 @@ def startup_ensure_voter_enrichment() -> None:
             db.execute(text("ALTER TABLE data.family ADD COLUMN tag_leader varchar(255)"))
         if "family_availability" not in family_cols:
             db.execute(text("ALTER TABLE data.family ADD COLUMN family_availability varchar(50)"))
+        if "created_at" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN created_at timestamp"))
+        if "updated_at" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN updated_at timestamp"))
+        if "created_by" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN created_by integer"))
+        if "created_by_name" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN created_by_name varchar(255)"))
+        if "created_by_phone" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN created_by_phone varchar(50)"))
+        if "updated_by" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN updated_by integer"))
+        if "updated_by_name" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN updated_by_name varchar(255)"))
+        if "updated_by_phone" not in family_cols:
+            db.execute(text("ALTER TABLE data.family ADD COLUMN updated_by_phone varchar(50)"))
 
         col = db.execute(
             text(
@@ -4169,7 +4193,305 @@ def create_association(payload: CreateAssociationRequest, db: Session = Depends(
     )
 
 
-def _family_to_dto(db: Session, fam: Family) -> Dict[str, Any]:
+FAMILY_AVAILABILITY_BUCKETS = [
+    {"key": "available", "label": "Available", "match": "Available"},
+    {"key": "notAvailable", "label": "Not Available", "match": "Not Available"},
+    {"key": "entryDenied", "label": "Entry Denied", "match": "Entry Denied"},
+    {"key": "dataNotGiven", "label": "Data not Given", "match": "Data not Given"},
+    {"key": "doorClosed", "label": "Door Closed", "match": "Door Closed"},
+]
+
+FAMILY_DETAIL_EXPORT_FIELDS = [
+    ("roadName", "Road Name"),
+    ("familyNumber", "Family Number"),
+    ("flatNumber", "Flat No"),
+    ("buildingNumber", "Building/Apartment No"),
+    ("buildingName", "Building/Apartment Name"),
+    ("buildingAddress", "Building/Apartment Address"),
+    ("tagLeader", "Tag Leader"),
+    ("familyAvailability", "Family Availability"),
+    ("economicStatus", "Economic Status"),
+    ("familyNature", "Family Nature"),
+    ("points", "Points"),
+    ("phone", "Phone"),
+    ("hasAssociation", "Has Association"),
+    ("associationName", "Association Name"),
+    ("associationHeadName", "Association Head Name"),
+    ("associationHeadPhone", "Association Head Phone"),
+    ("headName", "Head of Family"),
+    ("headEpicNo", "Head EPIC"),
+    ("memberCount", "Member Count"),
+]
+
+
+def _resolve_db_user(db: Session, current: JwtUserDetails) -> Optional[Any]:
+    return db.query(User).filter(User.first_name == current.firstName, User.phone == current.phone).first()
+
+
+def _apply_family_audit(db: Session, fam: Family, current: JwtUserDetails, is_create: bool = False) -> None:
+    user = _resolve_db_user(db, current)
+    now = datetime.now(timezone.utc)
+    agent_name = current.firstName or (user.first_name if user else None)
+    if is_create:
+        fam.created_by = user.id if user else None
+        fam.created_by_name = agent_name
+        fam.created_by_phone = current.phone
+        fam.created_at = now
+    fam.updated_by = user.id if user else None
+    fam.updated_by_name = agent_name
+    fam.updated_by_phone = current.phone
+    fam.updated_at = now
+
+
+def _family_effective_updated(fam: Family) -> Optional[datetime]:
+    return fam.updated_at or fam.created_at
+
+
+def _family_agent_id(fam: Family) -> Optional[int]:
+    return fam.updated_by or fam.created_by
+
+
+def _family_availability_bucket(fam: Family) -> str:
+    val = (fam.family_availability or "").strip()
+    for bucket in FAMILY_AVAILABILITY_BUCKETS:
+        if val == bucket["match"]:
+            return bucket["key"]
+    return "other"
+
+
+def _family_building_key(fam: Family) -> Optional[str]:
+    parts = [
+        (fam.building_number or "").strip().lower(),
+        (fam.building_name or "").strip().lower(),
+        (fam.building_address or "").strip().lower(),
+    ]
+    if not any(parts):
+        return None
+    return "|".join(parts)
+
+
+def _parse_family_analysis_date(value: Optional[str], end_of_day: bool = False) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except Exception:
+        try:
+            parsed = datetime.strptime(value, "%Y-%m-%d")
+        except Exception:
+            return None
+    if end_of_day and parsed.hour == 0 and parsed.minute == 0 and parsed.second == 0 and len(value) <= 10:
+        parsed = parsed + timedelta(hours=23, minutes=59, seconds=59)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _family_in_date_range(fam: Family, from_dt: Optional[datetime], to_dt: Optional[datetime]) -> bool:
+    ts = _family_effective_updated(fam)
+    if not ts:
+        return from_dt is None and to_dt is None
+    if from_dt and ts < from_dt:
+        return False
+    if to_dt and ts > to_dt:
+        return False
+    return True
+
+
+@dataclass
+class _FamilyBoothContext:
+    booth_id: int
+    ward_id: Optional[int] = None
+    ward_code: Optional[str] = None
+    booth_no: Optional[str] = None
+
+
+def _resolve_booth_ids_for_ward_param(db: Session, ward_id: int) -> List[int]:
+    booth_ids: set[int] = set()
+    ward_codes: set[str] = set()
+
+    ward_cols = _get_table_columns(db, "public", "wards")
+    pub_id_col = "id" if "id" in ward_cols else ("ward_id" if "ward_id" in ward_cols else None)
+    code_col = "ward_code" if "ward_code" in ward_cols else None
+    if pub_id_col:
+        select_cols = [f"{pub_id_col} AS wid"]
+        if code_col:
+            select_cols.append(f"{code_col} AS ward_code")
+        row = db.execute(
+            text(f"SELECT {', '.join(select_cols)} FROM public.wards WHERE {pub_id_col} = :ward_id LIMIT 1"),
+            {"ward_id": ward_id},
+        ).first()
+        if row:
+            if getattr(row, "ward_code", None) is not None:
+                ward_codes.add(str(row.ward_code))
+            booth_cols = _get_table_columns(db, "public", "booths")
+            b_id_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
+            b_ward_col = "ward_id" if "ward_id" in booth_cols else None
+            if b_id_col and b_ward_col:
+                pub_rows = db.execute(
+                    text(f"SELECT {b_id_col} AS booth_id FROM public.booths WHERE {b_ward_col} = :ward_id"),
+                    {"ward_id": ward_id},
+                ).all()
+                booth_ids.update(int(r.booth_id) for r in pub_rows if r.booth_id is not None)
+
+    data_ward = db.query(Ward).filter(Ward.ward_id == ward_id).first()
+    if data_ward and data_ward.ward_code:
+        ward_codes.add(str(data_ward.ward_code))
+
+    for wc in ward_codes:
+        for row in db.query(Booth.booth_id).filter(Booth.ward_code == wc).all():
+            booth_ids.add(int(row[0]))
+        booth_cols = _get_table_columns(db, "public", "booths")
+        b_id_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
+        b_code_col = "ward_code" if "ward_code" in booth_cols else None
+        if b_id_col and b_code_col:
+            pub_rows = db.execute(
+                text(f"SELECT {b_id_col} AS booth_id FROM public.booths WHERE {b_code_col} = :ward_code"),
+                {"ward_code": wc},
+            ).all()
+            booth_ids.update(int(r.booth_id) for r in pub_rows if r.booth_id is not None)
+
+    for row in db.query(Booth.booth_id).filter(Booth.ward_id == ward_id).all():
+        booth_ids.add(int(row[0]))
+
+    return sorted(booth_ids)
+
+
+def _resolve_booth_ids_for_ward_list(db: Session, ward_ids: Iterable[int]) -> List[int]:
+    merged: set[int] = set()
+    for ward_id in ward_ids:
+        if ward_id is None:
+            continue
+        merged.update(_resolve_booth_ids_for_ward_param(db, int(ward_id)))
+    return sorted(merged)
+
+
+def _booth_context_for_family(db: Session, fam: Family) -> _FamilyBoothContext:
+    booth = db.query(Booth).filter(Booth.booth_id == fam.booth_id).first()
+    if booth:
+        return _FamilyBoothContext(
+            booth_id=int(booth.booth_id),
+            ward_id=booth.ward_id,
+            ward_code=str(booth.ward_code) if booth.ward_code is not None else None,
+            booth_no=str(booth.booth_no) if booth.booth_no is not None else None,
+        )
+
+    booth_cols = _get_table_columns(db, "public", "booths")
+    b_id_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
+    if not b_id_col:
+        return _FamilyBoothContext(booth_id=int(fam.booth_id))
+
+    select_cols = [f"{b_id_col} AS booth_id"]
+    for col, alias in (("ward_id", "ward_id"), ("ward_code", "ward_code"), ("booth_no", "booth_no")):
+        if col in booth_cols:
+            select_cols.append(f"{col} AS {alias}")
+    row = db.execute(
+        text(f"SELECT {', '.join(select_cols)} FROM public.booths WHERE {b_id_col} = :booth_id LIMIT 1"),
+        {"booth_id": fam.booth_id},
+    ).first()
+    if row:
+        return _FamilyBoothContext(
+            booth_id=int(getattr(row, "booth_id", fam.booth_id)),
+            ward_id=getattr(row, "ward_id", None),
+            ward_code=str(row.ward_code) if getattr(row, "ward_code", None) is not None else None,
+            booth_no=str(row.booth_no) if getattr(row, "booth_no", None) is not None else None,
+        )
+    return _FamilyBoothContext(booth_id=int(fam.booth_id))
+
+
+def _apply_family_list_filters(
+    q,
+    db: Session,
+    current: JwtUserDetails,
+    wardId: Optional[int] = None,
+    boothId: Optional[int] = None,
+):
+    role = (current.role or "").replace("ROLE_", "")
+    if current.tenantId and role != "SUPER_ADMIN":
+        q = q.filter(Family.tenant_id == current.tenantId)
+
+    scope = _resolve_access_scope_ids(db, current)
+    if scope:
+        allowed_ward_ids = sorted(scope.get("allowed_ward_ids") or [])
+        allowed_booth_ids = sorted(scope.get("allowed_booth_ids") or [])
+        scope_booth_ids: set[int] = {int(b) for b in allowed_booth_ids if b is not None}
+        if allowed_ward_ids:
+            scope_booth_ids.update(_resolve_booth_ids_for_ward_list(db, allowed_ward_ids))
+        if scope_booth_ids:
+            q = q.filter(Family.booth_id.in_(sorted(scope_booth_ids)))
+        else:
+            q = q.filter(text("1=0"))
+
+    if wardId is not None:
+        ward_booth_ids = _resolve_booth_ids_for_ward_param(db, int(wardId))
+        if ward_booth_ids:
+            q = q.filter(Family.booth_id.in_(ward_booth_ids))
+        else:
+            q = q.filter(text("1=0"))
+    if boothId is not None:
+        q = q.filter(Family.booth_id == int(boothId))
+    return q
+
+
+def _load_families_for_analysis(
+    db: Session,
+    current: JwtUserDetails,
+    wardId: Optional[int] = None,
+    boothId: Optional[int] = None,
+    updatedFrom: Optional[str] = None,
+    updatedTo: Optional[str] = None,
+) -> List[tuple]:
+    q = db.query(Family).filter(Family.deleted.is_(False))
+    q = _apply_family_list_filters(q, db, current, wardId=wardId, boothId=boothId)
+
+    from_dt = _parse_family_analysis_date(updatedFrom)
+    to_dt = _parse_family_analysis_date(updatedTo, end_of_day=True)
+    families = q.all()
+    rows: List[tuple] = []
+    for fam in families:
+        if from_dt or to_dt:
+            if not _family_in_date_range(fam, from_dt, to_dt):
+                continue
+        rows.append((fam, _booth_context_for_family(db, fam)))
+    return rows
+
+
+def _lookup_master_voter_relation(
+    db: Session, epic_no: Optional[str], cache: Optional[Dict[str, tuple]] = None
+) -> tuple:
+    """Fallback relation name/type from public.voters (rel_eng) or voter_enrichment."""
+    epic = normalize_optional_text(epic_no)
+    if not epic:
+        return "", ""
+    rel_cache = cache if cache is not None else {}
+    if epic.upper() in rel_cache:
+        return rel_cache[epic.upper()]
+    relation_name = ""
+    relation_type = ""
+    try:
+        row = db.execute(
+            text("SELECT rel_eng, rel_type FROM public.voters WHERE UPPER(epic) = UPPER(:epic) LIMIT 1"),
+            {"epic": epic},
+        ).mappings().first()
+        if row:
+            relation_name = (row.get("rel_eng") or "").strip()
+            relation_type = (row.get("rel_type") or "").strip()
+    except Exception:
+        pass
+    if not relation_name:
+        try:
+            enr = db.query(VoterEnrichment).filter(VoterEnrichment.epic == epic).first()
+            if enr:
+                relation_name = f"{enr.relation_first_middle_name_en or ''} {enr.relation_last_name_en or ''}".strip()
+                if not relation_type:
+                    relation_type = (enr.relation_type or "").strip()
+        except Exception:
+            pass
+    rel_cache[epic.upper()] = (relation_name, relation_type)
+    return relation_name, relation_type
+
+
+def _family_to_dto(db: Session, fam: Family, rel_cache: Optional[Dict[str, tuple]] = None) -> Dict[str, Any]:
     head_name = ""
     head_epic = ""
     m_dto = []
@@ -4181,24 +4503,48 @@ def _family_to_dto(db: Session, fam: Family) -> Dict[str, Any]:
                 head_name = full_name
                 head_epic = voter.epic_no
             relation_name = f"{voter.relation_first_middle_name_en or ''} {voter.relation_last_name_en or ''}".strip()
+            if not relation_name:
+                relation_name = f"{voter.relation_first_middle_name_local or ''} {voter.relation_last_name_local or ''}".strip()
+            relation_type = (voter.relation_type or "").strip()
+            if not relation_name or not relation_type:
+                master_name, master_type = _lookup_master_voter_relation(db, voter.epic_no, rel_cache)
+                if not relation_name:
+                    relation_name = master_name
+                if not relation_type:
+                    relation_type = master_type
             m_dto.append(
                 {
                     "memberId": member.member_id,
                     "head": bool(member.is_head),
                     "epicNo": voter.epic_no,
                     "voterName": full_name,
-                    "relationName": relation_name or voter.relation_type or "",
+                    "relationName": relation_name,
+                    "relationType": relation_type,
+                    "relationFirstMiddleNameEn": voter.relation_first_middle_name_en,
+                    "relationLastNameEn": voter.relation_last_name_en,
+                    "relationFirstMiddleNameLocal": voter.relation_first_middle_name_local,
+                    "relationLastNameLocal": voter.relation_last_name_local,
+                    "rel_eng": relation_name,
                 }
             )
     except Exception as e:
         print(f"Error in _family_to_dto members: {e}")
 
     ward_id = None
+    ward_code = None
+    booth_no = None
     try:
         booth = db.query(Booth).filter(Booth.booth_id == fam.booth_id).first()
-        ward_id = booth.ward_id if booth else None
+        if booth:
+            ward_id = booth.ward_id
+            ward_code = booth.ward_code
+            booth_no = booth.booth_no
     except Exception:
         ward_id = None
+        ward_code = None
+        booth_no = None
+
+    last_updated = _family_effective_updated(fam)
 
     return {
         "familyId": fam.familyId,
@@ -4217,7 +4563,15 @@ def _family_to_dto(db: Session, fam: Family) -> Dict[str, Any]:
         "latitude": fam.latitude,
         "longitude": fam.longitude,
         "boothId": fam.booth_id,
+        "boothNo": str(booth_no) if booth_no is not None else None,
         "wardId": ward_id,
+        "wardCode": str(ward_code) if ward_code is not None else None,
+        "createdAt": fam.created_at.isoformat() if fam.created_at else None,
+        "lastUpdatedAt": last_updated.isoformat() if last_updated else None,
+        "updatedByName": fam.updated_by_name,
+        "updatedByPhone": fam.updated_by_phone,
+        "agentName": fam.updated_by_name or fam.created_by_name,
+        "agentPhone": fam.updated_by_phone or fam.created_by_phone,
         "associationId": fam.association_id,
         "headMemberId": fam.head_voter_id,
         "headName": head_name,
@@ -4372,6 +4726,7 @@ def create_family(payload: CreateFamilyRequest, db: Session = Depends(get_db), c
     )
     db.add(fam)
     db.flush()
+    _apply_family_audit(db, fam, current, is_create=True)
 
     head_member_id = None
     for epic in payload.memberEpicNos:
@@ -4389,6 +4744,7 @@ def create_family(payload: CreateFamilyRequest, db: Session = Depends(get_db), c
             head_member_id = member.member_id
 
     fam.head_voter_id = head_member_id
+    _apply_family_audit(db, fam, current, is_create=False)
     db.add(fam)
     db.commit()
     db.refresh(fam)
@@ -4468,6 +4824,7 @@ def update_family(familyId: int, payload: UpdateFamilyRequest, db: Session = Dep
             head_member_id = m.member_id
 
     fam.head_voter_id = head_member_id
+    _apply_family_audit(db, fam, current, is_create=False)
     db.add(fam)
     db.commit()
     db.refresh(fam)
@@ -4478,6 +4835,7 @@ def update_family(familyId: int, payload: UpdateFamilyRequest, db: Session = Dep
 @app.get(f"{CONTEXT_PATH}/api/family")
 def list_families(
     boothId: Optional[int] = None,
+    wardId: Optional[int] = None,
     page: int = 0,
     size: int = 10,
     search: Optional[str] = None,
@@ -4486,10 +4844,7 @@ def list_families(
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "USER")),
 ):
     q = db.query(Family).filter(Family.deleted.is_(False))
-    if current.tenantId:
-        q = q.filter(Family.tenant_id == current.tenantId)
-    if boothId:
-        q = q.filter(Family.booth_id == boothId)
+    q = _apply_family_list_filters(q, db, current, wardId=wardId, boothId=boothId)
 
     association_filter = parse_optional_bool(association)
     if association_filter is not None:
@@ -4516,7 +4871,264 @@ def list_families(
 
     total = q.count()
     families = q.offset(page * size).limit(size).all()
-    return build_page([_family_to_dto(db, f) for f in families], page, size, total)
+    rel_cache: Dict[str, tuple] = {}
+    return build_page([_family_to_dto(db, f, rel_cache) for f in families], page, size, total)
+
+
+@app.get(f"{CONTEXT_PATH}/api/families/analysis")
+def families_analysis(
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "USER")),
+    wardId: Optional[int] = None,
+    boothId: Optional[int] = None,
+    mode: Optional[str] = "agent",
+    updatedFrom: Optional[str] = None,
+    updatedTo: Optional[str] = None,
+):
+    rows = _load_families_for_analysis(db, current, wardId=wardId, boothId=boothId, updatedFrom=updatedFrom, updatedTo=updatedTo)
+    if not rows:
+        return api_success("Family analysis fetched", {"fields": FAMILY_AVAILABILITY_BUCKETS, "rows": [], "mode": (mode or "agent").lower()})
+
+    analysis_fields = [{"key": item["key"], "label": item["label"]} for item in FAMILY_AVAILABILITY_BUCKETS]
+    mode_key = (mode or "agent").lower()
+
+    def _init_counts() -> Dict[str, int]:
+        return {item["key"]: 0 for item in FAMILY_AVAILABILITY_BUCKETS}
+
+    if mode_key == "agent":
+        counters: Dict[int, Dict[str, Any]] = {}
+        for fam, booth in rows:
+            user_id = _family_agent_id(fam)
+            if user_id is None:
+                user_id = 0
+            bucket = counters.setdefault(
+                int(user_id),
+                {
+                    "userId": int(user_id),
+                    "counts": _init_counts(),
+                    "buildings": set(),
+                    "totalFamilies": 0,
+                    "agentName": fam.updated_by_name or fam.created_by_name,
+                    "phone": fam.updated_by_phone or fam.created_by_phone,
+                    "lastUpdatedAt": None,
+                },
+            )
+            bucket["totalFamilies"] += 1
+            building_key = _family_building_key(fam)
+            if building_key:
+                bucket["buildings"].add(building_key)
+            avail_key = _family_availability_bucket(fam)
+            if avail_key in bucket["counts"]:
+                bucket["counts"][avail_key] += 1
+            ts = _family_effective_updated(fam)
+            if ts and (not bucket.get("lastUpdatedAt") or ts > bucket["lastUpdatedAt"]):
+                bucket["lastUpdatedAt"] = ts
+
+        user_rows = db.query(User).filter(User.id.in_([uid for uid in counters.keys() if uid > 0])).all() if counters else []
+        user_map = {u.id: u for u in user_rows}
+        results = []
+        for user_id, bucket in counters.items():
+            user = user_map.get(user_id) if user_id > 0 else None
+            results.append(
+                {
+                    "userId": user_id,
+                    "agentName": user.first_name if user else (bucket.get("agentName") or ("Unknown Agent" if user_id == 0 else f"User {user_id}")),
+                    "phone": user.phone if user else (bucket.get("phone") or ""),
+                    "totalBuildings": len(bucket["buildings"]),
+                    "totalFamilies": bucket["totalFamilies"],
+                    "counts": bucket["counts"],
+                    "lastUpdatedAt": bucket.get("lastUpdatedAt").isoformat() if bucket.get("lastUpdatedAt") else None,
+                }
+            )
+        results.sort(key=lambda item: item.get("agentName") or "")
+        return api_success("Family analysis fetched", {"fields": analysis_fields, "rows": results, "mode": mode_key})
+
+    ward_name_map: Dict[str, str] = {}
+    if mode_key == "ward":
+        ward_cols = _get_table_columns(db, "public", "wards")
+        ward_code_col = "ward_code" if "ward_code" in ward_cols else None
+        ward_name_col = (
+            "ward_name_en"
+            if "ward_name_en" in ward_cols
+            else ("name_en" if "name_en" in ward_cols else ("ward_name_local" if "ward_name_local" in ward_cols else None))
+        )
+        if ward_code_col and ward_name_col:
+            t_clause, t_params = _build_public_tenant_filter(current)
+            ward_rows = db.execute(
+                text(
+                    f"""
+                    SELECT {ward_code_col} AS ward_code, {ward_name_col} AS ward_name
+                    FROM public.wards
+                    WHERE 1=1 {t_clause}
+                    """
+                ),
+                t_params,
+            ).all()
+            ward_name_map = {
+                str(r.ward_code): str(r.ward_name)
+                for r in ward_rows
+                if r.ward_code is not None and r.ward_name is not None
+            }
+
+    group_buckets: Dict[str, Dict[str, Any]] = {}
+    for fam, booth in rows:
+        if mode_key == "date":
+            ts = _family_effective_updated(fam)
+            if not ts:
+                continue
+            group_key = ts.date().isoformat()
+            group_label = group_key
+        elif mode_key == "ward":
+            group_key = str(booth.ward_code or booth.ward_id or "")
+            if not group_key:
+                continue
+            group_label = ward_name_map.get(group_key) or f"Ward {group_key}"
+        elif mode_key == "booth":
+            group_key = str(booth.booth_no or fam.booth_id or "")
+            if not group_key:
+                continue
+            group_label = f"Booth {group_key}"
+        else:
+            group_key = "all"
+            group_label = "All"
+
+        bucket = group_buckets.setdefault(
+            group_key,
+            {
+                "groupKey": group_key,
+                "label": group_label,
+                "counts": _init_counts(),
+                "buildings": set(),
+                "totalFamilies": 0,
+                "agents": set(),
+                "booths": set(),
+                "lastUpdatedAt": None,
+            },
+        )
+        bucket["totalFamilies"] += 1
+        building_key = _family_building_key(fam)
+        if building_key:
+            bucket["buildings"].add(building_key)
+        agent_id = _family_agent_id(fam)
+        if agent_id:
+            bucket["agents"].add(agent_id)
+        if booth.booth_no:
+            bucket["booths"].add(str(booth.booth_no))
+        avail_key = _family_availability_bucket(fam)
+        if avail_key in bucket["counts"]:
+            bucket["counts"][avail_key] += 1
+        ts = _family_effective_updated(fam)
+        if ts and (not bucket.get("lastUpdatedAt") or ts > bucket["lastUpdatedAt"]):
+            bucket["lastUpdatedAt"] = ts
+
+    grouped_rows = []
+    for bucket in group_buckets.values():
+        grouped_rows.append(
+            {
+                "groupKey": bucket["groupKey"],
+                "label": bucket["label"],
+                "totalBuildings": len(bucket["buildings"]),
+                "totalFamilies": bucket["totalFamilies"],
+                "agentsWorked": len(bucket["agents"]),
+                "boothsCovered": len(bucket["booths"]),
+                "counts": bucket["counts"],
+                "lastUpdatedAt": bucket.get("lastUpdatedAt").isoformat() if bucket.get("lastUpdatedAt") else None,
+            }
+        )
+    grouped_rows.sort(key=lambda item: item.get("label") or "")
+    return api_success("Family analysis fetched", {"fields": analysis_fields, "rows": grouped_rows, "mode": mode_key})
+
+
+@app.get(f"{CONTEXT_PATH}/api/families/map-points")
+def families_map_points(
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "USER")),
+    wardId: Optional[int] = None,
+    boothId: Optional[int] = None,
+):
+    """Families with coordinates and enriched member relation fields for map tooltips."""
+    rows = _load_families_for_analysis(db, current, wardId=wardId, boothId=boothId)
+    rel_cache: Dict[str, tuple] = {}
+    points: List[Dict[str, Any]] = []
+    for fam, _booth in rows:
+        dto = _family_to_dto(db, fam, rel_cache)
+        lat = dto.get("latitude")
+        lng = dto.get("longitude")
+        if lat is None or lng is None:
+            continue
+        try:
+            lat_f = float(lat)
+            lng_f = float(lng)
+        except (TypeError, ValueError):
+            continue
+        if not (lat_f == lat_f and lng_f == lng_f):  # NaN check without math import
+            continue
+        points.append(
+            {
+                "familyId": dto.get("familyId"),
+                "latitude": lat_f,
+                "longitude": lng_f,
+                "familyName": dto.get("familyName"),
+                "familyAvailability": dto.get("familyAvailability") or "Available",
+                "roadName": dto.get("roadName"),
+                "buildingNumber": dto.get("buildingNumber"),
+                "buildingName": dto.get("buildingName"),
+                "familyNumber": dto.get("familyNumber"),
+                "flatNumber": dto.get("flatNumber"),
+                "boothNo": dto.get("boothNo"),
+                "wardId": dto.get("wardId"),
+                "wardCode": dto.get("wardCode"),
+                "members": dto.get("members") or [],
+            }
+        )
+    return api_success("Family map points fetched", points)
+
+
+@app.get(f"{CONTEXT_PATH}/api/families/details")
+def families_details(
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "USER")),
+    wardId: Optional[int] = None,
+    boothId: Optional[int] = None,
+    updatedFrom: Optional[str] = None,
+    updatedTo: Optional[str] = None,
+    page: Optional[int] = None,
+    size: Optional[int] = None,
+):
+    rows = _load_families_for_analysis(db, current, wardId=wardId, boothId=boothId, updatedFrom=updatedFrom, updatedTo=updatedTo)
+    rows.sort(key=lambda item: _family_effective_updated(item[0]) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+
+    if page is not None and size is not None:
+        start = page * size
+        page_rows = rows[start : start + size]
+        start_idx = start + 1
+    else:
+        page_rows = rows
+        start_idx = 1
+
+    detail_fields = [{"key": key, "label": label} for key, label in FAMILY_DETAIL_EXPORT_FIELDS]
+    result_rows: List[Dict[str, Any]] = []
+    rel_cache: Dict[str, tuple] = {}
+    for idx, (fam, booth) in enumerate(page_rows, start=start_idx):
+        dto = _family_to_dto(db, fam, rel_cache)
+        ordered: Dict[str, Any] = {
+            "familyId": dto.get("familyId"),
+            "serialNumber": idx,
+            "familyName": dto.get("familyName"),
+            "boothNo": dto.get("boothNo") or (str(booth.booth_no) if booth.booth_no is not None else None),
+            "latitude": dto.get("latitude"),
+            "longitude": dto.get("longitude"),
+            "lastUpdatedAt": dto.get("lastUpdatedAt"),
+            "members": dto.get("members") or [],
+        }
+        for key, _label in FAMILY_DETAIL_EXPORT_FIELDS:
+            ordered[key] = dto.get(key)
+        result_rows.append(ordered)
+
+    return api_success(
+        "Family details fetched",
+        {"fields": detail_fields, "rows": result_rows, "total": len(rows)},
+    )
 
 
 @app.get(f"{CONTEXT_PATH}/api/family/suggestions")
