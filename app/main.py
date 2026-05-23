@@ -5461,6 +5461,41 @@ def family_suggestions(
             q = q.filter(Family.tenant_id == current.tenantId)
         results = q.distinct().limit(100).all()
         return api_success("Suggestions fetched", [r[0] for r in results if r[0]])
+
+    elif field in ("family", "familyname", "name"):
+        q = db.query(Family.family_name).filter(Family.family_name.isnot(None), Family.deleted.is_(False))
+        if current.tenantId:
+            q = q.filter(Family.tenant_id == current.tenantId)
+        results = q.distinct().limit(100).all()
+        return api_success("Suggestions fetched", sorted({r[0] for r in results if r[0]})[:100])
+
+    elif field in ("buildingnumber", "building_number"):
+        q = db.query(Family.building_number).filter(Family.building_number.isnot(None), Family.deleted.is_(False))
+        if current.tenantId:
+            q = q.filter(Family.tenant_id == current.tenantId)
+        results = q.distinct().limit(100).all()
+        return api_success("Suggestions fetched", [r[0] for r in results if r[0]])
+
+    elif field == "flat":
+        q = db.query(Family.flat_number).filter(Family.flat_number.isnot(None), Family.deleted.is_(False))
+        if current.tenantId:
+            q = q.filter(Family.tenant_id == current.tenantId)
+        results = q.distinct().limit(100).all()
+        return api_success("Suggestions fetched", [r[0] for r in results if r[0]])
+
+    elif field in ("address", "buildingaddress"):
+        q = db.query(Family.building_address).filter(Family.building_address.isnot(None), Family.deleted.is_(False))
+        if current.tenantId:
+            q = q.filter(Family.tenant_id == current.tenantId)
+        results = q.distinct().limit(100).all()
+        return api_success("Suggestions fetched", [r[0] for r in results if r[0]])
+
+    elif field in ("associationhead", "association_head"):
+        q = db.query(Family.association_head_name).filter(Family.association_head_name.isnot(None), Family.deleted.is_(False))
+        if current.tenantId:
+            q = q.filter(Family.tenant_id == current.tenantId)
+        results = q.distinct().limit(100).all()
+        return api_success("Suggestions fetched", [r[0] for r in results if r[0]])
     
     return api_success("Suggestions fetched", [])
 
