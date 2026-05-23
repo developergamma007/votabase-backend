@@ -740,6 +740,7 @@ class CreateFamilyRequest(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     boothId: int
+    wardId: Optional[int] = None
     associationId: Optional[int] = None
     headEpicNo: str
     memberEpicNos: List[str]
@@ -1991,6 +1992,7 @@ def volunteer_analysis(
     current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD")),
     wardId: Optional[int] = None,
     mode: Optional[str] = None,
+    assemblyCode: Optional[str] = None,
 ):
     scope = _resolve_access_scope_ids(db, current)
 
@@ -2071,6 +2073,8 @@ def volunteer_analysis(
                 q = q.filter(VoterEnrichment.ward_code == str(row.ward_code))
             else:
                 q = q.filter(text("1=0"))
+
+    q = _apply_enrichment_assembly_filter(q, db, assemblyCode)
 
     enrichments = q.all()
     if not enrichments:
@@ -2252,6 +2256,7 @@ def volunteer_analysis_enrichment(
     updatedTo: Optional[str] = None,
     page: Optional[int] = None,
     size: Optional[int] = None,
+    assemblyCode: Optional[str] = None,
 ):
     exclude_keys = {
         "firstMiddleNameEn",
@@ -2345,6 +2350,8 @@ def volunteer_analysis_enrichment(
                 enrichments_q = enrichments_q.filter(VoterEnrichment.ward_code == str(row.ward_code))
             else:
                 enrichments_q = enrichments_q.filter(text("1=0"))
+
+    enrichments_q = _apply_enrichment_assembly_filter(enrichments_q, db, assemblyCode)
 
     def _parse_date(value: Optional[str], end_of_day: bool = False) -> Optional[datetime]:
         if not value:
@@ -2473,6 +2480,7 @@ def volunteer_analysis_locations(
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD")),
     wardId: Optional[int] = None,
+    assemblyCode: Optional[str] = None,
 ):
     scope = _resolve_access_scope_ids(db, current)
 
@@ -2551,6 +2559,8 @@ def volunteer_analysis_locations(
                 q = q.filter(VoterEnrichment.ward_code == str(row.ward_code))
             else:
                 q = q.filter(text("1=0"))
+
+    q = _apply_enrichment_assembly_filter(q, db, assemblyCode)
 
     enrichments = q.all()
     if not enrichments:
@@ -4228,27 +4238,85 @@ def _resolve_db_user(db: Session, current: JwtUserDetails) -> Optional[Any]:
     return db.query(User).filter(User.first_name == current.firstName, User.phone == current.phone).first()
 
 
-def _apply_family_audit(db: Session, fam: Family, current: JwtUserDetails, is_create: bool = False) -> None:
+def _resolve_volunteer_user(db: Session, current: JwtUserDetails) -> Optional[VolunteerUser]:
+    if not current.phone:
+        return None
+    return (
+        db.query(VolunteerUser)
+        .filter(
+            func.lower(VolunteerUser.first_name) == (current.firstName or "").lower(),
+            VolunteerUser.phone == current.phone,
+        )
+        .first()
+    )
+
+
+def _resolve_family_audit_actor(db: Session, current: JwtUserDetails) -> tuple[Optional[int], str]:
+    """Return (actor_id, display_name). Volunteer actors use negative ids to avoid User id collisions."""
     user = _resolve_db_user(db, current)
+    if user:
+        return int(user.id), (user.first_name or current.firstName or "").strip()
+    volunteer = _resolve_volunteer_user(db, current)
+    if volunteer:
+        return -int(volunteer.id), (volunteer.first_name or current.firstName or "").strip()
+    return None, (current.firstName or "").strip()
+
+
+def _apply_family_audit(db: Session, fam: Family, current: JwtUserDetails, is_create: bool = False) -> None:
+    actor_id, agent_name = _resolve_family_audit_actor(db, current)
     now = datetime.now(timezone.utc)
-    agent_name = current.firstName or (user.first_name if user else None)
     if is_create:
-        fam.created_by = user.id if user else None
-        fam.created_by_name = agent_name
+        fam.created_by = actor_id
+        fam.created_by_name = agent_name or None
         fam.created_by_phone = current.phone
         fam.created_at = now
-    fam.updated_by = user.id if user else None
-    fam.updated_by_name = agent_name
+    fam.updated_by = actor_id
+    fam.updated_by_name = agent_name or None
     fam.updated_by_phone = current.phone
     fam.updated_at = now
 
 
+def _as_utc_aware(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _family_effective_updated(fam: Family) -> Optional[datetime]:
-    return fam.updated_at or fam.created_at
+    raw = fam.updated_at or fam.created_at
+    return _as_utc_aware(raw)
+
+
+def _family_sort_timestamp(fam: Family) -> datetime:
+    return _family_effective_updated(fam) or datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _family_agent_id(fam: Family) -> Optional[int]:
     return fam.updated_by or fam.created_by
+
+
+def _normalize_agent_phone(phone: Optional[str]) -> str:
+    digits = re.sub(r"\D", "", str(phone or "").strip())
+    if len(digits) >= 10:
+        return digits[-10:]
+    return digits
+
+
+def _family_agent_bucket_key(fam: Family) -> str:
+    """Single bucket per real agent — phone first so volunteer id vs legacy name rows merge."""
+    phone = _normalize_agent_phone(fam.updated_by_phone or fam.created_by_phone)
+    if phone:
+        return f"phone:{phone}"
+    user_id = _family_agent_id(fam)
+    if user_id is not None and int(user_id) != 0:
+        uid = int(user_id)
+        if uid < 0:
+            return f"volunteer:{-uid}"
+        return f"user:{uid}"
+    name = (fam.updated_by_name or fam.created_by_name or "").strip().lower()
+    return f"name:{name or 'unknown'}"
 
 
 def _family_availability_bucket(fam: Family) -> str:
@@ -4357,6 +4425,73 @@ def _resolve_booth_ids_for_ward_param(db: Session, ward_id: int) -> List[int]:
     return sorted(booth_ids)
 
 
+def _assert_booth_in_ward(db: Session, booth_id: int, ward_id: int) -> None:
+    allowed = _resolve_booth_ids_for_ward_param(db, int(ward_id))
+    if not allowed or int(booth_id) not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Booth {booth_id} does not belong to ward {ward_id}",
+        )
+
+
+def _super_admin_user_ids(db: Session) -> set:
+    rows = db.query(User.id).filter(User.role.in_(["SUPER_ADMIN", "ROLE_SUPER_ADMIN", "ADMIN", "ROLE_ADMIN"])).all()
+    return {int(r[0]) for r in rows if r[0] is not None}
+
+
+HIDDEN_FAMILY_AGENT_NAMES = frozenset({"admin@iswot.io", "admin@iswot.in"})
+
+
+def _normalize_family_agent_name(name: Optional[str]) -> str:
+    return (name or "").strip().lower()
+
+
+def _family_agent_name_is_hidden(name: Optional[str]) -> bool:
+    normalized = _normalize_family_agent_name(name)
+    if not normalized:
+        return False
+    if normalized in HIDDEN_FAMILY_AGENT_NAMES:
+        return True
+    return normalized.startswith("admin@iswot")
+
+
+def _family_is_hidden_admin_entry(db: Session, fam: Family, super_admin_ids: Optional[set] = None) -> bool:
+    """Hide families touched by super-admin / admin@iswot.io from field volunteer family tables."""
+    admin_ids = super_admin_ids if super_admin_ids is not None else _super_admin_user_ids(db)
+    for agent_id in (fam.created_by, fam.updated_by, _family_agent_id(fam)):
+        if agent_id is not None and int(agent_id) > 0 and int(agent_id) in admin_ids:
+            return True
+    if _family_agent_name_is_hidden(fam.created_by_name) or _family_agent_name_is_hidden(fam.updated_by_name):
+        return True
+    return False
+
+
+def _apply_exclude_admin_family_filter(q, db: Session, super_admin_ids: Optional[set] = None):
+    admin_ids = super_admin_ids if super_admin_ids is not None else _super_admin_user_ids(db)
+    if admin_ids:
+        id_list = list(admin_ids)
+        q = q.filter(
+            or_(
+                Family.created_by.is_(None),
+                Family.created_by < 0,
+                ~Family.created_by.in_(id_list),
+            )
+        )
+        q = q.filter(
+            or_(
+                Family.updated_by.is_(None),
+                Family.updated_by < 0,
+                ~Family.updated_by.in_(id_list),
+            )
+        )
+    for hidden_name in HIDDEN_FAMILY_AGENT_NAMES:
+        q = q.filter(
+            func.lower(func.coalesce(Family.created_by_name, "")) != hidden_name,
+            func.lower(func.coalesce(Family.updated_by_name, "")) != hidden_name,
+        )
+    return q
+
+
 def _resolve_booth_ids_for_ward_list(db: Session, ward_ids: Iterable[int]) -> List[int]:
     merged: set[int] = set()
     for ward_id in ward_ids:
@@ -4364,6 +4499,81 @@ def _resolve_booth_ids_for_ward_list(db: Session, ward_ids: Iterable[int]) -> Li
             continue
         merged.update(_resolve_booth_ids_for_ward_param(db, int(ward_id)))
     return sorted(merged)
+
+
+def _assembly_filter_values(assembly_code: Optional[str]) -> List[str]:
+    """String assembly id/code variants (151, 000000000151) for safe TEXT SQL compares."""
+    if assembly_code is None:
+        return []
+    raw = str(assembly_code).strip()
+    if not raw:
+        return []
+    values: List[str] = [raw]
+    padded = _normalize_assembly_code(raw) or normalize_assembly_code(raw)
+    if padded and padded not in values:
+        values.append(padded)
+    if padded and str(padded).isdigit():
+        unpadded = str(int(str(padded)))
+        if unpadded not in values:
+            values.append(unpadded)
+    return values
+
+
+def _resolve_public_ward_codes_for_assembly(db: Session, assembly_code: Optional[str]) -> set[str]:
+    """Ward codes in public.voter_enrichment scope for the selected assembly context."""
+    values = _assembly_filter_values(assembly_code)
+    if not values:
+        return set()
+    ward_cols = _get_table_columns(db, "public", "wards")
+    ward_code_col = "ward_code" if "ward_code" in ward_cols else None
+    assembly_ref = "assembly_id" if "assembly_id" in ward_cols else ("assembly_no" if "assembly_no" in ward_cols else None)
+    if not ward_code_col or not assembly_ref:
+        return set()
+    clauses = []
+    params: Dict[str, Any] = {}
+    for index, val in enumerate(values):
+        key = f"asm_{index}"
+        clauses.append(f"CAST({assembly_ref} AS TEXT) = :{key}")
+        params[key] = str(val)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT DISTINCT {ward_code_col} AS ward_code
+            FROM public.wards
+            WHERE ({' OR '.join(clauses)})
+              AND {ward_code_col} IS NOT NULL
+            """
+        ),
+        params,
+    ).all()
+    return {str(row.ward_code).strip() for row in rows if row.ward_code is not None}
+
+
+def _resolve_booth_ids_for_assembly_param(db: Session, assembly_code: Optional[str]) -> List[int]:
+    str_values = _assembly_filter_values(assembly_code)
+    if not str_values:
+        return []
+    asm_ids: List[Any] = list(dict.fromkeys(str_values))
+    for val in str_values:
+        if val.isdigit():
+            asm_ids.append(int(val))
+    ward_ids = [
+        int(row.ward_id)
+        for row in db.query(Ward.ward_id).filter(Ward.assembly_id.in_(asm_ids)).all()
+        if row.ward_id is not None
+    ]
+    if not ward_ids:
+        return []
+    return _resolve_booth_ids_for_ward_list(db, ward_ids)
+
+
+def _apply_enrichment_assembly_filter(q, db: Session, assembly_code: Optional[str]):
+    if assembly_code is None or not str(assembly_code).strip():
+        return q
+    codes = _resolve_public_ward_codes_for_assembly(db, assembly_code)
+    if not codes:
+        return q.filter(text("1=0"))
+    return q.filter(VoterEnrichment.ward_code.in_(sorted(codes)))
 
 
 def _booth_context_for_family(db: Session, fam: Family) -> _FamilyBoothContext:
@@ -4405,6 +4615,7 @@ def _apply_family_list_filters(
     current: JwtUserDetails,
     wardId: Optional[int] = None,
     boothId: Optional[int] = None,
+    assemblyCode: Optional[str] = None,
 ):
     role = (current.role or "").replace("ROLE_", "")
     if current.tenantId and role != "SUPER_ADMIN":
@@ -4430,6 +4641,12 @@ def _apply_family_list_filters(
             q = q.filter(text("1=0"))
     if boothId is not None:
         q = q.filter(Family.booth_id == int(boothId))
+    if assemblyCode is not None and str(assemblyCode).strip():
+        asm_booth_ids = _resolve_booth_ids_for_assembly_param(db, assemblyCode)
+        if asm_booth_ids:
+            q = q.filter(Family.booth_id.in_(asm_booth_ids))
+        else:
+            q = q.filter(text("1=0"))
     return q
 
 
@@ -4440,15 +4657,20 @@ def _load_families_for_analysis(
     boothId: Optional[int] = None,
     updatedFrom: Optional[str] = None,
     updatedTo: Optional[str] = None,
+    assemblyCode: Optional[str] = None,
 ) -> List[tuple]:
     q = db.query(Family).filter(Family.deleted.is_(False))
-    q = _apply_family_list_filters(q, db, current, wardId=wardId, boothId=boothId)
+    q = _apply_family_list_filters(q, db, current, wardId=wardId, boothId=boothId, assemblyCode=assemblyCode)
+    q = _apply_exclude_admin_family_filter(q, db)
 
     from_dt = _parse_family_analysis_date(updatedFrom)
     to_dt = _parse_family_analysis_date(updatedTo, end_of_day=True)
     families = q.all()
+    super_admin_ids = _super_admin_user_ids(db)
     rows: List[tuple] = []
     for fam in families:
+        if _family_is_hidden_admin_entry(db, fam, super_admin_ids):
+            continue
         if from_dt or to_dt:
             if not _family_in_date_range(fam, from_dt, to_dt):
                 continue
@@ -4691,6 +4913,9 @@ def create_family(payload: CreateFamilyRequest, db: Session = Depends(get_db), c
     if not booth:
         raise ValueError("Invalid booth")
 
+    if payload.wardId is not None:
+        _assert_booth_in_ward(db, int(payload.boothId), int(payload.wardId))
+
     association = None
     if payload.associationId is not None:
         association = db.query(Association).filter(Association.association_id == payload.associationId).first()
@@ -4757,6 +4982,9 @@ def update_family(familyId: int, payload: UpdateFamilyRequest, db: Session = Dep
     fam = db.query(Family).filter(Family.familyId == familyId).first()
     if not fam:
         raise ValueError(f"Family not found: {familyId}")
+
+    if payload.wardId is not None:
+        _assert_booth_in_ward(db, int(payload.boothId), int(payload.wardId))
 
     fam.family_name = payload.familyName
     fam.family_address = payload.familyAddress
@@ -4840,11 +5068,13 @@ def list_families(
     size: int = 10,
     search: Optional[str] = None,
     association: Optional[str] = None,
+    assemblyCode: Optional[str] = None,
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "USER")),
 ):
     q = db.query(Family).filter(Family.deleted.is_(False))
-    q = _apply_family_list_filters(q, db, current, wardId=wardId, boothId=boothId)
+    q = _apply_family_list_filters(q, db, current, wardId=wardId, boothId=boothId, assemblyCode=assemblyCode)
+    q = _apply_exclude_admin_family_filter(q, db)
 
     association_filter = parse_optional_bool(association)
     if association_filter is not None:
@@ -4884,8 +5114,11 @@ def families_analysis(
     mode: Optional[str] = "agent",
     updatedFrom: Optional[str] = None,
     updatedTo: Optional[str] = None,
+    assemblyCode: Optional[str] = None,
 ):
-    rows = _load_families_for_analysis(db, current, wardId=wardId, boothId=boothId, updatedFrom=updatedFrom, updatedTo=updatedTo)
+    rows = _load_families_for_analysis(
+        db, current, wardId=wardId, boothId=boothId, updatedFrom=updatedFrom, updatedTo=updatedTo, assemblyCode=assemblyCode
+    )
     if not rows:
         return api_success("Family analysis fetched", {"fields": FAMILY_AVAILABILITY_BUCKETS, "rows": [], "mode": (mode or "agent").lower()})
 
@@ -4896,15 +5129,19 @@ def families_analysis(
         return {item["key"]: 0 for item in FAMILY_AVAILABILITY_BUCKETS}
 
     if mode_key == "agent":
-        counters: Dict[int, Dict[str, Any]] = {}
+        super_admin_ids = _super_admin_user_ids(db)
+        counters: Dict[str, Dict[str, Any]] = {}
         for fam, booth in rows:
+            if _family_is_hidden_admin_entry(db, fam, super_admin_ids):
+                continue
             user_id = _family_agent_id(fam)
-            if user_id is None:
-                user_id = 0
+            if user_id is not None and int(user_id) > 0 and int(user_id) in super_admin_ids:
+                continue
+            bucket_key = _family_agent_bucket_key(fam)
             bucket = counters.setdefault(
-                int(user_id),
+                bucket_key,
                 {
-                    "userId": int(user_id),
+                    "userId": int(user_id) if user_id is not None else 0,
                     "counts": _init_counts(),
                     "buildings": set(),
                     "totalFamilies": 0,
@@ -4924,16 +5161,59 @@ def families_analysis(
             if ts and (not bucket.get("lastUpdatedAt") or ts > bucket["lastUpdatedAt"]):
                 bucket["lastUpdatedAt"] = ts
 
-        user_rows = db.query(User).filter(User.id.in_([uid for uid in counters.keys() if uid > 0])).all() if counters else []
+        positive_user_ids = sorted({b["userId"] for b in counters.values() if b.get("userId", 0) > 0})
+        volunteer_ids = sorted({-b["userId"] for b in counters.values() if b.get("userId", 0) < 0})
+        phone_keys = sorted(
+            {
+                key.split(":", 1)[1]
+                for key in counters.keys()
+                if key.startswith("phone:") and key.split(":", 1)[1]
+            }
+        )
+        user_rows = db.query(User).filter(User.id.in_(positive_user_ids)).all() if positive_user_ids else []
+        volunteer_rows = db.query(VolunteerUser).filter(VolunteerUser.id.in_(volunteer_ids)).all() if volunteer_ids else []
+        if phone_keys:
+            phone_filters = [VolunteerUser.phone.in_(phone_keys)]
+            phone_filters.extend(VolunteerUser.phone.like(f"%{phone}") for phone in phone_keys)
+            volunteer_rows = list(
+                {
+                    v.id: v
+                    for v in (
+                        volunteer_rows + db.query(VolunteerUser).filter(or_(*phone_filters)).all()
+                    )
+                }.values()
+            )
         user_map = {u.id: u for u in user_rows}
+        volunteer_map = {v.id: v for v in volunteer_rows}
+        volunteer_by_phone = {_normalize_agent_phone(v.phone): v for v in volunteer_rows if v.phone}
         results = []
-        for user_id, bucket in counters.items():
+        for bucket_key, bucket in counters.items():
+            user_id = int(bucket.get("userId") or 0)
             user = user_map.get(user_id) if user_id > 0 else None
+            volunteer = volunteer_map.get(-user_id) if user_id < 0 else None
+            if bucket_key.startswith("phone:"):
+                volunteer = volunteer or volunteer_by_phone.get(bucket_key.split(":", 1)[1])
+                if volunteer:
+                    user_id = -int(volunteer.id)
+            agent_name = (
+                user.first_name
+                if user
+                else volunteer.first_name
+                if volunteer
+                else (bucket.get("agentName") or ("Unknown Agent" if user_id == 0 else f"User {user_id}"))
+            )
+            display_phone = (
+                user.phone
+                if user
+                else volunteer.phone
+                if volunteer
+                else (bucket.get("phone") or (bucket_key.split(":", 1)[1] if bucket_key.startswith("phone:") else ""))
+            )
             results.append(
                 {
                     "userId": user_id,
-                    "agentName": user.first_name if user else (bucket.get("agentName") or ("Unknown Agent" if user_id == 0 else f"User {user_id}")),
-                    "phone": user.phone if user else (bucket.get("phone") or ""),
+                    "agentName": agent_name,
+                    "phone": display_phone or "",
                     "totalBuildings": len(bucket["buildings"]),
                     "totalFamilies": bucket["totalFamilies"],
                     "counts": bucket["counts"],
@@ -5045,9 +5325,10 @@ def families_map_points(
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "USER")),
     wardId: Optional[int] = None,
     boothId: Optional[int] = None,
+    assemblyCode: Optional[str] = None,
 ):
     """Families with coordinates and enriched member relation fields for map tooltips."""
-    rows = _load_families_for_analysis(db, current, wardId=wardId, boothId=boothId)
+    rows = _load_families_for_analysis(db, current, wardId=wardId, boothId=boothId, assemblyCode=assemblyCode)
     rel_cache: Dict[str, tuple] = {}
     points: List[Dict[str, Any]] = []
     for fam, _booth in rows:
@@ -5094,9 +5375,12 @@ def families_details(
     updatedTo: Optional[str] = None,
     page: Optional[int] = None,
     size: Optional[int] = None,
+    assemblyCode: Optional[str] = None,
 ):
-    rows = _load_families_for_analysis(db, current, wardId=wardId, boothId=boothId, updatedFrom=updatedFrom, updatedTo=updatedTo)
-    rows.sort(key=lambda item: _family_effective_updated(item[0]) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    rows = _load_families_for_analysis(
+        db, current, wardId=wardId, boothId=boothId, updatedFrom=updatedFrom, updatedTo=updatedTo, assemblyCode=assemblyCode
+    )
+    rows.sort(key=lambda item: _family_sort_timestamp(item[0]), reverse=True)
 
     if page is not None and size is not None:
         start = page * size
