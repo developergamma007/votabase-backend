@@ -1,6 +1,7 @@
 import json
 import traceback
 import os
+from io import BytesIO
 import re
 import tempfile
 import uuid
@@ -7050,7 +7051,7 @@ def generate_snapshots(db: Session, assembly_id: int, tenant_id: str) -> None:
 @app.post(f"{CONTEXT_PATH}/api/excel/upload")
 def upload_excel(file: UploadFile = File(...), db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN"))):
     try:
-        wb = load_workbook(file.file, data_only=True)
+        wb = _load_workbook_from_upload(file)
 
         def sheet(name: str):
             if name not in wb.sheetnames:
@@ -7244,6 +7245,14 @@ _MASTER_ROLL_IMPORT_STATUS: Dict[str, Any] = {
 }
 
 
+def _load_workbook_from_upload(file: UploadFile, *, data_only: bool = True):
+    """Read upload into memory; Starlette SpooledTemporaryFile lacks seekable() for openpyxl."""
+    raw = file.file.read()
+    if not raw:
+        raise ValueError("Uploaded file is empty")
+    return load_workbook(BytesIO(raw), data_only=data_only)
+
+
 def _master_roll_status(
     phase: str,
     progress: int,
@@ -7287,7 +7296,7 @@ def upload_master_roll(
     _ = resume
     _master_roll_status("starting", 1, inserted={}, error=None)
     try:
-        wb = load_workbook(file.file, data_only=True)
+        wb = _load_workbook_from_upload(file)
 
         def sheet(name: str):
             for sn in wb.sheetnames:
