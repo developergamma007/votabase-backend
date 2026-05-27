@@ -1677,6 +1677,7 @@ def create_volunteer(
     working_level = (payload.workingLevel or "").strip().upper()
     if working_level not in {"ASSEMBLY", "WARD", "BOOTH"}:
         raise ValueError("workingLevel must be ASSEMBLY, WARD, or BOOTH")
+    _assert_volunteer_working_level_allowed(db, current, working_level)
 
     phone = normalize_optional_text(payload.phone)
     if not phone or not phone.isdigit() or len(phone) != 10:
@@ -1747,6 +1748,7 @@ def update_volunteer(
     working_level = (payload.workingLevel or "").strip().upper()
     if working_level not in {"ASSEMBLY", "WARD", "BOOTH"}:
         raise ValueError("workingLevel must be ASSEMBLY, WARD, or BOOTH")
+    _assert_volunteer_working_level_allowed(db, current, working_level)
 
     assembly_ids = payload.assemblyIds or []
     ward_ids = payload.wardIds or []
@@ -2041,8 +2043,7 @@ def volunteer_analysis(
                 allowed_booth_nos.update([str(r.booth_no) for r in rows if r.booth_no is not None])
 
     q = db.query(VoterEnrichment).filter(VoterEnrichment.updated_by.isnot(None))
-    # Filter out admin entries from analysis
-    q = q.filter(not_(VoterEnrichment.updated_by_name.in_(["admin@iswot.in", "admin@iswot.io"])))
+    q = _apply_exclude_hidden_enrichment_agents_filter(q, db)
     if scope:
         filters = []
         if allowed_ward_codes:
@@ -2308,7 +2309,8 @@ def volunteer_analysis_enrichment(
             str(r.ward_code): str(r.ward_name) for r in ward_rows if r.ward_code is not None and r.ward_name is not None
         }
 
-    enrichments_q = db.query(VoterEnrichment).filter(not_(VoterEnrichment.updated_by_name.in_(["admin@iswot.in", "admin@iswot.io"])))
+    enrichments_q = db.query(VoterEnrichment)
+    enrichments_q = _apply_exclude_hidden_enrichment_agents_filter(enrichments_q, db)
 
     # For non-super-admin users, scope to their allowed ward codes
     scope = _resolve_access_scope_ids(db, current)
@@ -2529,6 +2531,7 @@ def volunteer_analysis_locations(
                 allowed_booth_nos.update([str(r.booth_no) for r in rows if r.booth_no is not None])
 
     q = db.query(VoterEnrichment).filter(VoterEnrichment.latitude.isnot(None), VoterEnrichment.longitude.isnot(None))
+    q = _apply_exclude_hidden_enrichment_agents_filter(q, db)
     if scope:
         filters = []
         if allowed_ward_codes:
@@ -4443,6 +4446,125 @@ def _super_admin_user_ids(db: Session) -> set:
 HIDDEN_FAMILY_AGENT_NAMES = frozenset({"admin@iswot.io", "admin@iswot.in"})
 
 
+def _creator_access_role(db: Session, current: JwtUserDetails) -> str:
+    role = (current.role or "").replace("ROLE_", "").upper()
+    if role in {"SUPER_ADMIN", "ADMIN"}:
+        return role
+    scope = _get_access_scope(db, current)
+    if scope:
+        return str(scope.get("assignment_type") or role).upper()
+    return role
+
+
+def _allowed_working_levels_for_creator(creator_role: str) -> set:
+    if creator_role in {"SUPER_ADMIN", "ADMIN"}:
+        return {"ASSEMBLY", "WARD", "BOOTH"}
+    if creator_role == "ASSEMBLY":
+        return {"WARD", "BOOTH"}
+    if creator_role == "WARD":
+        return {"BOOTH"}
+    return set()
+
+
+def _assert_volunteer_working_level_allowed(db: Session, current: JwtUserDetails, working_level: str) -> None:
+    creator = _creator_access_role(db, current)
+    allowed = _allowed_working_levels_for_creator(creator)
+    wl = (working_level or "").strip().upper()
+    if wl in allowed:
+        return
+    if creator == "ASSEMBLY":
+        raise HTTPException(
+            status_code=403,
+            detail="Assembly-level volunteers can assign Ward or Booth access only, not Assembly.",
+        )
+    if creator == "WARD":
+        raise HTTPException(
+            status_code=403,
+            detail="Ward-level volunteers can assign Booth access only.",
+        )
+    raise HTTPException(status_code=403, detail=f"You cannot assign {wl} level access.")
+
+
+def _hidden_enrichment_volunteer_phones(db: Session) -> set:
+    rows = db.query(VolunteerUser.phone).filter(
+        VolunteerUser.deleted.is_(False),
+        func.upper(
+            func.coalesce(
+                VolunteerUser.working_level,
+                VolunteerUser.assignment_type,
+                VolunteerUser.role,
+                "",
+            )
+        ).in_(["ASSEMBLY", "WARD"]),
+    ).all()
+    phones: set = set()
+    for row in rows:
+        normalized = _normalize_agent_phone(row[0] if row else None)
+        if normalized:
+            phones.add(normalized)
+    return phones
+
+
+def _hidden_enrichment_updater_user_ids(db: Session) -> set:
+    hidden = set(_super_admin_user_ids(db))
+    volunteers = (
+        db.query(VolunteerUser)
+        .filter(
+            VolunteerUser.deleted.is_(False),
+            func.upper(
+                func.coalesce(
+                    VolunteerUser.working_level,
+                    VolunteerUser.assignment_type,
+                    VolunteerUser.role,
+                    "",
+                )
+            ).in_(["ASSEMBLY", "WARD"]),
+        )
+        .all()
+    )
+    for vol in volunteers:
+        user = (
+            db.query(User)
+            .filter(User.first_name == vol.first_name, User.phone == vol.phone)
+            .first()
+        )
+        if user and user.id is not None:
+            hidden.add(int(user.id))
+    return hidden
+
+
+def _apply_exclude_hidden_enrichment_agents_filter(q, db: Session):
+    """Hide super-admin and assembly/ward volunteer login rows from enrichment analysis (like admin@iswot)."""
+    q = q.filter(not_(VoterEnrichment.updated_by_name.in_(list(HIDDEN_FAMILY_AGENT_NAMES))))
+    for hidden_name in HIDDEN_FAMILY_AGENT_NAMES:
+        q = q.filter(func.lower(func.coalesce(VoterEnrichment.updated_by_name, "")) != hidden_name)
+    q = q.filter(~func.lower(func.coalesce(VoterEnrichment.updated_by_name, "")).like("admin@iswot%"))
+
+    hidden_user_ids = _hidden_enrichment_updater_user_ids(db)
+    if hidden_user_ids:
+        q = q.filter(
+            or_(
+                VoterEnrichment.updated_by.is_(None),
+                ~VoterEnrichment.updated_by.in_(list(hidden_user_ids)),
+            )
+        )
+
+    hidden_phones = _hidden_enrichment_volunteer_phones(db)
+    if hidden_phones:
+        phone_tail = func.right(
+            func.regexp_replace(func.coalesce(VoterEnrichment.updated_by_phone, ""), r"[^0-9]", "", "g"),
+            10,
+        )
+        q = q.filter(
+            or_(
+                VoterEnrichment.updated_by_phone.is_(None),
+                phone_tail == "",
+                ~phone_tail.in_(list(hidden_phones)),
+            )
+        )
+    return q
+
+
 def _normalize_family_agent_name(name: Optional[str]) -> str:
     return (name or "").strip().lower()
 
@@ -5580,35 +5702,68 @@ def get_activated_wards(
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "USER")),
 ):
-    q = db.query(MessageTemplate).filter(
-        MessageTemplate.tenant_id == current.tenantId, 
-        MessageTemplate.enabled == True
+    """List enabled templates; ward names from public.wards (same ids as promotions ward picker)."""
+    templates = (
+        db.query(MessageTemplate)
+        .filter(MessageTemplate.tenant_id == current.tenantId, MessageTemplate.enabled == True)
+        .all()
     )
-    
-    if assemblyId:
-        # Include Global (ward_id is NULL) OR Wards belonging to this assembly
-        q = q.outerjoin(Ward, MessageTemplate.ward_id == Ward.ward_id).filter(
-            or_(MessageTemplate.ward_id.is_(None), Ward.assembly_id == assemblyId)
-        )
 
-    templates = q.all()
-    
-    # Pre-fetch ward details for labeling
-    ward_ids = [t.ward_id for t in templates if t.ward_id is not None]
-    wards_map = {}
-    if ward_ids:
-        wards = db.query(Ward).filter(Ward.ward_id.in_(ward_ids)).all()
-        wards_map = {w.ward_id: w for w in wards}
+    public_wards_by_id: Dict[int, Any] = {}
+    ward_cols = _get_table_columns(db, "public", "wards")
+    id_col = "id" if "id" in ward_cols else ("ward_id" if "ward_id" in ward_cols else None)
+    name_col = "ward_name_en" if "ward_name_en" in ward_cols else ("name_en" if "name_en" in ward_cols else None)
+    code_col = "ward_code" if "ward_code" in ward_cols else None
+    asm_col = "assembly_no" if "assembly_no" in ward_cols else ("assembly_id" if "assembly_id" in ward_cols else None)
+    if id_col and name_col:
+        where_parts: List[str] = []
+        params: Dict[str, Any] = {}
+        if assemblyId is not None and asm_col:
+            where_parts.append(f"{asm_col} = :assembly_no")
+            params["assembly_no"] = int(assemblyId)
+        where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        rows = db.execute(
+            text(
+                f"""
+                SELECT {id_col} AS id, {name_col} AS name_en,
+                       {code_col if code_col else 'NULL'} AS ward_code
+                FROM public.wards
+                {where_sql}
+                """
+            ),
+            params,
+        ).all()
+        public_wards_by_id = {int(r.id): r for r in rows if r.id is not None}
 
     out = []
     for t in templates:
-        w_obj = wards_map.get(t.ward_id) if t.ward_id else None
-        out.append({
-            "wardId": t.ward_id,
-            "wardLabel": t.ward_label or (w_obj.ward_name_en if w_obj else None),
-            "wardNameEn": w_obj.ward_name_en if w_obj else None,
-            "channel": t.channel,
-        })
+        if t.ward_id is None:
+            out.append(
+                {
+                    "wardId": None,
+                    "wardLabel": t.ward_label or "Global (all wards)",
+                    "wardNameEn": t.ward_label or "Global",
+                    "channel": t.channel,
+                }
+            )
+            continue
+        pub = public_wards_by_id.get(int(t.ward_id))
+        if assemblyId is not None and not pub:
+            continue
+        name_en = (t.ward_label or (pub.name_en if pub else None) or "").strip()
+        ward_code = str(pub.ward_code).strip() if pub and pub.ward_code else ""
+        if name_en and ward_code and ward_code not in name_en:
+            label = f"{ward_code} - {name_en}"
+        else:
+            label = name_en or (f"Ward {t.ward_id}" if t.ward_id is not None else "Ward")
+        out.append(
+            {
+                "wardId": t.ward_id,
+                "wardLabel": label,
+                "wardNameEn": pub.name_en if pub else name_en or None,
+                "channel": t.channel,
+            }
+        )
     return api_success("Activated wards fetched", out)
 
 
@@ -5945,12 +6100,183 @@ def list_meeting_attendance(id: int, db: Session = Depends(get_db), current: Jwt
     return out
 
 
+def _is_generic_assembly_name(name: Optional[str]) -> bool:
+    if not name or not str(name).strip():
+        return True
+    return bool(re.match(r"^assembly\s*\d+\s*$", str(name).strip(), re.I))
+
+
+def _fetch_public_assembly_name_map(db: Session, current: JwtUserDetails) -> Dict[str, str]:
+    try:
+        assembly_cols = _ensure_public_assembly_code(db)
+    except ValueError:
+        return {}
+    id_col = "id" if "id" in assembly_cols else ("assembly_id" if "assembly_id" in assembly_cols else ("assembly_no" if "assembly_no" in assembly_cols else None))
+    name_col = "assembly_name_en" if "assembly_name_en" in assembly_cols else ("name_en" if "name_en" in assembly_cols else None)
+    code_col = "assembly_code" if "assembly_code" in assembly_cols else None
+    no_col = "assembly_no" if "assembly_no" in assembly_cols else ("assembly_id" if "assembly_id" in assembly_cols else None)
+    if not id_col or not name_col:
+        return {}
+    code_expr = code_col if code_col else (f"CAST({no_col} AS TEXT)" if no_col else "NULL")
+    # Name lookup should not hide assemblies when tenant_id on public.assembly is unset or mismatched.
+    public_rows = db.execute(
+        text(
+            f"""
+            SELECT {id_col} AS id, {name_col} AS name, {code_expr} AS code,
+                   {no_col if no_col else 'NULL'} AS assembly_no
+            FROM public.assembly
+            """
+        ),
+    ).all()
+    result: Dict[str, str] = {}
+    for row in public_rows:
+        name = str(row.name).strip() if row.name else ""
+        if not name or _is_generic_assembly_name(name):
+            continue
+        keys = {str(row.id), str(row.code or ""), str(row.assembly_no or "")}
+        for key in keys:
+            key = key.strip()
+            if not key or key == "None":
+                continue
+            result[key] = name
+            if key.isdigit():
+                result[str(int(key))] = name
+    return result
+
+
+def _assembly_lookup_keys(assembly_key: Any) -> List[str]:
+    raw = str(assembly_key or "").strip()
+    if not raw:
+        return []
+    keys = {raw}
+    if raw.isdigit():
+        n = int(raw)
+        keys.add(str(n))
+        keys.add(str(n).zfill(12))
+    elif len(raw) == 12 and raw.isdigit():
+        keys.add(str(int(raw)))
+    return [k for k in keys if k]
+
+
+def _lookup_assembly_name_en(db: Session, assembly_key: Any, tenant_id: Optional[str] = None) -> str:
+    keys = _assembly_lookup_keys(assembly_key)
+    if not keys:
+        return ""
+    candidates: List[str] = []
+
+    try:
+        assembly_cols = _ensure_public_assembly_code(db)
+        id_col = "id" if "id" in assembly_cols else ("assembly_id" if "assembly_id" in assembly_cols else ("assembly_no" if "assembly_no" in assembly_cols else None))
+        name_col = "assembly_name_en" if "assembly_name_en" in assembly_cols else ("name_en" if "name_en" in assembly_cols else None)
+        code_col = "assembly_code" if "assembly_code" in assembly_cols else None
+        no_col = "assembly_no" if "assembly_no" in assembly_cols else ("assembly_id" if "assembly_id" in assembly_cols else None)
+        if id_col and name_col:
+            clauses = []
+            params: Dict[str, Any] = {}
+            for idx, key in enumerate(keys):
+                params[f"k{idx}"] = key
+                part = [
+                    f"CAST({id_col} AS TEXT) = :k{idx}",
+                    f"CAST({no_col} AS TEXT) = :k{idx}" if no_col else None,
+                    f"{code_col} = :k{idx}" if code_col else None,
+                ]
+                clauses.extend([p for p in part if p])
+            if clauses:
+                row = db.execute(
+                    text(
+                        f"""
+                        SELECT {name_col} AS name
+                        FROM public.assembly
+                        WHERE {' OR '.join(clauses)}
+                        LIMIT 1
+                        """
+                    ),
+                    params,
+                ).first()
+                if row and row.name:
+                    candidates.append(str(row.name).strip())
+    except Exception:
+        pass
+
+    for key in keys:
+        try:
+            filters = []
+            if key.isdigit():
+                filters.append(Assembly.assembly_id == int(key))
+            filters.append(Assembly.assembly_code == key)
+            filters.append(Assembly.assembly_code == str(key).zfill(12))
+            row = db.query(Assembly).filter(or_(*filters)).first()
+            if tenant_id and row and row.tenant_id != tenant_id:
+                row = None
+            if not row and tenant_id:
+                row = (
+                    db.query(Assembly)
+                    .filter(or_(*filters))
+                    .filter(Assembly.tenant_id == tenant_id)
+                    .first()
+                )
+            if row and row.assembly_name_en:
+                candidates.append(str(row.assembly_name_en).strip())
+        except Exception:
+            continue
+
+    for name in candidates:
+        if name and not _is_generic_assembly_name(name):
+            return name
+    return candidates[0] if candidates else ""
+
+
+def _resolve_assembly_display_name(code: Any, name: Optional[str], public_names: Dict[str, str], db: Optional[Session] = None, tenant_id: Optional[str] = None) -> str:
+    if db is not None:
+        looked_up = _lookup_assembly_name_en(db, code, tenant_id=tenant_id)
+        if looked_up and not _is_generic_assembly_name(looked_up):
+            return looked_up
+    code_str = str(code).strip() if code is not None else ""
+    for key in (code_str, str(int(code_str)) if code_str.isdigit() else None):
+        if key and key in public_names:
+            return public_names[key]
+    cleaned = str(name).strip() if name else ""
+    if cleaned and not _is_generic_assembly_name(cleaned):
+        return cleaned
+    if db is not None:
+        looked_up = _lookup_assembly_name_en(db, code, tenant_id=tenant_id)
+        if looked_up:
+            return looked_up
+    if code_str:
+        return public_names.get(code_str, public_names.get(str(int(code_str)) if code_str.isdigit() else "", f"Assembly {code_str}"))
+    return cleaned or "Assembly"
+
+
+@app.get(f"{CONTEXT_PATH}/api/assemblies/resolve-name")
+def resolve_assembly_name(
+    assemblyId: Optional[str] = None,
+    assemblyCode: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current: JwtUserDetails = Depends(get_current_user),
+):
+    key = assemblyId or assemblyCode
+    if not key or not str(key).strip():
+        raise ValueError("assemblyId or assemblyCode is required")
+    name = _lookup_assembly_name_en(db, key, tenant_id=current.tenantId)
+    key_str = str(key).strip()
+    fallback_no = str(int(key_str)) if key_str.isdigit() else key_str
+    return api_success(
+        "Assembly name resolved",
+        {
+            "assemblyId": key_str,
+            "name": name or f"Assembly {fallback_no}",
+            "nameEn": name,
+        },
+    )
+
+
 @app.get(f"{CONTEXT_PATH}/api/volunteers/dropdown")
 def volunteer_dropdown(level: str, parentId: Optional[int] = None, db: Session = Depends(get_db), current: JwtUserDetails = Depends(get_current_user)):
     level = level.upper()
     out = []
 
     if level == "ASSEMBLY":
+        public_names = _fetch_public_assembly_name_map(db, current)
         query = db.query(Assembly.id if hasattr(Assembly, "id") else Assembly.assembly_id, Assembly.assembly_name_en)
         if current.tenantId is not None and current.role != "SUPER_ADMIN":
             query = query.filter(Assembly.tenant_id == current.tenantId)
@@ -5971,10 +6297,30 @@ def volunteer_dropdown(level: str, parentId: Optional[int] = None, db: Session =
                 # If public has more rows OR we are super admin (to get better names like KR Pura), use public
                 if not rows or len(public_rows) >= len(rows) or current.role == "SUPER_ADMIN":
                     for row in public_rows:
-                        out.append({"id": int(row.id), "code": String(row.code or row.id), "name": row.name})
+                        code = str(row.code or row.id)
+                        if code.isdigit() and len(code) == 12:
+                            code = str(int(code))
+                        out.append({
+                            "id": int(row.id),
+                            "code": code,
+                            "name": _resolve_assembly_display_name(
+                                code, row.name, public_names, db=db, tenant_id=current.tenantId
+                            ),
+                        })
                     return api_success("Assemblies fetched", out)
         for row in rows:
-            out.append({"id": row[0], "code": String(row[0]), "name": row[1]})
+            asm_id = row[0]
+            asm_row = db.query(Assembly).filter(Assembly.assembly_id == asm_id).first()
+            code = str(asm_row.assembly_code) if asm_row and asm_row.assembly_code else str(asm_id)
+            if code.isdigit() and len(code) == 12:
+                code = str(int(code))
+            out.append({
+                "id": asm_id,
+                "code": code,
+                "name": _resolve_assembly_display_name(
+                    code, row[1], public_names, db=db, tenant_id=current.tenantId
+                ),
+            })
         return api_success("Assemblies fetched", out)
     elif level == "WARD":
         if parentId is None:
