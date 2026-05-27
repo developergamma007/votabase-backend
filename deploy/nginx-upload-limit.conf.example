@@ -1,0 +1,8 @@
+# Master roll Excel uploads can be 50–200MB+. Default nginx limit is 1m → 413.
+# Copy into your site block (e.g. /etc/nginx/sites-available/votabase.iswot.in)
+# inside the server { } that proxies /votebase/ to the API, then:
+#   sudo nginx -t && sudo systemctl reload nginx
+
+client_max_body_size 500m;
+proxy_read_timeout 3600s;
+proxy_send_timeout 3600s;
