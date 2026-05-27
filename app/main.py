@@ -7228,12 +7228,64 @@ def upload_excel(file: UploadFile = File(...), db: Session = Depends(get_db), cu
         return JSONResponse(status_code=500, content=api_error("Excel upload failed", str(ex)))
 
 
+def _synthesize_booth_id(ward_id: int, booth_no: int) -> int:
+    # *10000 avoids (ward_id*1000+booth) collisions across adjacent wards/booth numbers.
+    return (ward_id * 10000) + int(booth_no)
+
+
+_MASTER_ROLL_IMPORT_STATUS: Dict[str, Any] = {
+    "active": False,
+    "phase": "idle",
+    "progress": 0,
+    "assembly_no": None,
+    "assembly_name_en": None,
+    "inserted": {"assembly": 0, "wards": 0, "booths": 0, "voters": 0},
+    "error": None,
+}
+
+
+def _master_roll_status(
+    phase: str,
+    progress: int,
+    *,
+    assembly_no: Optional[int] = None,
+    assembly_name_en: Optional[str] = None,
+    inserted: Optional[Dict[str, int]] = None,
+    error: Optional[str] = None,
+    active: bool = True,
+) -> None:
+    prev_inserted = _MASTER_ROLL_IMPORT_STATUS.get("inserted") or {}
+    next_inserted = dict(prev_inserted)
+    if inserted is not None:
+        next_inserted.update(inserted)
+    _MASTER_ROLL_IMPORT_STATUS.update({
+        "active": active,
+        "phase": phase,
+        "progress": max(0, min(100, int(progress))),
+        "assembly_no": assembly_no if assembly_no is not None else _MASTER_ROLL_IMPORT_STATUS.get("assembly_no"),
+        "assembly_name_en": assembly_name_en if assembly_name_en is not None else _MASTER_ROLL_IMPORT_STATUS.get("assembly_name_en"),
+        "inserted": next_inserted,
+        "error": error,
+    })
+
+
+@app.get(f"{CONTEXT_PATH}/api/admin/master-roll/import-status")
+def master_roll_import_status(
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN")),
+):
+    return api_success("Master roll import status", dict(_MASTER_ROLL_IMPORT_STATUS))
+
+
 @app.post(f"{CONTEXT_PATH}/api/admin/master-roll/upload")
 def upload_master_roll(
     file: UploadFile = File(...),
+    resume: bool = False,
     db: Session = Depends(get_db),
     current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN"))
 ):
+    # resume=true: continue import without deleting existing rows (upsert only).
+    _ = resume
+    _master_roll_status("starting", 1, inserted={}, error=None)
     try:
         wb = load_workbook(file.file, data_only=True)
 
@@ -7276,7 +7328,7 @@ def upload_master_roll(
         asm_name_en = get_val(arow, h_assembly, "ASSEMBLY_NAME_EN")
         asm_name_local = get_val(arow, h_assembly, "ASSEMBLY_NAME_LOCAL")
 
-        # Upsert into public.assembly (using assembly_no as PK)
+        _master_roll_status("assembly", 10, assembly_no=assembly_no, assembly_name_en=asm_name_en, inserted={"assembly": 0, "wards": 0, "booths": 0, "voters": 0})
         db.execute(text("""
             INSERT INTO public.assembly (assembly_no, assembly_name_en, assembly_name_local, assembly_code, tenant_id)
             VALUES (:no, :en, :local, :code, :tid)
@@ -7285,19 +7337,23 @@ def upload_master_roll(
                 assembly_name_local = EXCLUDED.assembly_name_local,
                 tenant_id = EXCLUDED.tenant_id
         """), {"no": assembly_no, "en": asm_name_en, "local": asm_name_local, "code": assembly_code, "tid": tenant_id})
+        db.commit()
+        _master_roll_status("assembly", 22, assembly_no=assembly_no, assembly_name_en=asm_name_en, inserted={"assembly": 1})
 
-        # 2. Wards
-        ward_map = {} # ward_code -> synthesized_id
-        for i, row in enumerate(ws_ward.iter_rows(min_row=2, values_only=True)):
+        _master_roll_status("wards", 28, assembly_no=assembly_no, assembly_name_en=asm_name_en)
+        ward_count = 0
+        booth_count = 0
+        ward_map: Dict[str, int] = {}
+        ward_index = 0
+        for row in ws_ward.iter_rows(min_row=2, values_only=True):
             w_code = get_val(row, h_ward, "WARD_CODE") or get_val(row, h_ward, "WARD_COD")
-            w_no_raw = get_val(row, h_ward, "WARD_NO") or get_val(row, h_ward, "WARD_ID") or get_val(row, h_ward, "ID")
-            if w_code is None: continue
-            
-            # Deterministic synthesis that fits in 32-bit signed INT (max 2.1B)
-            # Strategy: assembly_no * 1000 + ward_index
-            w_id = (assembly_no * 1000) + (i + 1)
+            if w_code is None:
+                continue
+
+            ward_index += 1
+            w_id = (assembly_no * 1000) + ward_index
             ward_map[str(w_code)] = w_id
-            
+
             w_name_en = get_val(row, h_ward, "WARD_NAME_EN") or get_val(row, h_ward, "WARD_NAME")
             w_name_local = get_val(row, h_ward, "WARD_NAME_LOCAL") or get_val(row, h_ward, "WARD_NAME_L")
 
@@ -7309,30 +7365,44 @@ def upload_master_roll(
                     ward_name_local = EXCLUDED.ward_name_local,
                     tenant_id = EXCLUDED.tenant_id
             """), {
-                "id": w_id, "code": str(w_code), 
-                "en": w_name_en, "local": w_name_local,
-                "ano": assembly_no, "tid": tenant_id
+                "id": w_id,
+                "code": str(w_code),
+                "en": w_name_en,
+                "local": w_name_local,
+                "ano": assembly_no,
+                "tid": tenant_id,
             })
+            ward_count += 1
 
-        # 3. Booths
+        db.commit()
+        _master_roll_status(
+            "wards",
+            38,
+            assembly_no=assembly_no,
+            assembly_name_en=asm_name_en,
+            inserted={"assembly": 1, "wards": ward_count},
+        )
+
+        _master_roll_status("booths", 45, assembly_no=assembly_no, assembly_name_en=asm_name_en)
+        seen_booth_keys: set[tuple[str, int]] = set()
         for row in ws_booth.iter_rows(min_row=2, values_only=True):
             b_no_raw = get_val(row, h_booth, "BOOTH_NO") or get_val(row, h_booth, "BOOTH_N")
             w_code = get_val(row, h_booth, "WARD_CODE") or get_val(row, h_booth, "WARD_COD")
-            if b_no_raw is None or w_code is None: continue
-            
+            if b_no_raw is None or w_code is None:
+                continue
+
             b_no = int(b_no_raw)
-            w_id = ward_map.get(str(w_code))
+            w_code_str = str(w_code).strip()
+            booth_key = (w_code_str, b_no)
+            if booth_key in seen_booth_keys:
+                continue
+            seen_booth_keys.add(booth_key)
+
+            w_id = ward_map.get(w_code_str)
             if not w_id:
-                # Fallback to DB fetch if not in current sheet
-                w_row = db.execute(text("SELECT id FROM public.wards WHERE ward_code = :wc AND assembly_no = :ano"), {"wc": str(w_code), "ano": assembly_no}).first()
-                if w_row: w_id = int(w_row.id)
-            
-            if not w_id: continue # Still no ward found
+                continue
 
-            # Strategy: ward_id * 1000 + booth_no
-            # Example: 170999 * 1000 + 999 = 170,999,999 (well within 2.1B)
-            b_id = (w_id * 1000) + b_no
-
+            b_id = _synthesize_booth_id(w_id, b_no)
             db.execute(text("""
                 INSERT INTO public.booths (id, booth_no, ward_code, ward_id, booth_add_en, booth_add_local, tenant_id)
                 VALUES (:id, :no, :wc, :wid, :en, :local, :tid)
@@ -7341,27 +7411,77 @@ def upload_master_roll(
                     booth_add_local = EXCLUDED.booth_add_local,
                     tenant_id = EXCLUDED.tenant_id
             """), {
-                "id": b_id, "no": b_no, "wc": str(w_code),
+                "id": b_id,
+                "no": str(b_no),
+                "wc": w_code_str,
                 "wid": w_id,
                 "en": get_val(row, h_booth, "BOOTH_ADD_EN") or get_val(row, h_booth, "POLLING_STATION_ADR_EN") or get_val(row, h_booth, "BOOTH_NAME_EN"),
                 "local": get_val(row, h_booth, "BOOTH_ADD_LOCAL") or get_val(row, h_booth, "POLLING_STATION_ADR_LOCAL") or get_val(row, h_booth, "BOOTH_NAME_LOCAL"),
-                "tid": tenant_id
+                "tid": tenant_id,
             })
+            booth_count += 1
 
-        # 4. Voters
+        db.commit()
+        _master_roll_status(
+            "booths",
+            52,
+            assembly_no=assembly_no,
+            assembly_name_en=asm_name_en,
+            inserted={"assembly": 1, "wards": ward_count, "booths": booth_count},
+        )
+
+        est_voter_rows = max(0, int(getattr(ws_data, "max_row", 2) or 2) - 1)
+        _master_roll_status(
+            "voters",
+            55,
+            assembly_no=assembly_no,
+            assembly_name_en=asm_name_en,
+            inserted={"assembly": 1, "wards": ward_count, "booths": booth_count, "voters": 0},
+        )
+
+        # Remote DB (e.g. AWS): large batches can exceed SSL/network timeouts — use smaller batches + no statement timeout.
+        db.execute(text("SET statement_timeout = 0"))
+        db.execute(text("SET lock_timeout = '120s'"))
+
+        voter_insert_sql = text("""
+            INSERT INTO public.voters (
+                epic, sl, name_en, name_kannada, rel_eng, rel_kannada, rel_type,
+                gender, age, house, booth_no, ward_code, mobile, tenant_id
+            )
+            VALUES (
+                :epic, :sl, :name_en, :name_k, :rel_e, :rel_k, :rel_t,
+                :gender, :age, :house, :bno, :wcode, :mobile, :tid
+            )
+            ON CONFLICT (epic) DO UPDATE SET
+                name_en = EXCLUDED.name_en,
+                name_kannada = COALESCE(EXCLUDED.name_kannada, public.voters.name_kannada),
+                rel_eng = COALESCE(EXCLUDED.rel_eng, public.voters.rel_eng),
+                rel_kannada = COALESCE(EXCLUDED.rel_kannada, public.voters.rel_kannada),
+                rel_type = COALESCE(EXCLUDED.rel_type, public.voters.rel_type),
+                gender = COALESCE(EXCLUDED.gender, public.voters.gender),
+                age = COALESCE(EXCLUDED.age, public.voters.age),
+                house = COALESCE(EXCLUDED.house, public.voters.house),
+                booth_no = COALESCE(EXCLUDED.booth_no, public.voters.booth_no),
+                ward_code = COALESCE(EXCLUDED.ward_code, public.voters.ward_code),
+                mobile = COALESCE(public.voters.mobile, EXCLUDED.mobile),
+                tenant_id = EXCLUDED.tenant_id
+        """)
+        voter_batch: List[Dict[str, Any]] = []
+        seen_epics: set[str] = set()
         voter_count = 0
-        def get_val(r, h, k):
-            idx = h.get(k.upper())
-            if idx is None or idx < 0: return None
-            return r[idx]
+        batch_size = 400
 
         for row in ws_data.iter_rows(min_row=2, values_only=True):
             epic = get_val(row, h_data, "EPIC")
-            if not epic: continue
-            
-            # Map headers to model fields based on actual schema
-            params = {
-                "epic": str(epic),
+            if not epic:
+                continue
+            epic = str(epic).strip()
+            if not epic or epic in seen_epics:
+                continue
+            seen_epics.add(epic)
+
+            voter_batch.append({
+                "epic": epic,
                 "sl": str(get_val(row, h_data, "SL") or ""),
                 "name_en": get_val(row, h_data, "NAME_EN"),
                 "name_k": get_val(row, h_data, "NAME_KANNADA") or get_val(row, h_data, "NAME_LOCAL"),
@@ -7371,28 +7491,66 @@ def upload_master_roll(
                 "gender": get_val(row, h_data, "GENDER"),
                 "age": str(get_val(row, h_data, "AGE") or ""),
                 "house": str(get_val(row, h_data, "HOUSE") or ""),
-                "bno": int(get_val(row, h_data, "BOOTH_NO") or get_val(row, h_data, "BOOTH_N") or 0),
+                "bno": str(get_val(row, h_data, "BOOTH_NO") or get_val(row, h_data, "BOOTH_N") or ""),
                 "wcode": str(get_val(row, h_data, "WARD_CODE") or get_val(row, h_data, "WARD_COD") or ""),
                 "mobile": str(get_val(row, h_data, "MOBILE")) if get_val(row, h_data, "MOBILE") else None,
-                "tid": tenant_id
-            }
+                "tid": tenant_id,
+            })
+            if len(voter_batch) >= batch_size:
+                try:
+                    db.execute(voter_insert_sql, voter_batch)
+                    voter_count += len(voter_batch)
+                    voter_batch.clear()
+                    db.commit()
+                except Exception as batch_ex:
+                    db.rollback()
+                    raise RuntimeError(
+                        f"Voter batch failed after {voter_count} rows loaded. Re-upload the same Excel to continue (upsert). Original: {batch_ex}"
+                    ) from batch_ex
+                if est_voter_rows > 0:
+                    voter_progress = 55 + int(40 * voter_count / est_voter_rows)
+                else:
+                    voter_progress = 90
+                _master_roll_status(
+                    "voters",
+                    voter_progress,
+                    assembly_no=assembly_no,
+                    assembly_name_en=asm_name_en,
+                    inserted={"assembly": 1, "wards": ward_count, "booths": booth_count, "voters": voter_count},
+                )
 
-            db.execute(text("""
-                INSERT INTO public.voters (epic, sl, name_en, name_kannada, rel_eng, rel_kannada, rel_type, gender, age, house, booth_no, ward_code, mobile, tenant_id)
-                VALUES (:epic, :sl, :name_en, :name_k, :rel_e, :rel_k, :rel_t, :gender, :age, :house, :bno, :wcode, :mobile, :tid)
-                ON CONFLICT (epic) DO UPDATE SET
-                    name_en = EXCLUDED.name_en,
-                    mobile = COALESCE(voters.mobile, EXCLUDED.mobile),
-                    tenant_id = EXCLUDED.tenant_id
-            """), params)
-            voter_count += 1
+        if voter_batch:
+            db.execute(voter_insert_sql, voter_batch)
+            voter_count += len(voter_batch)
+            db.commit()
 
-        db.commit()
-        return api_success(f"Master roll uploaded for tenant {tenant_id}", {"tenant_id": tenant_id, "voters": voter_count})
+        _master_roll_status(
+            "done",
+            100,
+            assembly_no=assembly_no,
+            assembly_name_en=asm_name_en,
+            inserted={"assembly": 1, "wards": ward_count, "booths": booth_count, "voters": voter_count},
+            active=False,
+        )
+        return api_success(
+            f"Master roll imported for assembly {assembly_no} ({asm_name_en or 'assembly'})",
+            {
+                "tenant_id": tenant_id,
+                "assembly_no": assembly_no,
+                "inserted": {
+                    "assembly": 1,
+                    "wards": ward_count,
+                    "booths": booth_count,
+                    "voters": voter_count,
+                },
+            },
+        )
     except Exception as ex:
         db.rollback()
+        err_text = f"{type(ex).__name__}: {str(ex)}"
+        _master_roll_status("error", 0, error=err_text, active=False)
         print(f"[IMPORT_ERROR] {traceback.format_exc()}")
-        return JSONResponse(status_code=500, content=api_error("Master roll upload failed", f"{type(ex).__name__}: {str(ex)}"))
+        return JSONResponse(status_code=500, content=api_error("Master roll upload failed", err_text))
 
 
 @app.get("/health")
