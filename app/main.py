@@ -22,6 +22,7 @@ import base64
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, DateTime, Double, ForeignKey, Integer, String, and_, asc, case, create_engine, desc, func, or_, text, not_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 import subprocess
 import shutil
@@ -927,6 +928,139 @@ def _build_public_tenant_filter(current: JwtUserDetails) -> tuple[str, Dict[str,
     return " AND (tenant_id = :tid OR tenant_id IS NULL OR tenant_id = '')", {"tid": current.tenantId}
 
 
+def _map_public_ward_pks(
+    db: Session,
+    ward_ids: Iterable[int],
+    assembly_ids: Optional[Iterable[int]] = None,
+) -> set[int]:
+    ward_cols = _get_table_columns(db, "public", "wards")
+    ward_pk_col = "id" if "id" in ward_cols else ("ward_id" if "ward_id" in ward_cols else None)
+    if not ward_pk_col or not ward_ids:
+        return set()
+    ward_code_col = "ward_code" if "ward_code" in ward_cols else None
+    ward_no_col = "ward_no" if "ward_no" in ward_cols else None
+    ward_asm_col = "assembly_id" if "assembly_id" in ward_cols else ("assembly_no" if "assembly_no" in ward_cols else None)
+
+    raw_values = [str(v).strip() for v in ward_ids if v is not None and str(v).strip() != ""]
+    ids_int = sorted({int(v) for v in raw_values if str(v).isdigit()})
+    ids_text = sorted({str(v) for v in raw_values if str(v).strip()})
+    where_parts: List[str] = []
+    params: Dict[str, Any] = {}
+    match_parts: List[str] = []
+    if ids_int:
+        clause_id, params_id = _build_in_clause(ward_pk_col, ids_int, "scope_ward_pk")
+        match_parts.append(clause_id)
+        params.update(params_id)
+    if ward_code_col and ids_text:
+        clause_code, params_code = _build_in_clause(f"CAST({ward_code_col} AS TEXT)", ids_text, "scope_ward_code")
+        match_parts.append(clause_code)
+        params.update(params_code)
+    if ward_no_col and ids_text:
+        clause_no, params_no = _build_in_clause(f"CAST({ward_no_col} AS TEXT)", ids_text, "scope_ward_no")
+        match_parts.append(clause_no)
+        params.update(params_no)
+    if not match_parts:
+        return set()
+    where_parts.append("(" + " OR ".join(match_parts) + ")")
+    if assembly_ids and ward_asm_col:
+        asm_int = sorted({int(v) for v in assembly_ids if v is not None})
+        if asm_int:
+            clause_asm, params_asm = _build_in_clause(ward_asm_col, asm_int, "scope_ward_asm")
+            where_parts.append(clause_asm)
+            params.update(params_asm)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT {ward_pk_col} AS ward_id
+            FROM public.wards
+            WHERE {' AND '.join(where_parts)}
+            """
+        ),
+        params,
+    ).all()
+    return {int(r.ward_id) for r in rows if r.ward_id is not None}
+
+
+def _map_public_booth_pks(
+    db: Session,
+    current: JwtUserDetails,
+    booth_ids: Iterable[int],
+    ward_ids: Optional[Iterable[int]] = None,
+    assembly_ids: Optional[Iterable[int]] = None,
+) -> set[int]:
+    booth_cols = _get_table_columns(db, "public", "booths")
+    booth_pk_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
+    booth_no_col = "booth_no" if "booth_no" in booth_cols else None
+    booth_ward_col = "ward_id" if "ward_id" in booth_cols else None
+    if not booth_pk_col or not booth_ids:
+        return set()
+
+    raw_values = [str(v).strip() for v in booth_ids if v is not None and str(v).strip() != ""]
+    ids_int = sorted({int(v) for v in raw_values if str(v).isdigit()})
+    ids_text = sorted({str(v) for v in raw_values if str(v).strip()})
+    where_parts: List[str] = []
+    params: Dict[str, Any] = {}
+    match_parts: List[str] = []
+    if ids_int:
+        clause_id, params_id = _build_in_clause(f"b.{booth_pk_col}", ids_int, "scope_booth_pk")
+        match_parts.append(clause_id)
+        params.update(params_id)
+    if booth_no_col and ids_text:
+        clause_no, params_no = _build_in_clause(f"CAST(b.{booth_no_col} AS TEXT)", ids_text, "scope_booth_no")
+        match_parts.append(clause_no)
+        params.update(params_no)
+    if not match_parts:
+        return set()
+    where_parts.append("(" + " OR ".join(match_parts) + ")")
+
+    ward_pks = _map_public_ward_pks(db, ward_ids or [], assembly_ids) if ward_ids else set()
+    from_clause = "public.booths b"
+    if ward_pks and booth_ward_col:
+        clause_ward, params_ward = _build_in_clause(f"b.{booth_ward_col}", sorted(ward_pks), "scope_booth_ward")
+        where_parts.append(clause_ward)
+        params.update(params_ward)
+    elif assembly_ids and booth_ward_col:
+        ward_cols = _get_table_columns(db, "public", "wards")
+        ward_pk_col = "id" if "id" in ward_cols else ("ward_id" if "ward_id" in ward_cols else None)
+        ward_asm_col = "assembly_id" if "assembly_id" in ward_cols else ("assembly_no" if "assembly_no" in ward_cols else None)
+        if ward_pk_col and ward_asm_col:
+            from_clause = "public.booths b JOIN public.wards w ON b." + booth_ward_col + " = w." + ward_pk_col
+            asm_int = sorted({int(v) for v in assembly_ids if v is not None})
+            if asm_int:
+                clause_asm, params_asm = _build_in_clause(f"w.{ward_asm_col}", asm_int, "scope_booth_asm")
+                where_parts.append(clause_asm)
+                params.update(params_asm)
+
+    t_clause, t_params = _build_public_tenant_filter(current)
+    t_clause = t_clause.replace("tenant_id", "b.tenant_id") if "tenant_id" in t_clause else t_clause
+    params.update(t_params)
+    where_sql = " AND ".join(where_parts)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT b.{booth_pk_col} AS booth_id
+            FROM {from_clause}
+            WHERE {where_sql} {t_clause}
+            """
+        ),
+        params,
+    ).all()
+    result = {int(r.booth_id) for r in rows if r.booth_id is not None}
+    if not result and t_clause.strip():
+        rows = db.execute(
+            text(
+                f"""
+                SELECT b.{booth_pk_col} AS booth_id
+                FROM {from_clause}
+                WHERE {where_sql}
+                """
+            ),
+            {k: v for k, v in params.items() if k != "tid"},
+        ).all()
+        result = {int(r.booth_id) for r in rows if r.booth_id is not None}
+    return result
+
+
 def _resolve_access_scope_ids(db: Session, current: JwtUserDetails) -> Optional[Dict[str, Any]]:
     scope = _get_access_scope(db, current)
     if not scope:
@@ -935,42 +1069,22 @@ def _resolve_access_scope_ids(db: Session, current: JwtUserDetails) -> Optional[
     allowed_assembly_ids = set(scope.get("assembly_ids") or [])
     allowed_ward_ids = set(scope.get("ward_ids") or [])
     allowed_booth_ids = set(scope.get("booth_ids") or [])
+    # When booth_ids are explicitly assigned, do not expand to full ward/assembly.
+    explicit_booth_ids = bool(scope.get("booth_ids"))
+    explicit_ward_ids = bool(scope.get("ward_ids"))
 
-    # booth_ids may be stored as booth_no values, so map both booth_id and booth_no to booth_id
+    if allowed_ward_ids:
+        allowed_ward_ids = _map_public_ward_pks(db, allowed_ward_ids, allowed_assembly_ids or None)
+
+    # booth_ids may be booth_no values — resolve within assigned ward/assembly when possible
     if allowed_booth_ids:
-        booth_cols = _get_table_columns(db, "public", "booths")
-        booth_pk_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
-        booth_no_col = "booth_no" if "booth_no" in booth_cols else None
-        if booth_pk_col:
-            raw_values = [str(v).strip() for v in allowed_booth_ids if v is not None and str(v).strip() != ""]
-            ids_int = sorted({int(v) for v in raw_values if v.isdigit()})
-            ids_text = sorted({str(v) for v in raw_values if str(v).strip()})
-            where_parts = []
-            params: Dict[str, Any] = {}
-            if ids_int:
-                clause_id, params_id = _build_in_clause(booth_pk_col, ids_int, "scope_booth_id")
-                where_parts.append(f"({clause_id})")
-                params.update(params_id)
-            if booth_no_col and ids_text:
-                clause_no, params_no = _build_in_clause(f"CAST({booth_no_col} AS TEXT)", ids_text, "scope_booth_no")
-                where_parts.append(f"({clause_no})")
-                params.update(params_no)
-            if not where_parts:
-                where_parts.append("1=0")
-            t_clause, t_params = _build_public_tenant_filter(current)
-            params.update(t_params)
-            where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
-            rows = db.execute(
-                text(
-                    f"""
-                    SELECT {booth_pk_col} AS booth_id, {booth_no_col if booth_no_col else booth_pk_col} AS booth_no
-                    FROM public.booths
-                    {where_clause} {t_clause}
-                    """
-                ),
-                params,
-            ).all()
-            allowed_booth_ids = {row.booth_id for row in rows if row.booth_id is not None}
+        allowed_booth_ids = _map_public_booth_pks(
+            db,
+            current,
+            allowed_booth_ids,
+            scope.get("ward_ids") or None,
+            scope.get("assembly_ids") or None,
+        )
 
     # Hierarchical expansion using public schema to avoid sparse data from 'data' schema
     ward_cols = _get_table_columns(db, "public", "wards")
@@ -982,8 +1096,14 @@ def _resolve_access_scope_ids(db: Session, current: JwtUserDetails) -> Optional[
     b_id_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
     b_ward_id_col = "ward_id" if "ward_id" in booth_cols else None
 
-    # Expansion: Assembly -> Wards
-    if allowed_assembly_ids and w_id_col and w_asm_id_col:
+    # Expansion: Assembly -> Wards (skip when user has explicit ward or booth scope)
+    if (
+        not explicit_booth_ids
+        and not explicit_ward_ids
+        and allowed_assembly_ids
+        and w_id_col
+        and w_asm_id_col
+    ):
         aids = sorted([int(v) for v in allowed_assembly_ids if v is not None])
         if aids:
             res = db.execute(text(f"SELECT {w_id_col} FROM public.wards WHERE {w_asm_id_col} IN :aids"), {"aids": tuple(aids)}).all()
@@ -996,8 +1116,8 @@ def _resolve_access_scope_ids(db: Session, current: JwtUserDetails) -> Optional[
             res = db.execute(text(f"SELECT {b_ward_id_col} FROM public.booths WHERE {b_id_col} IN :bids"), {"bids": tuple(bids)}).all()
             allowed_ward_ids.update([r[0] for r in res if r[0] is not None])
 
-    # Expansion: Wards -> Booths (Downward)
-    if allowed_ward_ids and b_id_col and b_ward_id_col:
+    # Expansion: Wards -> Booths (Downward) — only for ward-level users, not booth-scoped
+    if not explicit_booth_ids and allowed_ward_ids and b_id_col and b_ward_id_col:
         wids = sorted([int(v) for v in allowed_ward_ids if v is not None])
         if wids:
             res = db.execute(text(f"SELECT {b_id_col} FROM public.booths WHERE {b_ward_id_col} IN :wids"), {"wids": tuple(wids)}).all()
@@ -1019,6 +1139,7 @@ def _resolve_access_scope_ids(db: Session, current: JwtUserDetails) -> Optional[
         "allowed_assembly_ids": allowed_assembly_ids,
         "allowed_ward_ids": allowed_ward_ids,
         "allowed_booth_ids": allowed_booth_ids,
+        "booth_scoped": explicit_booth_ids,
     }
 
 
@@ -3116,23 +3237,52 @@ def get_public_booths(
         return []
     where = []
     params: Dict[str, Any] = {}
+    from_clause = "public.booths"
+    booth_alias = ""
     if assemblyId:
         normalized = normalize_assembly_code(assemblyId)
         unpadded = str(int(normalized)) if normalized and normalized.isdigit() else normalized
-        where.append(f"({assembly_ref} = :assembly_id OR CAST({assembly_ref} AS TEXT) = :assembly_unpadded)")
         params["assembly_id"] = normalized
         params["assembly_unpadded"] = unpadded
+        if assembly_ref:
+            where.append(
+                f"({assembly_ref} = :assembly_id OR CAST({assembly_ref} AS TEXT) = :assembly_unpadded)"
+            )
+        else:
+            ward_cols = _get_table_columns(db, "public", "wards")
+            ward_id_col = (
+                "ward_id"
+                if "ward_id" in ward_cols
+                else ("ward_no" if "ward_no" in ward_cols else ("id" if "id" in ward_cols else None))
+            )
+            assembly_ref_ward = (
+                "assembly_id"
+                if "assembly_id" in ward_cols
+                else ("assembly_no" if "assembly_no" in ward_cols else None)
+            )
+            if not ward_ref or not ward_id_col or not assembly_ref_ward:
+                return []
+            booth_alias = "b"
+            from_clause = f"public.booths {booth_alias} JOIN public.wards w ON {booth_alias}.{ward_ref} = w.{ward_id_col}"
+            where.append(
+                f"(w.{assembly_ref_ward} = :assembly_id OR CAST(w.{assembly_ref_ward} AS TEXT) = :assembly_unpadded)"
+            )
     if wardId and ward_ref:
-        where.append(f"{ward_ref} = :ward_id")
+        ward_col = f"{booth_alias}.{ward_ref}" if booth_alias else ward_ref
+        where.append(f"{ward_col} = :ward_id")
         params["ward_id"] = wardId
     where_clause = f"WHERE {' AND '.join(where)}" if where else ""
+    id_expr = f"{booth_alias}.{real_id_col}" if booth_alias and real_id_col else (real_id_col if real_id_col else id_col)
+    booth_no_expr = f"{booth_alias}.{id_col}" if booth_alias else id_col
+    name_expr = f"{booth_alias}.{name_col}" if booth_alias else name_col
+    ward_expr = f"{booth_alias}.{ward_ref}" if booth_alias and ward_ref else (ward_ref if ward_ref else "NULL")
     rows = db.execute(
         text(
             f"""
-            SELECT {real_id_col if real_id_col else id_col} as id, {id_col} AS booth_no, {name_col} AS booth_name, {ward_ref if ward_ref else 'NULL'} AS ward_id
-            FROM public.booths
+            SELECT {id_expr} as id, {booth_no_expr} AS booth_no, {name_expr} AS booth_name, {ward_expr} AS ward_id
+            FROM {from_clause}
             {where_clause}
-            ORDER BY {id_col}
+            ORDER BY {booth_no_expr}
             """
         ),
         params,
@@ -3619,16 +3769,31 @@ def search_voters(
     }).all()
     booth_by_key: Dict[tuple, Dict[str, Any]] = {}
     booths_by_no: Dict[str, List[Dict[str, Any]]] = {}
+    booth_scoped = bool(scope.get("booth_scoped")) if scope else False
+    scope_allowed_booth_ids = {int(v) for v in (scope.get("allowed_booth_ids") or set()) if v is not None} if scope else set()
+    scope_allowed_ward_ids = {int(v) for v in (scope.get("allowed_ward_ids") or set()) if v is not None} if scope else set()
+    raw_scope_booth_ids = {str(v).strip() for v in (scope.get("booth_ids") or []) if v is not None and str(v).strip() != ""} if scope else set()
     for b in booth_rows:
         if scope:
-            allowed_booth_ids = {v for v in (scope.get("allowed_booth_ids") or set()) if v is not None}
-            allowed_ward_ids = {v for v in (scope.get("allowed_ward_ids") or set()) if v is not None}
             booth_pk = int(b.booth_id)
             ward_pk = int(b.ward_id) if b.ward_id is not None else None
-            if allowed_booth_ids and booth_pk not in allowed_booth_ids:
-                continue
-            if allowed_ward_ids and ward_pk is not None and ward_pk not in allowed_ward_ids:
-                continue
+            booth_no_text = str(b.booth_no if b.booth_no is not None else b.booth_id)
+            if booth_scoped:
+                if scope_allowed_booth_ids:
+                    if booth_pk not in scope_allowed_booth_ids:
+                        continue
+                elif raw_scope_booth_ids:
+                    if booth_no_text not in raw_scope_booth_ids and str(booth_pk) not in raw_scope_booth_ids:
+                        continue
+                else:
+                    continue
+                if scope_allowed_ward_ids and ward_pk is not None and ward_pk not in scope_allowed_ward_ids:
+                    continue
+            else:
+                if scope_allowed_booth_ids and booth_pk not in scope_allowed_booth_ids:
+                    continue
+                if scope_allowed_ward_ids and ward_pk is not None and ward_pk not in scope_allowed_ward_ids:
+                    continue
         row = {
             "boothId": int(b.booth_id),
             "boothNo": str(b.booth_no if b.booth_no is not None else b.booth_id),
@@ -3673,9 +3838,25 @@ def search_voters(
             # For users with no tenant, we rely on the assembly-scoped ward/booth filters
             pass
 
-    allowed_ward_codes = sorted({str(v.get("wardCode")) for v in ward_by_id.values() if v.get("wardCode")})
-    allowed_booth_nos = sorted({row.get("boothNo") for row in booth_by_key.values() if row.get("boothNo")})
-    
+    if booth_scoped:
+        allowed_ward_codes = sorted(
+            {str(row.get("wardCode")) for row in booth_by_key.values() if row.get("wardCode")}
+        )
+        allowed_booth_nos = sorted({str(row.get("boothNo")) for row in booth_by_key.values() if row.get("boothNo")})
+        if not allowed_booth_nos and raw_scope_booth_ids:
+            allowed_booth_nos = sorted(raw_scope_booth_ids)
+        if not allowed_ward_codes and scope_allowed_ward_ids and ward_by_id:
+            allowed_ward_codes = sorted(
+                {
+                    str(v.get("wardCode"))
+                    for w_id, v in ward_by_id.items()
+                    if int(w_id) in scope_allowed_ward_ids and v.get("wardCode")
+                }
+            )
+    else:
+        allowed_ward_codes = sorted({str(v.get("wardCode")) for v in ward_by_id.values() if v.get("wardCode")})
+        allowed_booth_nos = sorted({str(row.get("boothNo")) for row in booth_by_key.values() if row.get("boothNo")})
+
     if allowed_ward_codes and voter_ward_code_col:
         clause, clause_params = _build_in_clause(f"CAST({voter_ward_code_col} AS TEXT)", allowed_ward_codes, "scope_ward_code")
         where_parts.append(clause)
@@ -4134,6 +4315,7 @@ def get_snapshot(
                 allowed_assembly_ids=scope.get("allowed_assembly_ids") if scope else None,
                 allowed_ward_ids=scope.get("allowed_ward_ids") if scope else None,
                 allowed_booth_ids=scope.get("allowed_booth_ids") if scope else None,
+                booth_scoped=bool(scope.get("booth_scoped")) if scope else False,
             )
             snapshot_id = _cache_snapshot(public_snapshot)
             snapshot_url = f"{_external_base_url(request)}{CONTEXT_PATH}/api/voters/snapshot/content/{snapshot_id}"
@@ -4430,8 +4612,22 @@ def _resolve_booth_ids_for_ward_param(db: Session, ward_id: int) -> List[int]:
 
 
 def _assert_booth_in_ward(db: Session, booth_id: int, ward_id: int) -> None:
-    allowed = _resolve_booth_ids_for_ward_param(db, int(ward_id))
-    if not allowed or int(booth_id) not in allowed:
+    ward_pks = _map_public_ward_pks(db, [int(ward_id)])
+    if not ward_pks:
+        ward_pks = {int(ward_id)}
+    allowed: set[int] = set()
+    for wpk in ward_pks:
+        allowed.update(_resolve_booth_ids_for_ward_param(db, int(wpk)))
+    booth_pk = int(booth_id)
+    if booth_pk not in allowed and booth_pk >= 10000:
+        composite_ward = booth_pk // 10000
+        composite_no = booth_pk % 10000
+        for wpk in ward_pks:
+            if int(wpk) == composite_ward:
+                for bid in allowed:
+                    if int(bid) % 10000 == composite_no or int(bid) == composite_no:
+                        return
+    if not allowed or booth_pk not in allowed:
         raise HTTPException(
             status_code=400,
             detail=f"Booth {booth_id} does not belong to ward {ward_id}",
@@ -4934,21 +5130,81 @@ def _family_to_dto(db: Session, fam: Family, rel_cache: Optional[Dict[str, tuple
     }
 
 
-def _bootstrap_booth(db: Session, booth_id: int, tenant_id: str):
+def _resolve_public_booth_row(
+    db: Session,
+    booth_id: int,
+    ward_id: Optional[int] = None,
+    booth_no: Optional[int] = None,
+) -> Any:
+    booth_cols = _get_table_columns(db, "public", "booths")
+    booth_id_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else None)
+    booth_no_col = "booth_no" if "booth_no" in booth_cols else booth_id_col
+    booth_ward_id_col = "ward_id" if "ward_id" in booth_cols else None
+    if not booth_id_col:
+        return None
+
+    def _lookup_by_ward_and_no(target_ward: int, target_no: int):
+        if not (booth_ward_id_col and booth_no_col):
+            return None
+        return db.execute(
+            text(
+                f"""
+                SELECT * FROM public.booths
+                WHERE {booth_ward_id_col} = :ward_id
+                  AND (
+                    CAST({booth_no_col} AS TEXT) = :booth_no_txt
+                    OR CAST({booth_no_col} AS INT) = :booth_no_int
+                  )
+                LIMIT 1
+                """
+            ),
+            {
+                "ward_id": target_ward,
+                "booth_no_txt": str(target_no),
+                "booth_no_int": target_no,
+            },
+        ).first()
+
+    row = db.execute(
+        text(f"SELECT * FROM public.booths WHERE {booth_id_col} = :booth_id LIMIT 1"),
+        {"booth_id": booth_id},
+    ).first()
+    if not row and ward_id is not None and booth_no is not None:
+        row = _lookup_by_ward_and_no(int(ward_id), int(booth_no))
+    if not row and booth_id >= 10000:
+        row = _lookup_by_ward_and_no(int(booth_id) // 10000, int(booth_id) % 10000)
+    if not row and ward_id is not None and booth_id < 10000:
+        row = _lookup_by_ward_and_no(int(ward_id), int(booth_id))
+    return row
+
+
+def _bootstrap_booth(db: Session, booth_id: int, tenant_id: str, ward_id: Optional[int] = None, booth_no: Optional[int] = None):
     # Check if booth exists in data.booths
     booth = db.query(Booth).filter(Booth.booth_id == booth_id).first()
     if booth:
         return booth
 
-    # Try to find in public.booths
-    res = db.execute(text("SELECT * FROM public.booths WHERE id = :bid AND (tenant_id = :tid OR tenant_id IS NULL)"), {"bid": booth_id, "tid": tenant_id}).first()
+    res = _resolve_public_booth_row(db, booth_id, ward_id=ward_id, booth_no=booth_no)
     if not res:
         return None
+    booth_cols = _get_table_columns(db, "public", "booths")
+    booth_pk_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else "id")
+    resolved_booth_id = int(getattr(res, booth_pk_col, None) or getattr(res, "booth_id", None) or booth_id)
+    booth = db.query(Booth).filter(Booth.booth_id == resolved_booth_id).first()
+    if booth:
+        return booth
 
+    ward_code_val = getattr(res, "ward_code", None)
     # Try to find ward info in public.wards
-    ward_info = db.execute(text("SELECT id, assembly_no, ward_name_en, ward_name_local FROM public.wards WHERE ward_code = :wc AND (tenant_id = :tid OR tenant_id IS NULL)"), {"wc": res.ward_code, "tid": tenant_id}).first()
+    ward_info = db.execute(
+        text(
+            "SELECT id, assembly_no, ward_name_en, ward_name_local FROM public.wards "
+            "WHERE ward_code = :wc AND (tenant_id = :tid OR tenant_id IS NULL)"
+        ),
+        {"wc": ward_code_val, "tid": tenant_id},
+    ).first()
     assembly_id = ward_info.assembly_no if ward_info and ward_info.assembly_no else 1
-    ward_id = ward_info.id if ward_info else res.ward_id
+    resolved_ward_id = ward_info.id if ward_info else getattr(res, "ward_id", None)
 
     # Assembly
     assembly = db.query(Assembly).filter(Assembly.assembly_id == assembly_id).first()
@@ -4963,41 +5219,53 @@ def _bootstrap_booth(db: Session, booth_id: int, tenant_id: str):
         db.flush()
 
     # Ward
-    ward = db.query(Ward).filter(Ward.ward_id == ward_id).first()
+    ward = db.query(Ward).filter(Ward.ward_id == resolved_ward_id).first()
     if not ward:
         ward = Ward(
-            ward_id=ward_id, # Explicit ID
+            ward_id=resolved_ward_id, # Explicit ID
             assembly_id=assembly.assembly_id,
             tenant_id=tenant_id,
-            ward_name_en=ward_info.ward_name_en if ward_info else res.ward_code,
+            ward_name_en=ward_info.ward_name_en if ward_info else ward_code_val,
             ward_name_local=ward_info.ward_name_local if ward_info else None,
-            ward_code=res.ward_code
+            ward_code=ward_code_val
         )
         db.add(ward)
         db.flush()
 
     # Create Booth in data schema
     booth = Booth(
-        booth_id=res.id, # Explicit ID
+        booth_id=resolved_booth_id,
         ward_id=ward.ward_id,
         tenant_id=tenant_id,
-        polling_station_adr_en=getattr(res, 'booth_add_en', ''),
-        polling_station_adr_local=getattr(res, 'booth_add_local', ''),
-        booth_no=res.booth_no,
-        ward_code=res.ward_code
+        polling_station_adr_en=getattr(res, "booth_add_en", None) or getattr(res, "polling_station_adr_en", "") or "",
+        polling_station_adr_local=getattr(res, "booth_add_local", None) or getattr(res, "polling_station_adr_local", "") or "",
+        booth_no=getattr(res, "booth_no", None),
+        ward_code=ward_code_val,
     )
     db.add(booth)
     db.flush()
     return booth
 
 def _bootstrap_voter(db: Session, epic: str, booth: Booth, tenant_id: str):
+    normalized_epic = normalize_optional_text(epic)
+    if not normalized_epic:
+        return None
+    effective_tenant = tenant_id or getattr(booth, "tenant_id", None) or "T1"
     # Check in data.voters
-    voters = db.query(Voter).filter(Voter.epic_no == epic, Voter.tenant_id == tenant_id).first()
+    voters = (
+        db.query(Voter)
+        .filter(Voter.epic_no == normalized_epic)
+        .filter(or_(Voter.tenant_id == effective_tenant, Voter.tenant_id.is_(None)))
+        .first()
+    )
     if voters:
         return voters
 
     # Find in public.voters
-    res = db.execute(text("SELECT * FROM public.voters WHERE epic = :epic AND (tenant_id = :tid OR tenant_id IS NULL)"), {"epic": epic, "tid": tenant_id}).first()
+    res = db.execute(
+        text("SELECT * FROM public.voters WHERE UPPER(TRIM(epic)) = UPPER(TRIM(:epic)) AND (tenant_id = :tid OR tenant_id IS NULL OR tenant_id = '')"),
+        {"epic": normalized_epic, "tid": effective_tenant},
+    ).first()
     if not res:
         return None
 
@@ -5007,13 +5275,13 @@ def _bootstrap_voter(db: Session, epic: str, booth: Booth, tenant_id: str):
     # Create Voter in data schema
     v = Voter(
         voter_id=next_id, # Explicit ID
-        tenant_id=tenant_id,
+        tenant_id=effective_tenant,
         booth_id=booth.booth_id,
-        epic_no=res.epic,
-        sr_no=int(res.sl) if res.sl and res.sl.isdigit() else 0,
+        epic_no=getattr(res, "epic", normalized_epic),
+        sr_no=int(res.sl) if res.sl is not None and str(res.sl).isdigit() else 0,
         first_middle_name_en=res.name_en,
         gender=res.gender,
-        age=int(res.age) if res.age and res.age.isdigit() else 0,
+        age=int(res.age) if res.age is not None and str(res.age).isdigit() else 0,
         house_no_en=res.house,
         mobile=res.mobile
     )
@@ -5032,12 +5300,25 @@ def create_family(payload: CreateFamilyRequest, db: Session = Depends(get_db), c
         # In a real system, you'd pick the relevant tenant for the booth.
         tenant_id = "T1" 
 
-    booth = _bootstrap_booth(db, payload.boothId, tenant_id)
-    if not booth:
-        raise ValueError("Invalid booth")
+    public_booth = _resolve_public_booth_row(db, int(payload.boothId), ward_id=payload.wardId)
+    if not public_booth:
+        raise ValueError(
+            f"Invalid booth (id={payload.boothId}, ward={payload.wardId}). "
+            "Re-add a family member from the selected ward or refresh the booth list."
+        )
+    booth_cols = _get_table_columns(db, "public", "booths")
+    booth_pk_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else "id")
+    booth_no_col = "booth_no" if "booth_no" in booth_cols else None
+    resolved_booth_id = int(getattr(public_booth, booth_pk_col, None) or getattr(public_booth, "booth_id", None) or payload.boothId)
+    raw_booth_no = getattr(public_booth, booth_no_col, None) if booth_no_col else None
+    booth_no = int(raw_booth_no) if raw_booth_no is not None and str(raw_booth_no).isdigit() else None
 
     if payload.wardId is not None:
-        _assert_booth_in_ward(db, int(payload.boothId), int(payload.wardId))
+        _assert_booth_in_ward(db, resolved_booth_id, int(payload.wardId))
+
+    booth = _bootstrap_booth(db, resolved_booth_id, tenant_id, ward_id=payload.wardId, booth_no=booth_no)
+    if not booth:
+        raise ValueError("Invalid booth")
 
     association = None
     if payload.associationId is not None:
@@ -6614,9 +6895,16 @@ def _serialize_enrichment_value(api_field: str, value: Any) -> Any:
 def _ensure_user_from_volunteer(db: Session, volunteer: VolunteerUser) -> Optional[User]:
     if not volunteer:
         return None
-    existing = db.query(User).filter(User.first_name == volunteer.first_name, User.phone == volunteer.phone).first()
-    if existing:
-        return existing
+    phone = normalize_optional_text(volunteer.phone) or ""
+    if phone:
+        existing = db.query(User).filter(User.phone == phone).first()
+        if existing:
+            return existing
+    first_name = normalize_optional_text(volunteer.first_name) or ""
+    if first_name:
+        existing = db.query(User).filter(User.first_name == first_name).first()
+        if existing:
+            return existing
 
     tenant_ref = None
     if volunteer.tenant_id:
@@ -6637,8 +6925,22 @@ def _ensure_user_from_volunteer(db: Session, volunteer: VolunteerUser) -> Option
         blocked=bool(volunteer.blocked),
         deleted=bool(volunteer.deleted),
     )
-    db.add(user)
-    db.flush()
+    nested = db.begin_nested()
+    try:
+        db.add(user)
+        db.flush()
+        nested.commit()
+    except IntegrityError:
+        nested.rollback()
+        if phone:
+            existing = db.query(User).filter(User.phone == phone).first()
+            if existing:
+                return existing
+        if first_name:
+            existing = db.query(User).filter(User.first_name == first_name).first()
+            if existing:
+                return existing
+        raise
     return user
 
 
@@ -6757,10 +7059,14 @@ def _build_public_snapshot(
     allowed_assembly_ids: Optional[set[int]] = None,
     allowed_ward_ids: Optional[set[int]] = None,
     allowed_booth_ids: Optional[set[int]] = None,
+    booth_scoped: bool = False,
 ) -> Dict[str, Any]:
     allowed_assembly_ids = {v for v in (allowed_assembly_ids or set()) if v is not None}
     allowed_ward_ids = {v for v in (allowed_ward_ids or set()) if v is not None}
     allowed_booth_ids = {v for v in (allowed_booth_ids or set()) if v is not None}
+    # Booth-level users: restrict by booth PK only — ward filter would expose the full ward if booth mapping failed.
+    if booth_scoped and allowed_booth_ids:
+        allowed_ward_ids = set()
     assembly_cols = _ensure_public_assembly_code(db)
     booth_cols = _get_table_columns(db, "public", "booths")
     voter_cols = _get_table_columns(db, "public", "voters")
@@ -6853,10 +7159,12 @@ def _build_public_snapshot(
             clause, params = _build_in_clause(booth_id_col, sorted(allowed_booth_ids), "scope_booth")
             booth_filters.append(clause)
             booth_params.update(params)
-        if allowed_ward_ids:
+        elif allowed_ward_ids:
             clause, params = _build_in_clause(booth_ward_id_col, sorted(allowed_ward_ids), "scope_ward")
             booth_filters.append(clause)
             booth_params.update(params)
+        elif booth_scoped:
+            booth_filters.append("1=0")
         
         if current.role != "SUPER_ADMIN" and "tenant_id" in booth_cols:
             if current.tenantId:
@@ -6951,19 +7259,33 @@ def _build_public_snapshot(
 
     voters_by_key: Dict[tuple, List[Dict[str, Any]]] = {}
     counts_by_key: Dict[tuple, Dict[str, int]] = {}
-    relevant_booths = [
-        b
-        for b in booth_rows
-        if (not allowed_ward_ids or b.ward_id in allowed_ward_ids)
-        and (not allowed_booth_ids or b.booth_id in allowed_booth_ids)
-    ]
-    allowed_ward_codes = sorted(
-        {
-            str(w.get("wardCode"))
-            for w in ward_map.values()
-            if w.get("wardCode") is not None and str(w.get("wardCode")).strip() != ""
-        }
-    )
+    if booth_scoped and allowed_booth_ids:
+        relevant_booths = [b for b in booth_rows if b.booth_id in allowed_booth_ids]
+    elif booth_scoped:
+        relevant_booths = []
+    else:
+        relevant_booths = [
+            b
+            for b in booth_rows
+            if (not allowed_ward_ids or b.ward_id in allowed_ward_ids)
+            and (not allowed_booth_ids or b.booth_id in allowed_booth_ids)
+        ]
+    if booth_scoped and relevant_booths:
+        allowed_ward_codes = sorted(
+            {
+                str(b.ward_code)
+                for b in relevant_booths
+                if b.ward_code is not None and str(b.ward_code).strip() != ""
+            }
+        )
+    else:
+        allowed_ward_codes = sorted(
+            {
+                str(w.get("wardCode"))
+                for w in ward_map.values()
+                if w.get("wardCode") is not None and str(w.get("wardCode")).strip() != ""
+            }
+        )
     allowed_booth_nos = sorted({str(b.booth_no) for b in relevant_booths if b.booth_no is not None})
 
     voter_where_parts: List[str] = []
@@ -7063,10 +7385,14 @@ def _build_public_snapshot(
 
     for b in booth_rows:
         ward_id = b.ward_id
-        if allowed_ward_ids and ward_id not in allowed_ward_ids:
-            continue
-        if allowed_booth_ids and b.booth_id not in allowed_booth_ids:
-            continue
+        if booth_scoped:
+            if allowed_booth_ids and b.booth_id not in allowed_booth_ids:
+                continue
+        else:
+            if allowed_ward_ids and ward_id not in allowed_ward_ids:
+                continue
+            if allowed_booth_ids and b.booth_id not in allowed_booth_ids:
+                continue
         if ward_id not in ward_map:
             ward_map[ward_id] = {
                 "wardId": ward_id,
@@ -7100,6 +7426,7 @@ def _build_public_snapshot(
                 [
                     {**ward, "booths": sorted(ward.get("booths", []), key=lambda b: (b.get("boothNo") or 0, b.get("boothId") or 0))}
                     for ward in ward_map.values()
+                    if ward.get("booths")
                 ],
                 key=lambda w: (w.get("wardCode") or str(w["wardId"])),
             ),
