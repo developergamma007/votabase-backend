@@ -5178,6 +5178,71 @@ def _resolve_public_booth_row(
     return row
 
 
+def _get_or_create_data_ward(
+    db: Session,
+    tenant_id: str,
+    assembly_id: int,
+    ward_code_val: Optional[str],
+    resolved_ward_id: Optional[int],
+    ward_info: Any = None,
+) -> Ward:
+    """Reuse data.wards by ward_code (unique) before inserting a duplicate row."""
+    ward_code = normalize_optional_text(ward_code_val)
+    if not ward_code and resolved_ward_id is not None:
+        ward_code = f"W{int(resolved_ward_id):02d}"
+
+    ward: Optional[Ward] = None
+    if ward_code:
+        ward = (
+            db.query(Ward)
+            .filter(Ward.ward_code == ward_code)
+            .filter(or_(Ward.tenant_id == tenant_id, Ward.tenant_id.is_(None)))
+            .first()
+        )
+    if not ward and resolved_ward_id is not None:
+        ward = db.query(Ward).filter(Ward.ward_id == int(resolved_ward_id)).first()
+
+    if ward:
+        return ward
+
+    new_ward_id = int(resolved_ward_id) if resolved_ward_id is not None else None
+    if new_ward_id is None:
+        max_id = db.query(func.max(Ward.ward_id)).scalar()
+        new_ward_id = int(max_id or 0) + 1
+    if not ward_code:
+        ward_code = f"W{new_ward_id:02d}"
+
+    # Avoid primary-key clash if another row already owns this ward_id.
+    existing_by_id = db.query(Ward).filter(Ward.ward_id == new_ward_id).first()
+    if existing_by_id:
+        return existing_by_id
+
+    ward = Ward(
+        ward_id=new_ward_id,
+        assembly_id=assembly_id,
+        tenant_id=tenant_id,
+        ward_name_en=(ward_info.ward_name_en if ward_info else None) or ward_code,
+        ward_name_local=ward_info.ward_name_local if ward_info else None,
+        ward_code=ward_code,
+    )
+    db.add(ward)
+    try:
+        with db.begin_nested():
+            db.flush()
+    except IntegrityError:
+        ward = (
+            db.query(Ward)
+            .filter(Ward.ward_code == ward_code)
+            .filter(or_(Ward.tenant_id == tenant_id, Ward.tenant_id.is_(None)))
+            .first()
+        )
+        if not ward and resolved_ward_id is not None:
+            ward = db.query(Ward).filter(Ward.ward_id == int(resolved_ward_id)).first()
+        if not ward:
+            raise ValueError(f"Unable to resolve ward for code {ward_code}") from None
+    return ward
+
+
 def _bootstrap_booth(db: Session, booth_id: int, tenant_id: str, ward_id: Optional[int] = None, booth_no: Optional[int] = None):
     # Check if booth exists in data.booths
     booth = db.query(Booth).filter(Booth.booth_id == booth_id).first()
@@ -5195,42 +5260,58 @@ def _bootstrap_booth(db: Session, booth_id: int, tenant_id: str, ward_id: Option
         return booth
 
     ward_code_val = getattr(res, "ward_code", None)
-    # Try to find ward info in public.wards
-    ward_info = db.execute(
-        text(
-            "SELECT id, assembly_no, ward_name_en, ward_name_local FROM public.wards "
-            "WHERE ward_code = :wc AND (tenant_id = :tid OR tenant_id IS NULL)"
-        ),
-        {"wc": ward_code_val, "tid": tenant_id},
-    ).first()
-    assembly_id = ward_info.assembly_no if ward_info and ward_info.assembly_no else 1
-    resolved_ward_id = ward_info.id if ward_info else getattr(res, "ward_id", None)
+    ward_info = None
+    if ward_code_val:
+        ward_info = db.execute(
+            text(
+                "SELECT id, assembly_no, ward_name_en, ward_name_local, ward_code FROM public.wards "
+                "WHERE ward_code = :wc AND (tenant_id = :tid OR tenant_id IS NULL)"
+            ),
+            {"wc": ward_code_val, "tid": tenant_id},
+        ).first()
+    if not ward_info and ward_id is not None:
+        ward_info = db.execute(
+            text(
+                "SELECT id, assembly_no, ward_name_en, ward_name_local, ward_code FROM public.wards "
+                "WHERE id = :wid AND (tenant_id = :tid OR tenant_id IS NULL)"
+            ),
+            {"wid": int(ward_id), "tid": tenant_id},
+        ).first()
+        if ward_info and not ward_code_val:
+            ward_code_val = getattr(ward_info, "ward_code", None)
 
-    # Assembly
+    assembly_id = int(ward_info.assembly_no) if ward_info and ward_info.assembly_no else 1
+    resolved_ward_id = int(ward_info.id) if ward_info and ward_info.id is not None else (
+        int(getattr(res, "ward_id", None)) if getattr(res, "ward_id", None) is not None else (
+            int(ward_id) if ward_id is not None else None
+        )
+    )
+
     assembly = db.query(Assembly).filter(Assembly.assembly_id == assembly_id).first()
     if not assembly:
         assembly = Assembly(
-            assembly_id=assembly_id, # Explicit ID
+            assembly_id=assembly_id,
             tenant_id=tenant_id,
             assembly_name_en=f"Assembly {assembly_id}",
-            assembly_code=str(assembly_id)
+            assembly_code=str(assembly_id),
         )
         db.add(assembly)
-        db.flush()
+        try:
+            with db.begin_nested():
+                db.flush()
+        except IntegrityError:
+            assembly = db.query(Assembly).filter(Assembly.assembly_id == assembly_id).first()
+            if not assembly:
+                raise ValueError(f"Unable to resolve assembly {assembly_id}") from None
 
-    # Ward
-    ward = db.query(Ward).filter(Ward.ward_id == resolved_ward_id).first()
-    if not ward:
-        ward = Ward(
-            ward_id=resolved_ward_id, # Explicit ID
-            assembly_id=assembly.assembly_id,
-            tenant_id=tenant_id,
-            ward_name_en=ward_info.ward_name_en if ward_info else ward_code_val,
-            ward_name_local=ward_info.ward_name_local if ward_info else None,
-            ward_code=ward_code_val
-        )
-        db.add(ward)
-        db.flush()
+    ward = _get_or_create_data_ward(
+        db,
+        tenant_id,
+        assembly.assembly_id,
+        ward_code_val,
+        resolved_ward_id,
+        ward_info,
+    )
 
     # Create Booth in data schema
     booth = Booth(
@@ -5246,47 +5327,106 @@ def _bootstrap_booth(db: Session, booth_id: int, tenant_id: str, ward_id: Option
     db.flush()
     return booth
 
+def _public_voter_row_value(row: Any, *keys: str, default: Any = None) -> Any:
+    if row is None:
+        return default
+    for key in keys:
+        if not key:
+            continue
+        value = getattr(row, key, None)
+        if value is not None and str(value).strip() != "":
+            return value
+    return default
+
+
+def _lookup_public_voter_by_epic(db: Session, epic: str, tenant_id: Optional[str] = None) -> Any:
+    """Match voter search behaviour: dynamic epic column, tenant filter then epic-only fallback."""
+    voter_cols = _get_table_columns(db, "public", "voters")
+    if not voter_cols:
+        return None
+    epic_col = "epic" if "epic" in voter_cols else ("epic_no" if "epic_no" in voter_cols else None)
+    if not epic_col:
+        return None
+    normalized_epic = normalize_optional_text(epic)
+    if not normalized_epic:
+        return None
+
+    def _run(with_tenant: bool) -> Any:
+        where_parts = [f"UPPER(TRIM({epic_col})) = UPPER(TRIM(:epic))"]
+        params: Dict[str, Any] = {"epic": normalized_epic}
+        if with_tenant and tenant_id and "tenant_id" in voter_cols:
+            where_parts.append("(tenant_id = :tid OR tenant_id IS NULL OR tenant_id = '')")
+            params["tid"] = tenant_id
+        return db.execute(
+            text(f"SELECT * FROM public.voters WHERE {' AND '.join(where_parts)} LIMIT 1"),
+            params,
+        ).first()
+
+    row = _run(True)
+    return row or _run(False)
+
+
 def _bootstrap_voter(db: Session, epic: str, booth: Booth, tenant_id: str):
     normalized_epic = normalize_optional_text(epic)
     if not normalized_epic:
         return None
     effective_tenant = tenant_id or getattr(booth, "tenant_id", None) or "T1"
-    # Check in data.voters
-    voters = (
+    epic_upper = normalized_epic.upper()
+
+    existing = (
         db.query(Voter)
-        .filter(Voter.epic_no == normalized_epic)
+        .filter(func.upper(func.trim(Voter.epic_no)) == epic_upper)
         .filter(or_(Voter.tenant_id == effective_tenant, Voter.tenant_id.is_(None)))
         .first()
     )
-    if voters:
-        return voters
+    if not existing:
+        existing = db.query(Voter).filter(func.upper(func.trim(Voter.epic_no)) == epic_upper).first()
+    if existing:
+        if existing.booth_id != booth.booth_id:
+            existing.booth_id = booth.booth_id
+        return existing
 
-    # Find in public.voters
-    res = db.execute(
-        text("SELECT * FROM public.voters WHERE UPPER(TRIM(epic)) = UPPER(TRIM(:epic)) AND (tenant_id = :tid OR tenant_id IS NULL OR tenant_id = '')"),
-        {"epic": normalized_epic, "tid": effective_tenant},
-    ).first()
+    res = _lookup_public_voter_by_epic(db, normalized_epic, effective_tenant)
     if not res:
         return None
 
-    # Generate a voter_id since data.voters has no serial
+    voter_cols = _get_table_columns(db, "public", "voters")
+    epic_col = "epic" if "epic" in voter_cols else ("epic_no" if "epic_no" in voter_cols else "epic")
+    name_col = (
+        "name_en"
+        if "name_en" in voter_cols
+        else ("first_middle_name_en" if "first_middle_name_en" in voter_cols else None)
+    )
+    sl_col = "sl" if "sl" in voter_cols else ("sr_no" if "sr_no" in voter_cols else None)
+    house_col = "house" if "house" in voter_cols else ("house_no_en" if "house_no_en" in voter_cols else None)
+
+    sl_raw = _public_voter_row_value(res, sl_col, "sl", "sr_no")
+    age_raw = _public_voter_row_value(res, "age")
     next_id = db.execute(text("SELECT COALESCE(MAX(voter_id), 0) + 1 FROM data.voters")).scalar()
 
-    # Create Voter in data schema
     v = Voter(
-        voter_id=next_id, # Explicit ID
+        voter_id=int(next_id or 1),
         tenant_id=effective_tenant,
         booth_id=booth.booth_id,
-        epic_no=getattr(res, "epic", normalized_epic),
-        sr_no=int(res.sl) if res.sl is not None and str(res.sl).isdigit() else 0,
-        first_middle_name_en=res.name_en,
-        gender=res.gender,
-        age=int(res.age) if res.age is not None and str(res.age).isdigit() else 0,
-        house_no_en=res.house,
-        mobile=res.mobile
+        epic_no=str(_public_voter_row_value(res, epic_col, "epic", "epic_no", default=normalized_epic)),
+        sr_no=int(sl_raw) if sl_raw is not None and str(sl_raw).isdigit() else 0,
+        first_middle_name_en=_public_voter_row_value(res, name_col, "name_en", "first_middle_name_en"),
+        gender=_public_voter_row_value(res, "gender"),
+        age=int(age_raw) if age_raw is not None and str(age_raw).isdigit() else 0,
+        house_no_en=_public_voter_row_value(res, house_col, "house", "house_no_en"),
+        mobile=_public_voter_row_value(res, "mobile"),
     )
     db.add(v)
-    db.flush()
+    try:
+        with db.begin_nested():
+            db.flush()
+    except IntegrityError:
+        existing = db.query(Voter).filter(func.upper(func.trim(Voter.epic_no)) == epic_upper).first()
+        if existing:
+            if existing.booth_id != booth.booth_id:
+                existing.booth_id = booth.booth_id
+            return existing
+        raise
     return v
 
 
