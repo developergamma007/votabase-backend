@@ -1866,6 +1866,17 @@ def update_volunteer(
     if not volunteer:
         return api_error("Volunteer not found", {"details": f"Volunteer not found with phone: '{phone}'"})
 
+    existing_level = (
+        (volunteer.working_level or volunteer.assignment_type or volunteer.role or "")
+        .strip()
+        .upper()
+    )
+    if existing_level in {"SUPER_ADMIN", "ASSEMBLY", "WARD"}:
+        raise HTTPException(
+            status_code=403,
+            detail="Super Admin, Assembly, and Ward level logins cannot be updated. Contact an administrator.",
+        )
+
     working_level = (payload.workingLevel or "").strip().upper()
     if working_level not in {"ASSEMBLY", "WARD", "BOOTH"}:
         raise ValueError("workingLevel must be ASSEMBLY, WARD, or BOOTH")
@@ -2203,9 +2214,6 @@ def volunteer_analysis(
     if not enrichments:
         return api_success("Volunteer analysis fetched", [])
 
-    def _label_from_key(key: str) -> str:
-        return " ".join([part.capitalize() for part in key.replace("_", " ").split()])
-
     exclude_keys = {
         "firstMiddleNameEn",
         "lastNameEn",
@@ -2223,7 +2231,7 @@ def volunteer_analysis(
     }
     enrichment_keys = [key for key in VOTER_ENRICHMENT_FIELD_MAP.keys() if key not in exclude_keys]
     extra_keys = ["ward_code", "booth_no", "updated_fields"]
-    analysis_fields = [{"key": key, "label": _label_from_key(key)} for key in enrichment_keys + extra_keys]
+    analysis_fields = [{"key": key, "label": _volunteer_analysis_count_field_label(key)} for key in enrichment_keys + extra_keys]
 
     mode_key = (mode or "agent").lower()
 
@@ -2404,6 +2412,9 @@ def volunteer_analysis_enrichment(
         "epicNo",
         "boothNo",
         "voterSerialNo",
+        "mobile",
+        "updatedByName",
+        "updatedByPhone",
         "lastUpdatedAt",
     ]
     ward_name_map: Dict[str, str] = {}
@@ -2581,12 +2592,15 @@ def volunteer_analysis_enrichment(
             if voter and voter.sr_no is not None
             else (public_voter.get("sl") if public_voter else None)
         ) or payload.get("newSerialNo")
+        ordered["mobile"] = payload.get("mobile")
+        ordered["updatedByName"] = payload.get("updatedByName") or enrichment.updated_by_name
+        ordered["updatedByPhone"] = payload.get("updatedByPhone") or enrichment.updated_by_phone
         ordered["lastUpdatedAt"] = enrichment.updated_at.isoformat() if enrichment.updated_at else None
 
         remaining_keys = [
             key
             for key in (
-                ["wardCode", "boothNo", "updatedFields", "updatedByName", "updatedByPhone"]
+                ["wardCode", "boothNo", "updatedFields", "mobile"]
                 + list(VOTER_ENRICHMENT_FIELD_MAP.keys())
             )
             if key not in ordered_keys and key not in exclude_keys and key != "updatedFields"
@@ -4417,6 +4431,8 @@ FAMILY_DETAIL_EXPORT_FIELDS = [
     ("headName", "Head of Family"),
     ("headEpicNo", "Head EPIC"),
     ("memberCount", "Member Count"),
+    ("updatedByName", "Updated By Name"),
+    ("updatedByPhone", "Updated By Number"),
 ]
 
 
@@ -5522,13 +5538,34 @@ def create_family(payload: CreateFamilyRequest, db: Session = Depends(get_db), c
 
 
 @app.put(f"{CONTEXT_PATH}/api/family/{{familyId}}")
-def update_family(familyId: int, payload: UpdateFamilyRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "USER"))):
+def update_family(familyId: int, payload: UpdateFamilyRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "BOOTH", "USER"))):
     fam = db.query(Family).filter(Family.familyId == familyId).first()
     if not fam:
         raise ValueError(f"Family not found: {familyId}")
 
-    if payload.wardId is not None:
-        _assert_booth_in_ward(db, int(payload.boothId), int(payload.wardId))
+    booth = db.query(Booth).filter(Booth.booth_id == fam.booth_id).first()
+    if payload.boothId is not None:
+        if payload.wardId is not None:
+            _assert_booth_in_ward(db, int(payload.boothId), int(payload.wardId))
+        tenant_id = fam.tenant_id or current.tenantId or "T1"
+        public_booth = _resolve_public_booth_row(db, int(payload.boothId), ward_id=payload.wardId)
+        if not public_booth:
+            raise ValueError(
+                f"Invalid booth (id={payload.boothId}, ward={payload.wardId}). "
+                "Re-add a family member from the selected ward or refresh the booth list."
+            )
+        booth_cols = _get_table_columns(db, "public", "booths")
+        booth_pk_col = "id" if "id" in booth_cols else ("booth_id" if "booth_id" in booth_cols else "id")
+        booth_no_col = "booth_no" if "booth_no" in booth_cols else None
+        resolved_booth_id = int(
+            getattr(public_booth, booth_pk_col, None) or getattr(public_booth, "booth_id", None) or payload.boothId
+        )
+        raw_booth_no = getattr(public_booth, booth_no_col, None) if booth_no_col else None
+        booth_no = int(raw_booth_no) if raw_booth_no is not None and str(raw_booth_no).isdigit() else None
+        booth = _bootstrap_booth(db, resolved_booth_id, tenant_id, ward_id=payload.wardId, booth_no=booth_no)
+        if not booth:
+            raise ValueError("Invalid booth")
+        fam.booth_id = booth.booth_id
 
     fam.family_name = payload.familyName
     fam.family_address = payload.familyAddress
@@ -5866,13 +5903,17 @@ def families_analysis(
 @app.get(f"{CONTEXT_PATH}/api/families/map-points")
 def families_map_points(
     db: Session = Depends(get_db),
-    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "USER")),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "BOOTH", "USER")),
     wardId: Optional[int] = None,
     boothId: Optional[int] = None,
+    updatedFrom: Optional[str] = None,
+    updatedTo: Optional[str] = None,
     assemblyCode: Optional[str] = None,
 ):
     """Families with coordinates and enriched member relation fields for map tooltips."""
-    rows = _load_families_for_analysis(db, current, wardId=wardId, boothId=boothId, assemblyCode=assemblyCode)
+    rows = _load_families_for_analysis(
+        db, current, wardId=wardId, boothId=boothId, updatedFrom=updatedFrom, updatedTo=updatedTo, assemblyCode=assemblyCode
+    )
     rel_cache: Dict[str, tuple] = {}
     points: List[Dict[str, Any]] = []
     for fam, _booth in rows:
@@ -6343,7 +6384,11 @@ def deactivate_all_templates(
 
 
 @app.get(f"{CONTEXT_PATH}/api/family/{{id}}")
-def get_family(id: int, db: Session = Depends(get_db), _: JwtUserDetails = Depends(require_roles("ADMIN", "USER"))):
+def get_family(
+    id: int,
+    db: Session = Depends(get_db),
+    _: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "BOOTH", "USER")),
+):
     fam = db.query(Family).filter(Family.familyId == id).first()
     if not fam:
         raise ValueError(f"Family not found: {id}")
@@ -6956,6 +7001,46 @@ def _get_public_voter_column_map(voter_cols: set[str]) -> Dict[str, str]:
     if "rel_type" in voter_cols:
         field_map["relationType"] = "rel_type"
     return field_map
+
+
+def _volunteer_analysis_count_field_label(key: str) -> str:
+    """Human labels for agent-wise update counts (not voter/agent identity columns)."""
+    explicit = {
+        "mobile": "Voter Mobile Updates",
+        "dob": "Voter DOB Updates",
+        "addressEn": "Voter Address (EN) Updates",
+        "addressLocal": "Voter Address (Local) Updates",
+        "status": "Voter Status Updates",
+        "community": "Voter Community Updates",
+        "caste": "Voter Caste Updates",
+        "residenceType": "Voter Residence Type Updates",
+        "civicIssue": "Voter Civic Issue Updates",
+        "motherTongue": "Voter Mother Tongue Updates",
+        "ownership": "Voter Ownership Updates",
+        "education": "Voter Education Updates",
+        "natureOfVoter": "Voter Nature Updates",
+        "voterPoints": "Voter Points Updates",
+        "govtSchemeTracking": "Voter Govt Scheme Updates",
+        "engagementPotential": "Voter Engagement Updates",
+        "ifShifted": "Voter Shifted Updates",
+        "notes": "Voter Notes Updates",
+        "presentAddress": "Voter Present Address Updates",
+        "newWard": "Voter New Ward Updates",
+        "newBoothNo": "Voter New Booth Updates",
+        "newSerialNo": "Voter New Serial Updates",
+        "notAvailableReason": "Voter Not Available Updates",
+        "latitude": "Voter Latitude Updates",
+        "longitude": "Voter Longitude Updates",
+        "ward_code": "Ward Code Updates",
+        "booth_no": "Booth No Updates",
+        "updated_fields": "Field Updates",
+    }
+    if key in explicit:
+        return explicit[key]
+    if key in VOTER_ENRICHMENT_FIELD_MAP:
+        parts = [part.capitalize() for part in key.replace("_", " ").split()]
+        return f"Voter {' '.join(parts)} Updates"
+    return " ".join([part.capitalize() for part in key.replace("_", " ").split()])
 
 
 VOTER_ENRICHMENT_FIELD_MAP: Dict[str, str] = {
