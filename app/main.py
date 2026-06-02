@@ -2131,64 +2131,8 @@ def _enrichment_has_value(enrichment: VoterEnrichment, api_field: str) -> bool:
     return True
 
 
-def _volunteer_analysis_epic_key(value: Optional[str]) -> Optional[str]:
-    if value is None:
-        return None
-    cleaned = str(value).strip().upper()
-    return cleaned or None
-
-
-def _load_public_voter_demographics_map(db: Session, enrichments: List[VoterEnrichment]) -> Dict[str, Dict[str, Any]]:
-    epic_keys = list(
-        {_volunteer_analysis_epic_key(e.epic) for e in enrichments if _volunteer_analysis_epic_key(e.epic)}
-    )
-    if not epic_keys:
-        return {}
-    voter_cols = _get_table_columns(db, "public", "voters")
-    if "epic" not in voter_cols:
-        return {}
-    gender_col = "gender" if "gender" in voter_cols else None
-    age_col = "age" if "age" in voter_cols else None
-    if not gender_col and not age_col:
-        return {}
-    clause, params = _build_in_clause("epic", epic_keys, "va_demo_epic")
-    rows = db.execute(
-        text(
-            f"""
-            SELECT epic,
-                   {gender_col if gender_col else 'NULL'} AS gender,
-                   {age_col if age_col else 'NULL'} AS age
-            FROM public.voters
-            WHERE {clause}
-            """
-        ),
-        params,
-    ).all()
-    result: Dict[str, Dict[str, Any]] = {}
-    for row in rows:
-        key = _volunteer_analysis_epic_key(row.epic)
-        if key:
-            result[key] = {"gender": row.gender, "age": row.age}
-    return result
-
-
-def _volunteer_analysis_field_counted(
-    enrichment: VoterEnrichment,
-    api_field: str,
-    public_demo_map: Optional[Dict[str, Dict[str, Any]]] = None,
-) -> bool:
-    if _enrichment_has_value(enrichment, api_field):
-        return True
-    if api_field not in {"gender", "age"} or not public_demo_map:
-        return False
-    epic_key = _volunteer_analysis_epic_key(enrichment.epic)
-    demo = public_demo_map.get(epic_key) if epic_key else None
-    if not demo:
-        return False
-    if api_field == "gender":
-        return bool(str(demo.get("gender") or "").strip())
-    age_val = demo.get("age")
-    return age_val is not None and str(age_val).strip() != ""
+def _volunteer_analysis_field_counted(enrichment: VoterEnrichment, api_field: str) -> bool:
+    return _enrichment_has_value(enrichment, api_field)
 
 
 @app.get(f"{CONTEXT_PATH}/api/volunteers/analysis")
@@ -2284,8 +2228,6 @@ def volunteer_analysis(
     if not enrichments:
         return api_success("Volunteer analysis fetched", [])
 
-    public_demo_map = _load_public_voter_demographics_map(db, enrichments)
-
     exclude_keys = {
         "firstMiddleNameEn",
         "lastNameEn",
@@ -2298,6 +2240,8 @@ def volunteer_analysis(
         "relationLastNameLocal",
         "houseNoEn",
         "houseNoLocal",
+        "gender",
+        "age",
     }
     enrichment_keys = [key for key in VOTER_ENRICHMENT_FIELD_MAP.keys() if key not in exclude_keys]
     extra_keys = ["ward_code", "booth_no", "updated_fields"]
@@ -2331,7 +2275,7 @@ def volunteer_analysis(
             if not existing or enrichment.updated_at > existing:
                 bucket["lastUpdatedAt"] = enrichment.updated_at
         for item in analysis_fields:
-            if _volunteer_analysis_field_counted(enrichment, item["key"], public_demo_map):
+            if _volunteer_analysis_field_counted(enrichment, item["key"]):
                 bucket["counts"][item["key"]] += 1
 
     if mode_key == "agent":
@@ -2424,7 +2368,7 @@ def volunteer_analysis(
             if not existing or enrichment.updated_at > existing:
                 bucket["lastUpdatedAt"] = enrichment.updated_at
         for item in analysis_fields:
-            if _volunteer_analysis_field_counted(enrichment, item["key"], public_demo_map):
+            if _volunteer_analysis_field_counted(enrichment, item["key"]):
                 bucket["counts"][item["key"]] += 1
 
     grouped_rows = []
@@ -2482,6 +2426,8 @@ def volunteer_analysis_enrichment(
         "epicNo",
         "boothNo",
         "voterSerialNo",
+        "gender",
+        "age",
         "mobile",
         "updatedByName",
         "updatedByPhone",
@@ -2612,12 +2558,16 @@ def volunteer_analysis_enrichment(
         epic_col = "epic" if "epic" in voter_cols else ("epic_no" if "epic_no" in voter_cols else None)
         name_col = "name_en" if "name_en" in voter_cols else ("name" if "name" in voter_cols else None)
         sl_col = "sl" if "sl" in voter_cols else ("sr_no" if "sr_no" in voter_cols else None)
+        gender_col = "gender" if "gender" in voter_cols else None
+        age_col = "age" if "age" in voter_cols else None
         if epic_col and (name_col or sl_col):
             clause, params = _build_in_clause(f"UPPER(TRIM({epic_col}))", epics, "public_epic")
             select_cols = [
                 f"{epic_col} AS epic",
                 f"{name_col} AS name_en" if name_col else "NULL AS name_en",
                 f"{sl_col} AS sl" if sl_col else "NULL AS sl",
+                f"{gender_col} AS gender" if gender_col else "NULL AS gender",
+                f"{age_col} AS age" if age_col else "NULL AS age",
             ]
             t_clause, t_params = _build_public_tenant_filter(current)
             public_rows = db.execute(
@@ -2631,7 +2581,12 @@ def volunteer_analysis_enrichment(
                 {**params, **t_params},
             ).all()
             public_voter_map = {
-                _normalize_epic(r.epic): {"name_en": r.name_en, "sl": r.sl}
+                _normalize_epic(r.epic): {
+                    "name_en": r.name_en,
+                    "sl": r.sl,
+                    "gender": getattr(r, "gender", None),
+                    "age": getattr(r, "age", None),
+                }
                 for r in public_rows
                 if _normalize_epic(r.epic)
             }
@@ -2662,6 +2617,20 @@ def volunteer_analysis_enrichment(
             if voter and voter.sr_no is not None
             else (public_voter.get("sl") if public_voter else None)
         ) or payload.get("newSerialNo")
+        ordered["gender"] = (
+            payload.get("gender")
+            or (voter.gender if voter and voter.gender else None)
+            or (public_voter.get("gender") if public_voter else None)
+        )
+        ordered["age"] = (
+            payload.get("age")
+            if payload.get("age") is not None and str(payload.get("age")).strip() != ""
+            else (
+                voter.age
+                if voter and voter.age is not None
+                else (public_voter.get("age") if public_voter else None)
+            )
+        )
         ordered["mobile"] = payload.get("mobile")
         ordered["updatedByName"] = payload.get("updatedByName") or enrichment.updated_by_name
         ordered["updatedByPhone"] = payload.get("updatedByPhone") or enrichment.updated_by_phone
@@ -3659,11 +3628,9 @@ def update_public_voter_by_epic(epic: str, payload: PublicVoterUpdatePayload, db
         setattr(enrichment, VOTER_ENRICHMENT_FIELD_MAP[api_field], serialized_value)
         updated_fields.add(api_field)
 
-    # Snapshot electoral-roll gender/age on enrichment when volunteer visits (for analysis counts).
+    # Snapshot electoral-roll gender/age on enrichment after each voter update (shown in enrichment details).
     for api_field in ("gender", "age"):
         if api_field in normalized_values:
-            continue
-        if _enrichment_has_value(enrichment, api_field):
             continue
         pub_val = getattr(public_voter, api_field, None)
         if pub_val is None or (isinstance(pub_val, str) and not str(pub_val).strip()):
@@ -4883,6 +4850,33 @@ def _family_analysis_shows_admin_rows(current: Optional[JwtUserDetails]) -> bool
     return role in {"SUPER_ADMIN", "ADMIN"}
 
 
+def _can_access_family_analysis(current: Optional[JwtUserDetails]) -> bool:
+    """Family analysis table/map: super admin, admin, assembly, and ward only."""
+    if not current:
+        return False
+    role = (current.role or "").replace("ROLE_", "").upper()
+    level = (
+        normalize_optional_text(getattr(current, "workingLevel", None))
+        or normalize_optional_text(current.assignmentType)
+        or ""
+    ).upper()
+    if role == "BOOTH" or level == "BOOTH":
+        return False
+    if role in {"SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD"}:
+        return True
+    if role == "USER" and level in {"ASSEMBLY", "WARD"}:
+        return True
+    return level in {"ASSEMBLY", "WARD"}
+
+
+def _require_family_analysis_access(current: JwtUserDetails) -> None:
+    if not _can_access_family_analysis(current):
+        raise HTTPException(
+            status_code=403,
+            detail="Family analysis is not available for booth-level access.",
+        )
+
+
 def _family_is_hidden_admin_entry(
     db: Session,
     fam: Family,
@@ -5833,6 +5827,7 @@ def families_analysis(
     updatedTo: Optional[str] = None,
     assemblyCode: Optional[str] = None,
 ):
+    _require_family_analysis_access(current)
     rows = _load_families_for_analysis(
         db, current, wardId=wardId, boothId=boothId, updatedFrom=updatedFrom, updatedTo=updatedTo, assemblyCode=assemblyCode
     )
@@ -6053,6 +6048,7 @@ def families_map_points(
     assemblyCode: Optional[str] = None,
 ):
     """Families with coordinates and enriched member relation fields for map tooltips."""
+    _require_family_analysis_access(current)
     rows = _load_families_for_analysis(
         db, current, wardId=wardId, boothId=boothId, updatedFrom=updatedFrom, updatedTo=updatedTo, assemblyCode=assemblyCode
     )
