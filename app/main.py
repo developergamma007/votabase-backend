@@ -1871,10 +1871,10 @@ def update_volunteer(
         .strip()
         .upper()
     )
-    if existing_level in {"SUPER_ADMIN", "ASSEMBLY", "WARD"}:
+    if existing_level == "SUPER_ADMIN":
         raise HTTPException(
             status_code=403,
-            detail="Super Admin, Assembly, and Ward level logins cannot be updated. Contact an administrator.",
+            detail="Super Admin logins cannot be updated. Contact a platform administrator.",
         )
 
     working_level = (payload.workingLevel or "").strip().upper()
@@ -1946,7 +1946,8 @@ def list_volunteers(
             (VolunteerUser.assignment_id == unpadded)
         )
 
-    if current.role == "WARD":
+    viewer_role = _creator_access_role(db, current)
+    if viewer_role in {"WARD", "ASSEMBLY"}:
         scope = _resolve_access_scope_ids(db, current)
         allowed_ward_ids = sorted(scope.get("allowed_ward_ids") or []) if scope else []
         allowed_booth_ids = sorted(scope.get("allowed_booth_ids") or []) if scope else []
@@ -1961,8 +1962,17 @@ def list_volunteers(
         else:
             q = q.filter(text("1=0"))
 
+    manageable_levels = _allowed_working_levels_for_creator(viewer_role)
+    if manageable_levels and viewer_role not in {"SUPER_ADMIN", "ADMIN"}:
+        level_col = func.upper(
+            func.coalesce(VolunteerUser.working_level, VolunteerUser.assignment_type, "")
+        )
+        q = q.filter(level_col.in_(manageable_levels))
+
     blocked_filter = parse_optional_bool(blocked)
     deleted_filter = parse_optional_bool(deleted)
+    if deleted_filter is None:
+        deleted_filter = False
     level_filter = normalize_optional_text(workingLevel)
 
     if blocked_filter is not None:
@@ -2121,6 +2131,66 @@ def _enrichment_has_value(enrichment: VoterEnrichment, api_field: str) -> bool:
     return True
 
 
+def _volunteer_analysis_epic_key(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = str(value).strip().upper()
+    return cleaned or None
+
+
+def _load_public_voter_demographics_map(db: Session, enrichments: List[VoterEnrichment]) -> Dict[str, Dict[str, Any]]:
+    epic_keys = list(
+        {_volunteer_analysis_epic_key(e.epic) for e in enrichments if _volunteer_analysis_epic_key(e.epic)}
+    )
+    if not epic_keys:
+        return {}
+    voter_cols = _get_table_columns(db, "public", "voters")
+    if "epic" not in voter_cols:
+        return {}
+    gender_col = "gender" if "gender" in voter_cols else None
+    age_col = "age" if "age" in voter_cols else None
+    if not gender_col and not age_col:
+        return {}
+    clause, params = _build_in_clause("epic", epic_keys, "va_demo_epic")
+    rows = db.execute(
+        text(
+            f"""
+            SELECT epic,
+                   {gender_col if gender_col else 'NULL'} AS gender,
+                   {age_col if age_col else 'NULL'} AS age
+            FROM public.voters
+            WHERE {clause}
+            """
+        ),
+        params,
+    ).all()
+    result: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        key = _volunteer_analysis_epic_key(row.epic)
+        if key:
+            result[key] = {"gender": row.gender, "age": row.age}
+    return result
+
+
+def _volunteer_analysis_field_counted(
+    enrichment: VoterEnrichment,
+    api_field: str,
+    public_demo_map: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> bool:
+    if _enrichment_has_value(enrichment, api_field):
+        return True
+    if api_field not in {"gender", "age"} or not public_demo_map:
+        return False
+    epic_key = _volunteer_analysis_epic_key(enrichment.epic)
+    demo = public_demo_map.get(epic_key) if epic_key else None
+    if not demo:
+        return False
+    if api_field == "gender":
+        return bool(str(demo.get("gender") or "").strip())
+    age_val = demo.get("age")
+    return age_val is not None and str(age_val).strip() != ""
+
+
 @app.get(f"{CONTEXT_PATH}/api/volunteers/analysis")
 def volunteer_analysis(
     db: Session = Depends(get_db),
@@ -2214,6 +2284,8 @@ def volunteer_analysis(
     if not enrichments:
         return api_success("Volunteer analysis fetched", [])
 
+    public_demo_map = _load_public_voter_demographics_map(db, enrichments)
+
     exclude_keys = {
         "firstMiddleNameEn",
         "lastNameEn",
@@ -2226,8 +2298,6 @@ def volunteer_analysis(
         "relationLastNameLocal",
         "houseNoEn",
         "houseNoLocal",
-        "gender",
-        "age",
     }
     enrichment_keys = [key for key in VOTER_ENRICHMENT_FIELD_MAP.keys() if key not in exclude_keys]
     extra_keys = ["ward_code", "booth_no", "updated_fields"]
@@ -2261,7 +2331,7 @@ def volunteer_analysis(
             if not existing or enrichment.updated_at > existing:
                 bucket["lastUpdatedAt"] = enrichment.updated_at
         for item in analysis_fields:
-            if _enrichment_has_value(enrichment, item["key"]):
+            if _volunteer_analysis_field_counted(enrichment, item["key"], public_demo_map):
                 bucket["counts"][item["key"]] += 1
 
     if mode_key == "agent":
@@ -2354,7 +2424,7 @@ def volunteer_analysis(
             if not existing or enrichment.updated_at > existing:
                 bucket["lastUpdatedAt"] = enrichment.updated_at
         for item in analysis_fields:
-            if _enrichment_has_value(enrichment, item["key"]):
+            if _volunteer_analysis_field_counted(enrichment, item["key"], public_demo_map):
                 bucket["counts"][item["key"]] += 1
 
     grouped_rows = []
@@ -3589,6 +3659,21 @@ def update_public_voter_by_epic(epic: str, payload: PublicVoterUpdatePayload, db
         setattr(enrichment, VOTER_ENRICHMENT_FIELD_MAP[api_field], serialized_value)
         updated_fields.add(api_field)
 
+    # Snapshot electoral-roll gender/age on enrichment when volunteer visits (for analysis counts).
+    for api_field in ("gender", "age"):
+        if api_field in normalized_values:
+            continue
+        if _enrichment_has_value(enrichment, api_field):
+            continue
+        pub_val = getattr(public_voter, api_field, None)
+        if pub_val is None or (isinstance(pub_val, str) and not str(pub_val).strip()):
+            continue
+        setattr(
+            enrichment,
+            VOTER_ENRICHMENT_FIELD_MAP[api_field],
+            _serialize_enrichment_value(api_field, pub_val),
+        )
+
     enrichment.ward_code = str(public_voter.ward_code) if public_voter.ward_code is not None else enrichment.ward_code
     enrichment.booth_no = str(public_voter.booth_no) if public_voter.booth_no is not None else enrichment.booth_no
     enrichment.updated_fields = json.dumps(sorted(updated_fields))
@@ -4790,8 +4875,23 @@ def _family_agent_name_is_hidden(name: Optional[str]) -> bool:
     return normalized.startswith("admin@iswot")
 
 
-def _family_is_hidden_admin_entry(db: Session, fam: Family, super_admin_ids: Optional[set] = None) -> bool:
-    """Hide families touched by super-admin / admin@iswot.io from field volunteer family tables."""
+def _family_analysis_shows_admin_rows(current: Optional[JwtUserDetails]) -> bool:
+    """Super Admin / Admin consoles need to see all family rows in analysis and lists."""
+    if not current:
+        return False
+    role = (current.role or "").replace("ROLE_", "").upper()
+    return role in {"SUPER_ADMIN", "ADMIN"}
+
+
+def _family_is_hidden_admin_entry(
+    db: Session,
+    fam: Family,
+    super_admin_ids: Optional[set] = None,
+    current: Optional[JwtUserDetails] = None,
+) -> bool:
+    """Hide families touched by super-admin test accounts from field volunteer views only."""
+    if _family_analysis_shows_admin_rows(current):
+        return False
     admin_ids = super_admin_ids if super_admin_ids is not None else _super_admin_user_ids(db)
     for agent_id in (fam.created_by, fam.updated_by, _family_agent_id(fam)):
         if agent_id is not None and int(agent_id) > 0 and int(agent_id) in admin_ids:
@@ -4801,24 +4901,30 @@ def _family_is_hidden_admin_entry(db: Session, fam: Family, super_admin_ids: Opt
     return False
 
 
-def _apply_exclude_admin_family_filter(q, db: Session, super_admin_ids: Optional[set] = None):
-    admin_ids = super_admin_ids if super_admin_ids is not None else _super_admin_user_ids(db)
-    if admin_ids:
-        id_list = list(admin_ids)
-        q = q.filter(
-            or_(
-                Family.created_by.is_(None),
-                Family.created_by < 0,
-                ~Family.created_by.in_(id_list),
+def _apply_exclude_admin_family_filter(
+    q,
+    db: Session,
+    super_admin_ids: Optional[set] = None,
+    current: Optional[JwtUserDetails] = None,
+):
+    if not _family_analysis_shows_admin_rows(current):
+        admin_ids = super_admin_ids if super_admin_ids is not None else _super_admin_user_ids(db)
+        if admin_ids:
+            id_list = list(admin_ids)
+            q = q.filter(
+                or_(
+                    Family.created_by.is_(None),
+                    Family.created_by < 0,
+                    ~Family.created_by.in_(id_list),
+                )
             )
-        )
-        q = q.filter(
-            or_(
-                Family.updated_by.is_(None),
-                Family.updated_by < 0,
-                ~Family.updated_by.in_(id_list),
+            q = q.filter(
+                or_(
+                    Family.updated_by.is_(None),
+                    Family.updated_by < 0,
+                    ~Family.updated_by.in_(id_list),
+                )
             )
-        )
     for hidden_name in HIDDEN_FAMILY_AGENT_NAMES:
         q = q.filter(
             func.lower(func.coalesce(Family.created_by_name, "")) != hidden_name,
@@ -4888,18 +4994,42 @@ def _resolve_booth_ids_for_assembly_param(db: Session, assembly_code: Optional[s
     str_values = _assembly_filter_values(assembly_code)
     if not str_values:
         return []
+    booth_ids: set[int] = set()
     asm_ids: List[Any] = list(dict.fromkeys(str_values))
     for val in str_values:
         if val.isdigit():
             asm_ids.append(int(val))
+
     ward_ids = [
         int(row.ward_id)
         for row in db.query(Ward.ward_id).filter(Ward.assembly_id.in_(asm_ids)).all()
         if row.ward_id is not None
     ]
-    if not ward_ids:
-        return []
-    return _resolve_booth_ids_for_ward_list(db, ward_ids)
+    if ward_ids:
+        booth_ids.update(_resolve_booth_ids_for_ward_list(db, ward_ids))
+
+    ward_cols = _get_table_columns(db, "public", "wards")
+    assembly_ref = (
+        "assembly_id"
+        if "assembly_id" in ward_cols
+        else ("assembly_no" if "assembly_no" in ward_cols else None)
+    )
+    ward_pk = "id" if "id" in ward_cols else ("ward_id" if "ward_id" in ward_cols else None)
+    if assembly_ref and ward_pk:
+        placeholders = ", ".join(f":a{i}" for i in range(len(str_values)))
+        params = {f"a{i}": v for i, v in enumerate(str_values)}
+        pub_ward_rows = db.execute(
+            text(
+                f"SELECT {ward_pk} AS ward_id FROM public.wards "
+                f"WHERE CAST({assembly_ref} AS TEXT) IN ({placeholders})"
+            ),
+            params,
+        ).all()
+        pub_ward_ids = [int(r.ward_id) for r in pub_ward_rows if r.ward_id is not None]
+        if pub_ward_ids:
+            booth_ids.update(_resolve_booth_ids_for_ward_list(db, pub_ward_ids))
+
+    return sorted(booth_ids)
 
 
 def _apply_enrichment_assembly_filter(q, db: Session, assembly_code: Optional[str]):
@@ -4976,7 +5106,13 @@ def _apply_family_list_filters(
             q = q.filter(text("1=0"))
     if boothId is not None:
         q = q.filter(Family.booth_id == int(boothId))
-    if assemblyCode is not None and str(assemblyCode).strip():
+    # Assembly filter only when ward/booth not set — avoids empty AND with ward-scoped lists.
+    if (
+        assemblyCode is not None
+        and str(assemblyCode).strip()
+        and wardId is None
+        and boothId is None
+    ):
         asm_booth_ids = _resolve_booth_ids_for_assembly_param(db, assemblyCode)
         if asm_booth_ids:
             q = q.filter(Family.booth_id.in_(asm_booth_ids))
@@ -4996,7 +5132,7 @@ def _load_families_for_analysis(
 ) -> List[tuple]:
     q = db.query(Family).filter(Family.deleted.is_(False))
     q = _apply_family_list_filters(q, db, current, wardId=wardId, boothId=boothId, assemblyCode=assemblyCode)
-    q = _apply_exclude_admin_family_filter(q, db)
+    q = _apply_exclude_admin_family_filter(q, db, current=current)
 
     from_dt = _parse_family_analysis_date(updatedFrom)
     to_dt = _parse_family_analysis_date(updatedTo, end_of_day=True)
@@ -5004,7 +5140,7 @@ def _load_families_for_analysis(
     super_admin_ids = _super_admin_user_ids(db)
     rows: List[tuple] = []
     for fam in families:
-        if _family_is_hidden_admin_entry(db, fam, super_admin_ids):
+        if _family_is_hidden_admin_entry(db, fam, super_admin_ids, current=current):
             continue
         if from_dt or to_dt:
             if not _family_in_date_range(fam, from_dt, to_dt):
@@ -5447,7 +5583,7 @@ def _bootstrap_voter(db: Session, epic: str, booth: Booth, tenant_id: str):
 
 
 @app.post(f"{CONTEXT_PATH}/api/family")
-def create_family(payload: CreateFamilyRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "USER"))):
+def create_family(payload: CreateFamilyRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "BOOTH", "USER"))):
     tenant_id = current.tenantId
     # If admin/superadmin with no tenant, we need to infer it or use booth tenant
     # But since bootstrap needs a tenant, we'll try to find one from existing data or use a default "T1"
@@ -5651,11 +5787,11 @@ def list_families(
     association: Optional[str] = None,
     assemblyCode: Optional[str] = None,
     db: Session = Depends(get_db),
-    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "USER")),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "BOOTH", "USER")),
 ):
     q = db.query(Family).filter(Family.deleted.is_(False))
     q = _apply_family_list_filters(q, db, current, wardId=wardId, boothId=boothId, assemblyCode=assemblyCode)
-    q = _apply_exclude_admin_family_filter(q, db)
+    q = _apply_exclude_admin_family_filter(q, db, current=current)
 
     association_filter = parse_optional_bool(association)
     if association_filter is not None:
@@ -5689,7 +5825,7 @@ def list_families(
 @app.get(f"{CONTEXT_PATH}/api/families/analysis")
 def families_analysis(
     db: Session = Depends(get_db),
-    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "USER")),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "BOOTH", "USER")),
     wardId: Optional[int] = None,
     boothId: Optional[int] = None,
     mode: Optional[str] = "agent",
@@ -5705,6 +5841,7 @@ def families_analysis(
 
     analysis_fields = [{"key": item["key"], "label": item["label"]} for item in FAMILY_AVAILABILITY_BUCKETS]
     mode_key = (mode or "agent").lower()
+    show_admin_rows = _family_analysis_shows_admin_rows(current)
 
     def _init_counts() -> Dict[str, int]:
         return {item["key"]: 0 for item in FAMILY_AVAILABILITY_BUCKETS}
@@ -5713,10 +5850,15 @@ def families_analysis(
         super_admin_ids = _super_admin_user_ids(db)
         counters: Dict[str, Dict[str, Any]] = {}
         for fam, booth in rows:
-            if _family_is_hidden_admin_entry(db, fam, super_admin_ids):
+            if _family_is_hidden_admin_entry(db, fam, super_admin_ids, current=current):
                 continue
             user_id = _family_agent_id(fam)
-            if user_id is not None and int(user_id) > 0 and int(user_id) in super_admin_ids:
+            if (
+                not show_admin_rows
+                and user_id is not None
+                and int(user_id) > 0
+                and int(user_id) in super_admin_ids
+            ):
                 continue
             bucket_key = _family_agent_bucket_key(fam)
             bucket = counters.setdefault(
@@ -5953,7 +6095,7 @@ def families_map_points(
 @app.get(f"{CONTEXT_PATH}/api/families/details")
 def families_details(
     db: Session = Depends(get_db),
-    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "USER")),
+    current: JwtUserDetails = Depends(require_roles("SUPER_ADMIN", "ADMIN", "ASSEMBLY", "WARD", "BOOTH", "USER")),
     wardId: Optional[int] = None,
     boothId: Optional[int] = None,
     updatedFrom: Optional[str] = None,
@@ -7006,6 +7148,8 @@ def _get_public_voter_column_map(voter_cols: set[str]) -> Dict[str, str]:
 def _volunteer_analysis_count_field_label(key: str) -> str:
     """Human labels for agent-wise update counts (not voter/agent identity columns)."""
     explicit = {
+        "gender": "Voter Gender Updates",
+        "age": "Voter Age Updates",
         "mobile": "Voter Mobile Updates",
         "dob": "Voter DOB Updates",
         "addressEn": "Voter Address (EN) Updates",
