@@ -2822,7 +2822,7 @@ def block_user(payload: UserBlockRequest, db: Session = Depends(get_db), current
     if not target_first_name:
         raise ValueError("firstName or userEmail is required")
 
-    q = db.query(VolunteerUser).filter(VolunteerUser.first_name == target_first_name)
+    q = db.query(VolunteerUser).filter(func.lower(VolunteerUser.first_name) == target_first_name.lower())
     if current.tenantId:
         q = q.filter(VolunteerUser.tenant_id == current.tenantId)
     user = q.first()
@@ -2893,7 +2893,7 @@ def delete_user(payload: UserDeleteRequest, db: Session = Depends(get_db), curre
     if not target_first_name:
         raise ValueError("firstName or userEmail is required")
 
-    q = db.query(VolunteerUser).filter(VolunteerUser.first_name == target_first_name)
+    q = db.query(VolunteerUser).filter(func.lower(VolunteerUser.first_name) == target_first_name.lower())
     if current.tenantId is not None and current.role != "SUPER_ADMIN":
         q = q.filter(VolunteerUser.tenant_id == current.tenantId)
     user = q.first()
@@ -2909,7 +2909,8 @@ def delete_user(payload: UserDeleteRequest, db: Session = Depends(get_db), curre
 @app.put(f"{CONTEXT_PATH}/api/user/block/bulk")
 def bulk_block(payload: UserBulkActionRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD"))):
     usernames = resolve_bulk_usernames(payload)
-    q = db.query(VolunteerUser).filter(VolunteerUser.first_name.in_(usernames))
+    normalized = [u.lower() for u in usernames]
+    q = db.query(VolunteerUser).filter(func.lower(VolunteerUser.first_name).in_(normalized))
     if current.tenantId is not None and current.role != "SUPER_ADMIN":
         q = q.filter(VolunteerUser.tenant_id == current.tenantId)
     users = q.all()
@@ -2926,7 +2927,8 @@ def bulk_block(payload: UserBulkActionRequest, db: Session = Depends(get_db), cu
 @app.put(f"{CONTEXT_PATH}/api/user/delete/bulk")
 def bulk_delete(payload: UserBulkActionRequest, db: Session = Depends(get_db), current: JwtUserDetails = Depends(require_roles("ADMIN", "SUPER_ADMIN", "ASSEMBLY", "WARD"))):
     usernames = resolve_bulk_usernames(payload)
-    q = db.query(VolunteerUser).filter(VolunteerUser.first_name.in_(usernames))
+    normalized = [u.lower() for u in usernames]
+    q = db.query(VolunteerUser).filter(func.lower(VolunteerUser.first_name).in_(normalized))
     if current.tenantId is not None and current.role != "SUPER_ADMIN":
         q = q.filter(VolunteerUser.tenant_id == current.tenantId)
     users = q.all()
@@ -6047,8 +6049,7 @@ def families_map_points(
     updatedTo: Optional[str] = None,
     assemblyCode: Optional[str] = None,
 ):
-    """Families with coordinates and enriched member relation fields for map tooltips."""
-    _require_family_analysis_access(current)
+    """Families with coordinates for maps (including booth pending-family tab; scoped by role)."""
     rows = _load_families_for_analysis(
         db, current, wardId=wardId, boothId=boothId, updatedFrom=updatedFrom, updatedTo=updatedTo, assemblyCode=assemblyCode
     )
