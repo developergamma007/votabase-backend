@@ -13,7 +13,8 @@ from typing import Any, Dict, Iterable, List, Optional
 import boto3
 import jwt
 from botocore.exceptions import NoCredentialsError
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, BackgroundTasks
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, BackgroundTasks, status
+from fastapi.security import OAuth2PasswordRequestForm
 from starlette.background import BackgroundTask
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
@@ -655,6 +656,11 @@ class MeetingCreateRequest(BaseModel):
 class LoginRequest(BaseModel):
     firstName: str
     phone: str
+
+
+class OAuthTokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
 
 
 class UserDetailsIn(BaseModel):
@@ -1608,21 +1614,34 @@ def startup_ensure_voter_enrichment() -> None:
         db.close()
 
 
-# ---------------------------
-# Routes
-# ---------------------------
-@app.post(f"{CONTEXT_PATH}/api/auth/login")
-def login(payload: LoginRequest, db: Session = Depends(get_db)):
-    normalized_name = normalize_optional_text(payload.firstName) or ""
-    normalized_phone = normalize_phone(payload.phone) or ""
+def _first_name_login_candidates(raw_username: str) -> List[str]:
+    """Survey-Website sends email/username; map to VoteBase first_name values."""
+    trimmed = (raw_username or "").strip()
+    candidates: List[str] = []
+    if trimmed:
+        candidates.append(trimmed)
+    if trimmed == "admin" and SUPERADMIN_USERNAME not in candidates:
+        candidates.append(SUPERADMIN_USERNAME)
+    if "@" in trimmed:
+        local = trimmed.split("@", 1)[0].strip()
+        if local and local not in candidates:
+            candidates.append(local)
+    return candidates
+
+
+def _authenticate_first_name_phone(db: Session, first_name: str, phone: str) -> tuple[str, Any, Optional[str], Optional[str], Any]:
+    normalized_name = normalize_optional_text(first_name) or ""
+    normalized_phone = normalize_phone(phone) or ""
     user = db.query(User).filter(func.lower(User.first_name) == normalized_name.lower(), User.phone == normalized_phone).first()
     if user and user.role not in {"SUPER_ADMIN", "ADMIN"} and not user.tenant:
         user = None
     volunteer = None
     if not user:
-        volunteer = db.query(VolunteerUser).filter(func.lower(VolunteerUser.first_name) == normalized_name.lower(), VolunteerUser.phone == normalized_phone).first()
+        volunteer = db.query(VolunteerUser).filter(
+            func.lower(VolunteerUser.first_name) == normalized_name.lower(),
+            VolunteerUser.phone == normalized_phone,
+        ).first()
         if not volunteer and normalized_phone:
-            # Fallback: allow login by phone only if the number matches a unique volunteer.
             volunteer = db.query(VolunteerUser).filter(VolunteerUser.phone == normalized_phone).first()
         if not volunteer and not user:
             raise InvalidCredentialsException("Invalid firstname or phone")
@@ -1649,11 +1668,61 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
         assignment_id = volunteer.assignment_id
 
     effective = user or volunteer
-    token = _generate_token(effective.first_name, effective.role, tenant_id, assignment_type, assignment_id, effective.phone)
+    token = _generate_token(
+        effective.first_name,
+        effective.role,
+        tenant_id,
+        assignment_type,
+        assignment_id,
+        effective.phone,
+    )
+    return token, effective, tenant_id, assignment_type, assignment_id
+
+
+# ---------------------------
+# Routes
+# ---------------------------
+@app.post("/token", response_model=OAuthTokenResponse)
+def oauth_token_login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    """
+    Survey-Website compatibility shim on votabase-backend.
+    username → VoteBase first_name (e.g. admin@iswot.io)
+    password → VoteBase phone (e.g. 8867038709)
+    """
+    last_error: Optional[Exception] = None
+    for candidate in _first_name_login_candidates(form_data.username):
+        try:
+            token, *_rest = _authenticate_first_name_phone(db, candidate, form_data.password)
+            return OAuthTokenResponse(access_token=token, token_type="bearer")
+        except InvalidCredentialsException as ex:
+            last_error = ex
+        except HTTPException:
+            raise
+
+    if isinstance(last_error, InvalidCredentialsException):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Incorrect username or password",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+@app.post(f"{CONTEXT_PATH}/api/auth/login")
+def login(payload: LoginRequest, db: Session = Depends(get_db)):
+    token, effective, tenant_id, assignment_type, assignment_id = _authenticate_first_name_phone(
+        db, payload.firstName, payload.phone
+    )
     return api_success(
         "Login successful",
         {
             "userName": payload.firstName,
+            "firstName": effective.first_name,
+            "phone": effective.phone,
             "token": token,
             "role": effective.role,
             "tenantId": tenant_id,
@@ -2953,9 +3022,16 @@ def get_profile(db: Session = Depends(get_db), current: JwtUserDetails = Depends
 
     target = user or volunteer
     presigned = ""
-    if target.profile_pic_url:
-        key = s3_extract_key(target.profile_pic_url)
-        presigned = s3_presigned_url(key, 15, fallback_url=target.profile_pic_url)
+    pic_url = target.profile_pic_url or ""
+    if pic_url and not pic_url.startswith(("data:", "file:", "content:")):
+        try:
+            if ".com/" in pic_url:
+                key = s3_extract_key(pic_url)
+                presigned = s3_presigned_url(key, 15, fallback_url=pic_url)
+            elif pic_url.startswith("http"):
+                presigned = pic_url
+        except Exception:
+            presigned = ""
 
     return {
         "firstName": target.first_name,
