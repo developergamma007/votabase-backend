@@ -3703,6 +3703,10 @@ def update_public_voter_by_epic(epic: str, payload: PublicVoterUpdatePayload, db
 
     updated_fields = _parse_updated_fields(enrichment.updated_fields)
     for api_field, serialized_value in normalized_values.items():
+        if serialized_value is None:
+            continue
+        if api_field in VOTER_ENRICHMENT_JSON_FIELDS and serialized_value == "[]":
+            continue
         setattr(enrichment, VOTER_ENRICHMENT_FIELD_MAP[api_field], serialized_value)
         updated_fields.add(api_field)
 
@@ -5260,6 +5264,20 @@ def _family_to_dto(db: Session, fam: Family, rel_cache: Optional[Dict[str, tuple
     head_name = ""
     head_epic = ""
     m_dto = []
+    ward_id = None
+    ward_code = None
+    booth_no = None
+    try:
+        booth = db.query(Booth).filter(Booth.booth_id == fam.booth_id).first()
+        if booth:
+            ward_id = booth.ward_id
+            ward_code = booth.ward_code
+            booth_no = booth.booth_no
+    except Exception:
+        ward_id = None
+        ward_code = None
+        booth_no = None
+
     try:
         members_data = db.query(FamilyMember, Voter).join(Voter, FamilyMember.voter_id == Voter.voter_id).filter(FamilyMember.family_id == fam.familyId).all()
         for member, voter in members_data:
@@ -5283,6 +5301,11 @@ def _family_to_dto(db: Session, fam: Family, rel_cache: Optional[Dict[str, tuple
                     "head": bool(member.is_head),
                     "epicNo": voter.epic_no,
                     "voterName": full_name,
+                    "name": full_name,
+                    "firstMiddleNameEn": voter.first_middle_name_en,
+                    "lastNameEn": voter.last_name_en,
+                    "firstMiddleNameLocal": voter.first_middle_name_local,
+                    "lastNameLocal": voter.last_name_local,
                     "relationName": relation_name,
                     "relationType": relation_type,
                     "relationFirstMiddleNameEn": voter.relation_first_middle_name_en,
@@ -5290,24 +5313,13 @@ def _family_to_dto(db: Session, fam: Family, rel_cache: Optional[Dict[str, tuple
                     "relationFirstMiddleNameLocal": voter.relation_first_middle_name_local,
                     "relationLastNameLocal": voter.relation_last_name_local,
                     "rel_eng": relation_name,
+                    "boothId": fam.booth_id,
+                    "wardCode": str(ward_code) if ward_code is not None else None,
+                    "boothNo": str(booth_no) if booth_no is not None else None,
                 }
             )
     except Exception as e:
         print(f"Error in _family_to_dto members: {e}")
-
-    ward_id = None
-    ward_code = None
-    booth_no = None
-    try:
-        booth = db.query(Booth).filter(Booth.booth_id == fam.booth_id).first()
-        if booth:
-            ward_id = booth.ward_id
-            ward_code = booth.ward_code
-            booth_no = booth.booth_no
-    except Exception:
-        ward_id = None
-        ward_code = None
-        booth_no = None
 
     last_updated = _family_effective_updated(fam)
 
